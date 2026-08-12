@@ -65,9 +65,13 @@ MAC_NOTIFY_SOUND=Glass
 | Setting | Meaning |
 |---------|---------|
 | `DRY_RUN` / `LIVE` | Keep `DRY_RUN=true` and `LIVE=false` until you’re ready |
-| `POSITION_PCT` | Margin per OPEN = this % of Hyperliquid account equity |
+| `POSITION_PCT` | Fallback margin % if the source trade has no `entrySize` |
+| `HL_MIN_ORDER_USD` | Floor order notional (margin×leverage); default $10 for Hyperliquid |
+| `MAX_POSITION_PCT` | Cap on margin % of our equity (safety) |
+| `RECOVERY_ENABLED` | On startup, reconcile open copies vs Involio closes (default true) |
+| `RECOVERY_SL_PCT` | Adverse % from mid for parked SL while waiting recovery TP (default 3) |
 | `MIN_EQUITY_USD` | Skip trades if HL equity is below this |
-| `MIN_ORDER_USD` | Skip if sized notional margin is below this |
+| `MIN_ORDER_USD` | Skip if sized margin is below this |
 | `PORTFOLIO_ALLOWLIST` | Only act on these followed portfolios |
 | `MAC_NOTIFY` | macOS notifications on actions/errors |
 | `MAC_NOTIFY_STICKY` | Stay until **Dismiss** (Slack-style via `alerter`) |
@@ -146,7 +150,9 @@ invo-agent once
 invo-agent dry-run
 ```
 
-On first start (or after `reset-state`), **catch-up** marks existing notifications as already handled, then only new trader signals fire OPEN / UPDATE / CLOSE.
+On every start (or after `reset-state`), **catch-up** marks existing notifications as already handled, then only new trader signals fire OPEN / UPDATE / CLOSE.
+
+After catch-up, **missed-close recovery** checks local open copies against Involio. If the trader already closed while the agent was offline but Hyperliquid still holds the coin, it either market-closes or parks reduce-only TP/SL (`RECOVERY_ENABLED`, `RECOVERY_SL_PCT`).
 
 You’ll get:
 
@@ -194,7 +200,7 @@ MIN_ORDER_USD=1
 invo-agent run
 ```
 
-**Sizing:** each OPEN uses `POSITION_PCT` of current HL `accountValue` as margin, then:
+**Sizing:** each OPEN copies the source trader’s `entrySize` (portfolio %) as margin % of *your* HL equity. If that would make order notional (`margin × leverage`) below `HL_MIN_ORDER_USD` ($10), it bids the % up to clear that floor. `POSITION_PCT` is only used when `entrySize` is missing.
 
 `size ≈ (margin × leverage) / mid_price`
 
@@ -297,12 +303,12 @@ Also written every refresh: `~/.invo-agent/hud.json`.
 
 1. Lid can close only if you prevent sleep (service uses `caffeinate`), or leave Mac awake/plugged in.
 2. Social login already works (`invo-agent status` → logged in).
-3. DEX session required for real orders:
+3. DEX/Turnkey session required for real orders. Prefer a fresh `dex-login` before bed. If the Turnkey key expires overnight, the agent **auto re-logins via IMAP** (Turnkey OTP email) and retries the trade; on failure it cools down 10 minutes then tries again.
 
 ```bash
 source .venv/bin/activate
 invo-agent dex-login
-invo-agent dex-status          # confirm HL equity looks right
+invo-agent dex-status          # confirm HL equity + expiry looks right
 ```
 
 4. `.env` for live:
@@ -381,10 +387,10 @@ invo-agent run
 src/invo_agent/
   api/           # Involio HTTP client + models
   auth/          # OTP login, IMAP (account vs wallet), session
-  dex/           # Turnkey signing + Hyperliquid execution
-  poller.py      # notification loop
+  dex/           # Turnkey signing + Hyperliquid execution (+ missed-close recovery)
+  poller.py      # notification loop + startup catch-up / missed-close reconcile
   engine.py      # notification → OPEN/UPDATE/CLOSE
-  db.py          # processed ids + position map
+  db.py          # processed ids + open copies (entry + recovery state)
   notify.py      # macOS Notification Center
   service.py     # launchd install/unload
   logging_setup.py

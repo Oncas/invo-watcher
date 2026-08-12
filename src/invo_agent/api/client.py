@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -14,6 +14,18 @@ from invo_agent.api.models import (
 )
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings
+
+# Match Flutter web Dio interceptor (app.invoapp.com → version.json).
+_WEB_APP_VERSION = "0.0.85"
+_WEB_APP_RELEASE = "1.0.59"
+_WEB_APP_BUILD = "83"
+_WEB_PLATFORM = "web"
+_DEX_CLIENT_VERSION = "involio-dex/fe"
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/139.0.0.0 Safari/537.36"
+)
 
 
 class InvolioAPIError(RuntimeError):
@@ -36,13 +48,19 @@ class InvolioClient:
                 "Content-Type": "application/json",
                 "Origin": settings.origin,
                 "Referer": f"{settings.origin}/",
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/139.0.0.0 Safari/537.36"
-                ),
+                "User-Agent": _BROWSER_UA,
+                "x-app-version": _WEB_APP_VERSION,
+                "x-app-release": _WEB_APP_RELEASE,
+                "x-app-build-number": _WEB_APP_BUILD,
+                "x-platform": _WEB_PLATFORM,
             },
         )
+
+    def _browser_headers(self, *, dex: bool = False) -> dict[str, str]:
+        headers = {"x-request-id": str(uuid4())}
+        if dex:
+            headers["X-Client-Version"] = _DEX_CLIENT_VERSION
+        return headers
 
     def close(self) -> None:
         self._client.close()
@@ -71,8 +89,11 @@ class InvolioClient:
         auth: bool = True,
         use_refresh: bool = False,
         retry_on_401: bool = True,
+        dex: bool = False,
     ) -> httpx.Response:
-        headers = self._auth_headers(use_refresh=use_refresh) if auth else {}
+        headers = self._browser_headers(dex=dex)
+        if auth:
+            headers.update(self._auth_headers(use_refresh=use_refresh))
         response = self._client.request(method, url, json=json, headers=headers)
 
         if (
@@ -83,7 +104,8 @@ class InvolioClient:
             and self.session.load() is not None
         ):
             self.refresh_tokens()
-            headers = self._auth_headers()
+            headers = self._browser_headers(dex=dex)
+            headers.update(self._auth_headers())
             response = self._client.request(method, url, json=json, headers=headers)
 
         return response
@@ -128,17 +150,17 @@ class InvolioClient:
         email: str,
         code: str,
         device_id: str,
-        device_type: str = "web",
+        device_type: str | None = None,
         device_info: str | None = None,
     ) -> OTPLoginResponse:
+        # Flutter web sends deviceType/deviceInfo as null.
         payload = {
             "email": email,
             "code": code,
             "deviceId": device_id,
             "deviceType": device_type,
+            "deviceInfo": device_info,
         }
-        if device_info:
-            payload["deviceInfo"] = device_info
         response = self._request(
             "POST",
             self._social("/auth/login/email"),
@@ -200,6 +222,18 @@ class InvolioClient:
         self._raise_for_status(response, "get post")
         return PostResponse.model_validate(response.json())
 
+    def get_current_shadow_post_by_investment_base_id(
+        self, base_id: UUID | str
+    ) -> PostResponse:
+        """Latest shadow post for an investment base id (open or closed)."""
+        response = self._request(
+            "POST",
+            self._social("/posts/get_current_shadow_post_by_investment_base_id"),
+            json={"baseId": str(base_id)},
+        )
+        self._raise_for_status(response, "get shadow post by investment base id")
+        return PostResponse.model_validate(response.json())
+
     def get_followed_portfolios(self, user_id: UUID | str) -> dict[str, Any]:
         response = self._request(
             "POST",
@@ -216,11 +250,11 @@ class InvolioClient:
     # --- dex (raw for now) ---
 
     def dex_get(self, path: str) -> dict[str, Any]:
-        response = self._request("GET", self._dex(path))
+        response = self._request("GET", self._dex(path), dex=True)
         self._raise_for_status(response, f"DEX GET {path}")
         return response.json()
 
     def dex_post(self, path: str, json: dict[str, Any] | None = None) -> dict[str, Any]:
-        response = self._request("POST", self._dex(path), json=json or {})
+        response = self._request("POST", self._dex(path), json=json or {}, dex=True)
         self._raise_for_status(response, f"DEX POST {path}")
         return response.json()

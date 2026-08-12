@@ -74,14 +74,20 @@ def start_dex_otp(client: InvolioClient) -> tuple[str, int]:
     return str(otp_id), ttl
 
 
+# Web clamps ttlDays to 1..30 → seconds. Prefer multi-day overnight sessions.
+DEFAULT_DEX_EXPIRATION_SECONDS = 30 * 24 * 60 * 60
+# Browser-ish label (web uses something like "<user> · <last8 of pubkey>").
+DEFAULT_DEX_DEVICE_LABEL = "Chrome on Mac"
+
+
 def complete_dex_otp_login(
     client: InvolioClient,
     *,
     otp_id: str,
     code: str,
     public_key: str,
-    expiration_seconds: int = 60 * 60 * 24 * 7,
-    device_label: str = "invo-agent",
+    expiration_seconds: int = DEFAULT_DEX_EXPIRATION_SECONDS,
+    device_label: str = DEFAULT_DEX_DEVICE_LABEL,
 ) -> dict:
     body = {
         "otpId": otp_id,
@@ -144,11 +150,14 @@ def establish_dex_session(
     if not code:
         raise DexSessionError("Empty DEX OTP code")
 
+    expiration_seconds = DEFAULT_DEX_EXPIRATION_SECONDS
     login = complete_dex_otp_login(
         client,
         otp_id=otp_id,
         code=code,
         public_key=keypair.public_key_otp_hex,
+        expiration_seconds=expiration_seconds,
+        device_label=DEFAULT_DEX_DEVICE_LABEL,
     )
     bundle = login.get("credentialBundle")
     if not bundle:
@@ -156,6 +165,11 @@ def establish_dex_session(
 
     api_private = decrypt_credential_bundle(bundle, keypair.private_key_hex)
     api_public = public_key_from_private(api_private)
+
+    expires_at_ms = login.get("expiresAtMs")
+    if expires_at_ms is None:
+        # API often omits this; estimate from requested TTL so we can warn.
+        expires_at_ms = int(datetime.now(UTC).timestamp() * 1000) + expiration_seconds * 1000
 
     session = DexSessionData(
         organization_id=str(org_id),
@@ -166,7 +180,7 @@ def establish_dex_session(
         api_private_key=api_private,
         api_key_id=login.get("apiKeyId"),
         credential_type=login.get("credentialType"),
-        expires_at_ms=login.get("expiresAtMs"),
+        expires_at_ms=int(expires_at_ms) if expires_at_ms is not None else None,
     )
     store.save(session)
     # Keep a redacted mirror under captures for debugging (optional)
@@ -186,10 +200,21 @@ def establish_dex_session(
     return session
 
 
+def session_is_expired(data: DexSessionData, *, skew_seconds: int = 60) -> bool:
+    if data.expires_at_ms is None:
+        return False
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    return now_ms >= int(data.expires_at_ms) - skew_seconds * 1000
+
+
 def load_signer(store: DexSessionStore) -> tuple[DexSessionData, TurnkeySigner]:
     data = store.load()
     if data is None:
         raise DexSessionError("No DEX session. Run: invo-agent dex-login")
+    if session_is_expired(data):
+        raise DexSessionError(
+            "DEX session expired. Run: invo-agent dex-login"
+        )
     signer = TurnkeySigner(
         organization_id=data.organization_id,
         sign_with_address=data.master_address,

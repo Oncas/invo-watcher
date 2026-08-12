@@ -14,6 +14,14 @@ class OpenCopy:
     portfolio_id: str | None
     opened_at: str
     last_notification_id: str | None
+    our_entry_px: float | None = None
+    side: str | None = None
+    size: float | None = None
+    leverage: float | None = None
+    recovery_pending: bool = False
+    recovery_tp: float | None = None
+    recovery_sl: float | None = None
+    trader_closing_px: float | None = None
 
 
 @dataclass
@@ -24,6 +32,18 @@ class ActionLogRow:
     summary: str | None
     notification_id: str | None
     dry_run: bool
+
+
+_OPEN_COPY_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("our_entry_px", "REAL"),
+    ("side", "TEXT"),
+    ("size", "REAL"),
+    ("leverage", "REAL"),
+    ("recovery_pending", "INTEGER NOT NULL DEFAULT 0"),
+    ("recovery_tp", "REAL"),
+    ("recovery_sl", "REAL"),
+    ("trader_closing_px", "REAL"),
+)
 
 
 class AgentDB:
@@ -71,6 +91,13 @@ class AgentDB:
             );
             """
         )
+        existing = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(open_copies)").fetchall()
+        }
+        for name, col_type in _OPEN_COPY_EXTRA_COLUMNS:
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE open_copies ADD COLUMN {name} {col_type}")
         self._conn.commit()
 
     def is_processed(self, notification_id: str) -> bool:
@@ -155,25 +182,99 @@ class AgentDB:
         ticker: str | None,
         portfolio_id: str | None,
         notification_id: str | None,
+        our_entry_px: float | None = None,
+        side: str | None = None,
+        size: float | None = None,
+        leverage: float | None = None,
     ) -> None:
         existing = self._conn.execute(
-            "SELECT opened_at FROM open_copies WHERE investment_base_id = ?",
+            "SELECT * FROM open_copies WHERE investment_base_id = ?",
             (investment_base_id,),
         ).fetchone()
         opened_at = existing["opened_at"] if existing else datetime.now(UTC).isoformat()
+
+        def _keep(new: float | str | None, col: str) -> float | str | None:
+            if new is not None:
+                return new
+            if existing is None:
+                return None
+            return existing[col]
+
         self._conn.execute(
             """
-            INSERT OR REPLACE INTO open_copies
-            (investment_base_id, base_short_id, ticker, portfolio_id, opened_at, last_notification_id)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO open_copies (
+                investment_base_id, base_short_id, ticker, portfolio_id,
+                opened_at, last_notification_id,
+                our_entry_px, side, size, leverage,
+                recovery_pending, recovery_tp, recovery_sl, trader_closing_px
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 investment_base_id,
-                base_short_id,
-                ticker,
-                portfolio_id,
+                base_short_id if base_short_id is not None else (
+                    existing["base_short_id"] if existing else None
+                ),
+                ticker if ticker is not None else (existing["ticker"] if existing else None),
+                portfolio_id if portfolio_id is not None else (
+                    existing["portfolio_id"] if existing else None
+                ),
                 opened_at,
                 notification_id,
+                _keep(our_entry_px, "our_entry_px"),
+                _keep(side, "side"),
+                _keep(size, "size"),
+                _keep(leverage, "leverage"),
+                int(existing["recovery_pending"] or 0) if existing else 0,
+                existing["recovery_tp"] if existing else None,
+                existing["recovery_sl"] if existing else None,
+                existing["trader_closing_px"] if existing else None,
+            ),
+        )
+        self._conn.commit()
+
+    def set_open_copy_fill(
+        self,
+        investment_base_id: str,
+        *,
+        our_entry_px: float,
+        side: str,
+        size: float,
+        leverage: float | None,
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE open_copies
+            SET our_entry_px = ?, side = ?, size = ?, leverage = ?
+            WHERE investment_base_id = ?
+            """,
+            (our_entry_px, side, size, leverage, investment_base_id),
+        )
+        self._conn.commit()
+
+    def set_recovery_state(
+        self,
+        investment_base_id: str,
+        *,
+        pending: bool,
+        recovery_tp: float | None = None,
+        recovery_sl: float | None = None,
+        trader_closing_px: float | None = None,
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE open_copies
+            SET recovery_pending = ?,
+                recovery_tp = ?,
+                recovery_sl = ?,
+                trader_closing_px = ?
+            WHERE investment_base_id = ?
+            """,
+            (
+                1 if pending else 0,
+                recovery_tp,
+                recovery_sl,
+                trader_closing_px,
+                investment_base_id,
             ),
         )
         self._conn.commit()
@@ -189,17 +290,31 @@ class AgentDB:
         rows = self._conn.execute(
             "SELECT * FROM open_copies ORDER BY opened_at DESC"
         ).fetchall()
-        return [
-            OpenCopy(
-                investment_base_id=row["investment_base_id"],
-                base_short_id=row["base_short_id"],
-                ticker=row["ticker"],
-                portfolio_id=row["portfolio_id"],
-                opened_at=row["opened_at"],
-                last_notification_id=row["last_notification_id"],
-            )
-            for row in rows
-        ]
+        return [self._row_to_open_copy(row) for row in rows]
+
+    @staticmethod
+    def _row_to_open_copy(row: sqlite3.Row) -> OpenCopy:
+        keys = set(row.keys())
+        return OpenCopy(
+            investment_base_id=row["investment_base_id"],
+            base_short_id=row["base_short_id"],
+            ticker=row["ticker"],
+            portfolio_id=row["portfolio_id"],
+            opened_at=row["opened_at"],
+            last_notification_id=row["last_notification_id"],
+            our_entry_px=row["our_entry_px"] if "our_entry_px" in keys else None,
+            side=row["side"] if "side" in keys else None,
+            size=row["size"] if "size" in keys else None,
+            leverage=row["leverage"] if "leverage" in keys else None,
+            recovery_pending=bool(row["recovery_pending"])
+            if "recovery_pending" in keys and row["recovery_pending"] is not None
+            else False,
+            recovery_tp=row["recovery_tp"] if "recovery_tp" in keys else None,
+            recovery_sl=row["recovery_sl"] if "recovery_sl" in keys else None,
+            trader_closing_px=row["trader_closing_px"]
+            if "trader_closing_px" in keys
+            else None,
+        )
 
     def processed_count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS c FROM processed_notifications").fetchone()

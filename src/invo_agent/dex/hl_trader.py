@@ -14,6 +14,7 @@ from hyperliquid.utils.signing import (
     order_request_to_order_wire,
     order_wires_to_order_action,
 )
+from hyperliquid.utils.types import Cloid
 
 from invo_agent.dex.turnkey_client import TurnkeySigner
 
@@ -122,6 +123,7 @@ class HlTrader:
         *,
         reduce_only: bool = False,
         slippage: float = 0.02,
+        cloid: Cloid | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], int]:
         """Place IoC market-style order. Returns (hl_order_payload, hl_response, nonce)."""
         limit_px = self.slippage_price(coin, is_buy, slippage)
@@ -129,17 +131,17 @@ class HlTrader:
         if sz <= 0:
             raise HlTraderError(f"Size rounded to zero for {coin}")
 
-        order_wire = order_request_to_order_wire(
-            {
-                "coin": coin,
-                "is_buy": is_buy,
-                "sz": sz,
-                "limit_px": limit_px,
-                "order_type": {"limit": {"tif": "Ioc"}},
-                "reduce_only": reduce_only,
-            },
-            self.asset_index(coin),
-        )
+        order_req: dict[str, Any] = {
+            "coin": coin,
+            "is_buy": is_buy,
+            "sz": sz,
+            "limit_px": limit_px,
+            "order_type": {"limit": {"tif": "Ioc"}},
+            "reduce_only": reduce_only,
+        }
+        if cloid is not None:
+            order_req["cloid"] = cloid
+        order_wire = order_request_to_order_wire(order_req, self.asset_index(coin))
         action = order_wires_to_order_action([order_wire], None)
         nonce = get_timestamp_ms()
         signature = self.sign_action(action, nonce)
@@ -147,12 +149,34 @@ class HlTrader:
         response = self.post_action(action, signature, nonce)
         return hl_order, response, nonce
 
-    def close_position(self, coin: str, sz: float, is_long: bool, *, slippage: float = 0.02) -> tuple[dict, dict, int]:
+    def close_position(
+        self,
+        coin: str,
+        sz: float,
+        is_long: bool,
+        *,
+        slippage: float = 0.02,
+        cloid: Cloid | None = None,
+    ) -> tuple[dict, dict, int]:
         # closing a long => sell; closing short => buy
-        return self.market_order(coin, is_buy=not is_long, sz=sz, reduce_only=True, slippage=slippage)
+        return self.market_order(
+            coin,
+            is_buy=not is_long,
+            sz=sz,
+            reduce_only=True,
+            slippage=slippage,
+            cloid=cloid,
+        )
 
     def position_size(self, coin: str) -> tuple[float, bool] | None:
         """Return (abs_size, is_long) for coin, or None if flat."""
+        detail = self.position_detail(coin)
+        if detail is None:
+            return None
+        return detail["sz"], detail["is_long"]
+
+    def position_detail(self, coin: str) -> dict[str, Any] | None:
+        """Return sz/is_long/entry_px/leverage for coin, or None if flat."""
         state = self.info.user_state(self.address)
         for item in state.get("assetPositions") or []:
             pos = item.get("position") or {}
@@ -161,5 +185,114 @@ class HlTrader:
             szi = float(pos.get("szi") or 0)
             if szi == 0:
                 return None
-            return abs(szi), szi > 0
+            leverage_raw = pos.get("leverage") or {}
+            lev = leverage_raw.get("value") if isinstance(leverage_raw, dict) else leverage_raw
+            entry_px = pos.get("entryPx")
+            return {
+                "sz": abs(szi),
+                "is_long": szi > 0,
+                "entry_px": float(entry_px) if entry_px is not None else None,
+                "leverage": float(lev) if lev is not None else None,
+            }
         return None
+
+    def cancel_reduce_triggers(self, coin: str) -> list[int]:
+        """Cancel open trigger / position TP-SL orders for coin. Returns cancelled oids."""
+        orders = self.info.frontend_open_orders(self.address)
+        cancelled: list[int] = []
+        for order in orders or []:
+            if order.get("coin") != coin:
+                continue
+            if not (order.get("isTrigger") or order.get("isPositionTpsl")):
+                continue
+            oid = order.get("oid")
+            if oid is None:
+                continue
+            action = {
+                "type": "cancel",
+                "cancels": [{"a": self.asset_index(coin), "o": int(oid)}],
+            }
+            nonce = get_timestamp_ms()
+            sig = self.sign_action(action, nonce)
+            self.post_action(action, sig, nonce)
+            cancelled.append(int(oid))
+        return cancelled
+
+    def place_reduce_trigger(
+        self,
+        coin: str,
+        *,
+        is_buy: bool,
+        sz: float,
+        trigger_px: float,
+        tpsl: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], int]:
+        """Place a reduce-only TP/SL trigger (market on trigger)."""
+        if tpsl not in ("tp", "sl"):
+            raise HlTraderError(f"tpsl must be 'tp' or 'sl', got {tpsl!r}")
+        sz = self.round_size(coin, sz)
+        if sz <= 0:
+            raise HlTraderError(f"Size rounded to zero for {coin}")
+        trigger_px = self.round_price(coin, trigger_px)
+        order_req: dict[str, Any] = {
+            "coin": coin,
+            "is_buy": is_buy,
+            "sz": sz,
+            "limit_px": trigger_px,
+            "order_type": {
+                "trigger": {
+                    "triggerPx": trigger_px,
+                    "isMarket": True,
+                    "tpsl": tpsl,
+                }
+            },
+            "reduce_only": True,
+        }
+        order_wire = order_request_to_order_wire(order_req, self.asset_index(coin))
+        action = order_wires_to_order_action([order_wire], None, grouping="na")
+        nonce = get_timestamp_ms()
+        signature = self.sign_action(action, nonce)
+        hl_order = {"action": action, "nonce": nonce, "signature": signature}
+        response = self.post_action(action, signature, nonce)
+        return hl_order, response, nonce
+
+    def place_position_tpsl(
+        self,
+        coin: str,
+        *,
+        is_long: bool,
+        sz: float,
+        tp_px: float,
+        sl_px: float,
+    ) -> tuple[dict[str, Any], dict[str, Any], int]:
+        """Cancel existing triggers, then place reduce-only TP+SL as positionTpsl."""
+        self.cancel_reduce_triggers(coin)
+        sz = self.round_size(coin, sz)
+        if sz <= 0:
+            raise HlTraderError(f"Size rounded to zero for {coin}")
+        tp_px = self.round_price(coin, tp_px)
+        sl_px = self.round_price(coin, sl_px)
+        is_buy = not is_long  # flatten direction
+        wires = []
+        for trigger_px, tpsl in ((tp_px, "tp"), (sl_px, "sl")):
+            order_req: dict[str, Any] = {
+                "coin": coin,
+                "is_buy": is_buy,
+                "sz": sz,
+                "limit_px": trigger_px,
+                "order_type": {
+                    "trigger": {
+                        "triggerPx": trigger_px,
+                        "isMarket": True,
+                        "tpsl": tpsl,
+                    }
+                },
+                "reduce_only": True,
+            }
+            wires.append(order_request_to_order_wire(order_req, self.asset_index(coin)))
+        action = order_wires_to_order_action(wires, None, grouping="positionTpsl")
+        nonce = get_timestamp_ms()
+        signature = self.sign_action(action, nonce)
+        hl_order = {"action": action, "nonce": nonce, "signature": signature}
+        response = self.post_action(action, signature, nonce)
+        return hl_order, response, nonce

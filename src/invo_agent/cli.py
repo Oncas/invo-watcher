@@ -145,14 +145,21 @@ def status_cmd() -> None:
     if copies:
         ct = Table(title="Open copies (tracked)")
         ct.add_column("Ticker")
+        ct.add_column("Side")
+        ct.add_column("Entry")
+        ct.add_column("Recovery")
         ct.add_column("Base short id")
-        ct.add_column("Investment base id")
         ct.add_column("Opened at")
         for c in copies:
+            recovery = "-"
+            if c.recovery_pending:
+                recovery = f"TP={c.recovery_tp} SL={c.recovery_sl}"
             ct.add_row(
                 c.ticker or "?",
+                c.side or "?",
+                f"{c.our_entry_px:g}" if c.our_entry_px is not None else "?",
+                recovery,
                 c.base_short_id or "?",
-                c.investment_base_id,
                 c.opened_at,
             )
         console.print(ct)
@@ -234,6 +241,16 @@ def dex_status_cmd() -> None:
     table.add_row("organization_id", data.organization_id)
     table.add_row("api_key_id", data.api_key_id or "")
     table.add_row("expires_at_ms", str(data.expires_at_ms or ""))
+    if data.expires_at_ms:
+        from datetime import UTC, datetime
+
+        exp = datetime.fromtimestamp(data.expires_at_ms / 1000, tz=UTC)
+        remaining_h = (exp - datetime.now(UTC)).total_seconds() / 3600
+        table.add_row("expires_at", exp.isoformat())
+        table.add_row(
+            "expires_in",
+            f"{remaining_h:.1f}h" if remaining_h > 0 else "EXPIRED — run dex-login",
+        )
     table.add_row("updated_at", data.updated_at.isoformat())
     console.print(table)
 
@@ -246,6 +263,8 @@ def dex_status_cmd() -> None:
         signer.close()
     except Exception as exc:  # noqa: BLE001
         console.print(f"[yellow]Could not read HL equity:[/yellow] {exc}")
+        if "expired" in str(exc).lower() or "API_KEY" in str(exc):
+            console.print("[red]Run:[/red] invo-agent dex-login")
 
 
 @app.command("reset-state")
@@ -292,7 +311,7 @@ def _run_poll_loop(*, force_dry_run: bool) -> None:
                     db.close()
                     raise typer.Exit(1) from login_exc
 
-        executor = DexExecutor(settings, client=client)
+        executor = DexExecutor(settings, client=client, db=db)
         if settings.live and not settings.dry_run:
             dex_store = DexSessionStore(settings.dex_session_path)
             if dex_store.load() is None:
@@ -351,13 +370,14 @@ def once_cmd(
             client,
             db,
             settings,
-            DexExecutor(settings, client=client),
+            DexExecutor(settings, client=client, db=db),
             session_store=session,
         )
         if skip_catchup:
             poller._watch_started_at = datetime.min.replace(tzinfo=UTC)  # noqa: SLF001
         else:
             poller.ensure_catchup(force=True)
+        poller.reconcile_missed_closes()
         actions = poller.poll_once()
         if not actions:
             console.print("[dim]No new trade notifications.[/dim]")

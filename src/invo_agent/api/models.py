@@ -84,6 +84,9 @@ class InvestmentUpdate(FlexibleModel):
     entry_sim: float | None = Field(default=None, alias="entrySim")
     liquidation_price: float | None = Field(default=None, alias="liquidationPrice")
     current_price: float | None = Field(default=None, alias="currentPrice")
+    closing_price: float | None = Field(default=None, alias="closingPrice")
+    closed_at: datetime | None = Field(default=None, alias="closedAt")
+    percent_change: float | None = Field(default=None, alias="percentChange")
     is_open: bool | None = Field(default=None, alias="isOpen")
     active: bool | None = None
     verified_trade: bool | None = Field(default=None, alias="verifiedTrade")

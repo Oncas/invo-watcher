@@ -1,7 +1,7 @@
 #!/bin/bash
 # <swiftbar.hideAbout>true</swiftbar.hideAbout>
 # <swiftbar.alwaysVisible>true</swiftbar.alwaysVisible>
-# Green/red dot = agent health. Dropdown = open PnL (cached ~60s) + recent trades.
+# Colored circle emoji — SF Symbols render white/template in the menu bar on this Mac.
 
 set -uo pipefail
 
@@ -10,7 +10,7 @@ PY="$ROOT/.venv/bin/python"
 CLI="$ROOT/.venv/bin/invo-agent"
 
 if [[ ! -x "$PY" ]]; then
-  echo "● | color=red size=18"
+  echo "🔴"
   echo "---"
   echo "invo-agent venv missing"
   exit 0
@@ -37,8 +37,7 @@ try:
     snap = collect_hud(s, with_pnl=True)
     write_hud_file(s, snap)
     ok = bool(snap.launchd_loaded and snap.healthy)
-    color = "#30D158" if ok else "#FF453A"
-    print(f"● | color={color} size=18")
+    print("🟢" if ok else "🔴")
     print("---")
 
     # Compact status
@@ -83,7 +82,7 @@ try:
     print(f"Logs | bash={cli} param1=logs terminal=true")
     print(f"Log folder | bash=/usr/bin/open param1={Path.home()}/.invo-agent/logs terminal=false")
 except Exception as exc:
-    print("● | color=#FF453A size=18")
+    print("🔴")
     print("---")
     print("invo-agent error")
     print(str(exc)[:120].replace("|", "/"))

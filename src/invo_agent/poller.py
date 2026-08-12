@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
+import httpx
 from rich.console import Console
 
 from invo_agent.api.client import InvolioAPIError, InvolioClient
-from invo_agent.api.models import ActionType, TradeAction
+from invo_agent.api.models import ActionType, InvestmentUpdate, TradeAction
 from invo_agent.auth.email_otp import login_with_otp
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings
-from invo_agent.db import AgentDB
-from invo_agent.dex.executor import DexExecutor
+from invo_agent.db import AgentDB, OpenCopy
+from invo_agent.dex.executor import DexExecutor, RecoveryResult
+from invo_agent.dex.session import (
+    DexSessionError,
+    DexSessionStore,
+    establish_dex_session,
+    session_is_expired,
+)
 from invo_agent.engine import CopyEngine
 from invo_agent.events import log_event
 from invo_agent.notify import notify_mac
@@ -23,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 CATCHUP_META = "catchup_completed_at"
 HEARTBEAT_EVERY = 8  # polls between "still alive" lines when idle
+# Don't hammer Turnkey OTP if auto dex-login keeps failing.
+DEX_RECOVER_COOLDOWN_SECONDS = 10 * 60
+# Transient network / 5xx: log quietly until this many in a row.
+TRANSIENT_NOTIFY_AFTER = 5
 
 
 class NotificationPoller:
@@ -38,11 +50,16 @@ class NotificationPoller:
         self.db = db
         self.settings = settings
         self.engine = CopyEngine(client, db, settings)
-        self.executor = executor or DexExecutor(settings, client=client)
+        self.executor = executor or DexExecutor(settings, client=client, db=db)
+        if self.executor.db is None:
+            self.executor.db = db
         self.session_store = session_store or client.session
         self._idle_polls = 0
         # Only act on notifications created after this timestamp (set on catch-up).
         self._watch_started_at: datetime | None = None
+        self._dex_recover_after: float = 0.0
+        self._dex_dead_notified = False
+        self._transient_failures = 0
 
     @property
     def is_dry_run(self) -> bool:
@@ -118,6 +135,158 @@ class NotificationPoller:
             sticky=self.settings.mac_notify_sticky,
         )
 
+    @staticmethod
+    def _investment_closed(inv: InvestmentUpdate) -> bool:
+        if inv.is_open is False:
+            return True
+        if inv.closing_price is not None or inv.closed_at is not None:
+            return True
+        return False
+
+    def reconcile_missed_closes(self) -> list[RecoveryResult]:
+        """If Involio closed offline while we still hold HL, flatten or park TP/SL."""
+        if not self.settings.recovery_enabled:
+            logger.info("missed-close recovery disabled")
+            return []
+
+        open_copies = self.db.list_open_copies()
+        if not open_copies:
+            logger.info("missed-close reconcile: no open copies")
+            return []
+
+        console.print(
+            f"[yellow]Missed-close reconcile:[/yellow] checking {len(open_copies)} open copy(ies)…"
+        )
+        results: list[RecoveryResult] = []
+        if not self.is_dry_run:
+            self._ensure_dex_session()
+
+        for copy in open_copies:
+            try:
+                result = self._reconcile_one_copy(copy)
+            except Exception as exc:  # noqa: BLE001
+                if self._is_dex_session_error(exc) and self._recover_dex_session():
+                    try:
+                        result = self._reconcile_one_copy(copy)
+                    except Exception as retry_exc:  # noqa: BLE001
+                        logger.exception(
+                            "missed-close reconcile failed base_id=%s: %s",
+                            copy.investment_base_id,
+                            retry_exc,
+                        )
+                        notify_mac(
+                            "invo-agent · RECOVERY ERROR",
+                            f"{copy.ticker or copy.investment_base_id}: {retry_exc}",
+                            sound="Basso",
+                            enabled=self.settings.mac_notify,
+                            sticky=self.settings.mac_notify_sticky,
+                        )
+                        continue
+                else:
+                    logger.exception(
+                        "missed-close reconcile failed base_id=%s: %s",
+                        copy.investment_base_id,
+                        exc,
+                    )
+                    notify_mac(
+                        "invo-agent · RECOVERY ERROR",
+                        f"{copy.ticker or copy.investment_base_id}: {exc}",
+                        sound="Basso",
+                        enabled=self.settings.mac_notify,
+                        sticky=self.settings.mac_notify_sticky,
+                    )
+                    continue
+            if result is not None:
+                results.append(result)
+
+        closed_n = sum(1 for r in results if r.status in {"closed", "already_flat"})
+        parked_n = sum(1 for r in results if r.status == "parked")
+        log_event(
+            "missed_close_reconcile_done",
+            checked=len(open_copies),
+            results=len(results),
+            closed=closed_n,
+            parked=parked_n,
+        )
+        if results:
+            summary = "; ".join(r.message for r in results[:5])
+            if len(results) > 5:
+                summary += f" (+{len(results) - 5} more)"
+            notify_mac(
+                "invo-agent · RECOVERY",
+                summary,
+                sound=self.settings.mac_notify_sound or None,
+                enabled=self.settings.mac_notify,
+                sticky=self.settings.mac_notify_sticky,
+            )
+        else:
+            console.print("[green]Missed-close reconcile:[/green] nothing to recover")
+        return results
+
+    def _reconcile_one_copy(self, copy: OpenCopy) -> RecoveryResult | None:
+        resp = self.client.get_current_shadow_post_by_investment_base_id(
+            copy.investment_base_id
+        )
+        inv = resp.post.update if resp.post else None
+        if inv is None:
+            logger.warning(
+                "shadow post missing for open copy base_id=%s",
+                copy.investment_base_id,
+            )
+            return None
+        if not self._investment_closed(inv):
+            logger.info(
+                "open copy still open on Involio base_id=%s ticker=%s",
+                copy.investment_base_id,
+                inv.ticker or copy.ticker,
+            )
+            return None
+
+        coin = (inv.ticker or inv.name or copy.ticker or "").upper()
+        if not coin:
+            logger.warning(
+                "closed shadow post has no ticker base_id=%s",
+                copy.investment_base_id,
+            )
+            return None
+
+        result = self.executor.recover_missed_close(
+            coin=coin,
+            inv=inv,
+            our_entry_px=copy.our_entry_px,
+            our_side=copy.side,
+        )
+        if result.status in {"closed", "already_flat"}:
+            self.db.close_copy(copy.investment_base_id)
+            self.db.log_action(
+                action="RECOVERY_CLOSE",
+                summary=result.message,
+                notification_id=None,
+                dry_run=self.is_dry_run,
+            )
+        elif result.status == "parked":
+            self.db.set_recovery_state(
+                copy.investment_base_id,
+                pending=True,
+                recovery_tp=result.tp,
+                recovery_sl=result.sl,
+                trader_closing_px=inv.closing_price,
+            )
+            self.db.log_action(
+                action="RECOVERY_PARK",
+                summary=result.message,
+                notification_id=None,
+                dry_run=self.is_dry_run,
+            )
+        elif result.status == "dry_run":
+            self.db.log_action(
+                action="RECOVERY_DRY_RUN",
+                summary=result.message,
+                notification_id=None,
+                dry_run=True,
+            )
+        return result
+
     def _notify_action(self, action: TradeAction) -> None:
         mode = "DRY-RUN" if self.is_dry_run else "LIVE"
         title = f"invo-agent · {action.action.value}"
@@ -175,27 +344,20 @@ class NotificationPoller:
                 continue
 
             action = self.engine.enrich(notification)
+            if not self.is_dry_run:
+                self._ensure_dex_session()
             try:
                 self.executor.handle(action)
             except Exception as exc:  # noqa: BLE001
-                # Mark processed so we don't retry the same trade every poll.
-                self.db.mark_processed(nid, f"ERROR_{action.action.value}", str(exc)[:500])
-                self.db.log_action(
-                    action=f"ERROR_{action.action.value}",
-                    summary=f"{action.summary}: {exc}"[:500],
-                    notification_id=nid,
-                    dry_run=self.is_dry_run,
-                )
-                logger.exception("executor failed for %s", action.summary)
-                notify_mac(
-                    "invo-agent · ERROR",
-                    f"{action.summary}: {exc}",
-                    subtitle=action.action.value,
-                    sound="Basso",
-                    enabled=self.settings.mac_notify,
-                    sticky=self.settings.mac_notify_sticky,
-                )
-                continue
+                if self._is_dex_session_error(exc) and self._recover_dex_session():
+                    try:
+                        self.executor.handle(action)
+                    except Exception as retry_exc:  # noqa: BLE001
+                        self._record_executor_error(nid, action, retry_exc)
+                        continue
+                else:
+                    self._record_executor_error(nid, action, exc)
+                    continue
             self.engine.remember(action)
             self.db.log_action(
                 action=action.action.value,
@@ -207,6 +369,109 @@ class NotificationPoller:
             logger.info("%s %s", action.action.value, action.summary)
             actions.append(action)
         return actions
+
+    def _record_executor_error(
+        self, nid: str, action: TradeAction, exc: BaseException
+    ) -> None:
+        # Mark processed so we don't retry the same trade every poll.
+        self.db.mark_processed(nid, f"ERROR_{action.action.value}", str(exc)[:500])
+        self.db.log_action(
+            action=f"ERROR_{action.action.value}",
+            summary=f"{action.summary}: {exc}"[:500],
+            notification_id=nid,
+            dry_run=self.is_dry_run,
+        )
+        if self._is_dex_session_error(exc):
+            self.executor.invalidate_trader()
+            logger.error("DEX session error for %s: %s", action.summary, exc)
+            if not self._dex_dead_notified:
+                self._dex_dead_notified = True
+                notify_mac(
+                    "invo-agent · DEX LOGIN NEEDED",
+                    "Turnkey key expired and auto dex-login failed. "
+                    "Check IMAP / run: invo-agent dex-login",
+                    subtitle="Trading paused",
+                    sound="Basso",
+                    enabled=self.settings.mac_notify,
+                    sticky=self.settings.mac_notify_sticky,
+                )
+            return
+        logger.exception("executor failed for %s", action.summary)
+        notify_mac(
+            "invo-agent · ERROR",
+            f"{action.summary}: {exc}",
+            subtitle=action.action.value,
+            sound="Basso",
+            enabled=self.settings.mac_notify,
+            sticky=self.settings.mac_notify_sticky,
+        )
+
+    @staticmethod
+    def _is_dex_session_error(exc: BaseException) -> bool:
+        if isinstance(exc, DexSessionError):
+            return True
+        msg = str(exc).lower()
+        return "api_key_expired" in msg or "expired api key" in msg
+
+    def _ensure_dex_session(self) -> None:
+        """Proactively refresh Turnkey session if local expiry is known."""
+        store = self.executor.dex_store
+        data = store.load()
+        if data is None or not session_is_expired(data):
+            return
+        console.print("[yellow]DEX session expired — auto dex-login...[/yellow]")
+        logger.warning("DEX session expired locally; attempting auto dex-login")
+        self._recover_dex_session()
+
+    def _recover_dex_session(self) -> bool:
+        """IMAP Turnkey OTP → new DEX API key. Rate-limited."""
+        now = time.monotonic()
+        if now < self._dex_recover_after:
+            logger.info(
+                "DEX auto-login cooling down (%.0fs left)",
+                self._dex_recover_after - now,
+            )
+            return False
+
+        if not self.settings.imap_configured:
+            console.print("[red]Cannot auto dex-login — configure IMAP.[/red]")
+            self._dex_recover_after = now + DEX_RECOVER_COOLDOWN_SECONDS
+            return False
+
+        self.executor.invalidate_trader()
+        console.print("[yellow]Auto dex-login via Turnkey OTP email...[/yellow]")
+        logger.info("attempting auto dex-login via IMAP")
+        try:
+            establish_dex_session(
+                self.client,
+                self.settings,
+                DexSessionStore(self.settings.dex_session_path),
+            )
+            self._dex_recover_after = 0.0
+            self._dex_dead_notified = False
+            console.print("[green]DEX session renewed.[/green]")
+            logger.info("auto dex-login succeeded")
+            log_event("dex_auto_login", ok=True)
+            notify_mac(
+                "invo-agent",
+                "DEX session renewed (auto dex-login)",
+                sound=self.settings.mac_notify_sound or None,
+                enabled=self.settings.mac_notify,
+                sticky=self.settings.mac_notify_sticky,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._dex_recover_after = now + DEX_RECOVER_COOLDOWN_SECONDS
+            console.print(f"[red]Auto dex-login failed:[/red] {exc}")
+            logger.error("auto dex-login failed: %s", exc)
+            log_event("dex_auto_login", ok=False, error=str(exc))
+            return False
+
+    def _sleep_interval(self) -> None:
+        base = float(self.settings.poll_interval_seconds)
+        jitter = max(0.0, float(self.settings.poll_jitter_seconds))
+        delay = base + random.uniform(-jitter, jitter) if jitter else base
+        time.sleep(max(0.5, delay))
 
     def _recover_auth(self) -> bool:
         """Try refresh, then IMAP OTP login. Returns True if recovered."""
@@ -286,12 +551,14 @@ class NotificationPoller:
             sticky=self.settings.mac_notify_sticky,
         )
         self.ensure_catchup()
+        self.reconcile_missed_closes()
 
         while True:
             if stop_fn and stop_fn():
                 break
             try:
                 actions = self.poll_once()
+                self._transient_failures = 0
                 if actions:
                     self._idle_polls = 0
                     for action in actions:
@@ -321,6 +588,10 @@ class NotificationPoller:
                             f"watching… (no new trades)[/dim]"
                         )
             except InvolioAPIError as exc:
+                if self._is_transient_api_error(exc):
+                    self._handle_transient(exc, kind="API")
+                    self._sleep_interval()
+                    continue
                 console.print(f"[red]API error:[/red] {exc}")
                 logger.error("API error: %s", exc)
                 notify_mac(
@@ -337,8 +608,12 @@ class NotificationPoller:
                         time.sleep(30)
                         continue
                 else:
-                    time.sleep(self.settings.poll_interval_seconds)
+                    self._sleep_interval()
                     continue
+            except httpx.HTTPError as exc:
+                self._handle_transient(exc, kind="Poller")
+                self._sleep_interval()
+                continue
             except Exception as exc:  # noqa: BLE001
                 console.print(f"[red]poll error:[/red] {exc}")
                 logger.exception("poll error")
@@ -350,4 +625,35 @@ class NotificationPoller:
                     enabled=self.settings.mac_notify,
                     sticky=self.settings.mac_notify_sticky,
                 )
-            time.sleep(self.settings.poll_interval_seconds)
+            self._sleep_interval()
+
+    @staticmethod
+    def _is_transient_api_error(exc: InvolioAPIError) -> bool:
+        if exc.status_code in (408, 425, 429, 500, 502, 503, 504):
+            return True
+        msg = str(exc).lower()
+        return any(
+            needle in msg
+            for needle in (
+                "disconnected",
+                "timeout",
+                "temporarily",
+                "connection reset",
+                "connect error",
+            )
+        )
+
+    def _handle_transient(self, exc: BaseException, *, kind: str) -> None:
+        self._transient_failures += 1
+        n = self._transient_failures
+        console.print(f"[yellow]transient {kind.lower()} blip ({n}):[/yellow] {exc}")
+        logger.warning("transient %s (%s): %s", kind, n, exc)
+        if n >= TRANSIENT_NOTIFY_AFTER and n % TRANSIENT_NOTIFY_AFTER == 0:
+            notify_mac(
+                "invo-agent · WARN",
+                f"{n}x network blips: {exc}",
+                subtitle=kind,
+                sound=None,
+                enabled=self.settings.mac_notify,
+                sticky=False,
+            )

@@ -33,12 +33,13 @@ def complete_login(
 ) -> SessionData:
     del settings  # reserved for future device metadata
     device_id = session.get_or_create_device_id()
+    # Match Flutter web: deviceType/deviceInfo are null (not "invo-agent").
     result = client.login_email(
         email=email,
         code=code.strip(),
         device_id=device_id,
-        device_type="web",
-        device_info="invo-agent/0.1.0 (Macintosh)",
+        device_type=None,
+        device_info=None,
     )
     if not result.access_token or not result.refresh_token:
         raise LoginError(f"login/email failed: {result.error}")
