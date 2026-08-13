@@ -116,6 +116,8 @@ def status_cmd() -> None:
     table.add_row("live", str(settings.live))
     table.add_row("mac_notify", str(settings.mac_notify))
     table.add_row("mac_notify_sticky", str(settings.mac_notify_sticky))
+    table.add_row("hud_token", "set" if settings.hud_token else "(disabled)")
+    table.add_row("hud_sync_url", settings.hud_sync_url or "(local trader)")
     table.add_row("alerter", find_alerter() or "(missing — will auto-download)")
     table.add_row("poll_interval_seconds", str(settings.poll_interval_seconds))
     table.add_row("position_pct", str(settings.position_pct))
@@ -323,6 +325,14 @@ def _run_poll_loop(*, force_dry_run: bool) -> None:
                 f"position_pct={settings.position_pct}%"
             )
 
+        if settings.hud_token:
+            from invo_agent.server import start_hud_server
+
+            start_hud_server(settings)
+            console.print(
+                f"[dim]hud API {settings.hud_bind}:{settings.hud_port}[/dim]"
+            )
+
         poller = NotificationPoller(client, db, settings, executor, session_store=session)
         try:
             poller.run_forever()
@@ -450,6 +460,66 @@ def install_service_cmd(
     )
 
 
+@app.command("hud-sync")
+def hud_sync_cmd() -> None:
+    """Poll the remote HUD API and write local hud.json + log tails (Mac sidecar)."""
+    from invo_agent.hud_sync import run_forever
+
+    settings = get_settings()
+    if not settings.hud_sync_url or not settings.hud_token:
+        console.print("[red]Set HUD_SYNC_URL and HUD_TOKEN in .env[/red]")
+        raise typer.Exit(1)
+    console.print(f"[dim]hud-sync → {settings.hud_sync_url}[/dim]")
+    try:
+        run_forever(settings)
+    except KeyboardInterrupt:
+        console.print("\n[dim]hud-sync stopped[/dim]")
+
+
+@app.command("install-hud-sync")
+def install_hud_sync_cmd() -> None:
+    """Install a launchd agent that polls the VPS HUD API every 1s."""
+    settings = get_settings()
+    if not settings.hud_sync_url or not settings.hud_token:
+        console.print("[red]Set HUD_SYNC_URL and HUD_TOKEN in .env first.[/red]")
+        raise typer.Exit(1)
+    try:
+        path = launchd_service.install_hud_launchd(log_dir=settings.log_dir)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]install failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]Installed[/green] {path}")
+    console.print(f"Polling {settings.hud_sync_url} · logs: {settings.log_dir}")
+    console.print("Unload anytime: invo-agent uninstall-hud-sync")
+    notify_mac(
+        "invo-agent",
+        "hud-sync launchd installed",
+        subtitle="Service",
+        sound=settings.mac_notify_sound or None,
+        enabled=settings.mac_notify,
+        sticky=settings.mac_notify_sticky,
+    )
+
+
+@app.command("uninstall-hud-sync")
+def uninstall_hud_sync_cmd() -> None:
+    """Unload and remove the hud-sync launchd agent."""
+    settings = get_settings()
+    path = launchd_service.uninstall_hud_launchd()
+    if path:
+        console.print(f"[green]Removed[/green] {path}")
+    else:
+        console.print("[dim]No hud-sync plist found (launchctl remove attempted).[/dim]")
+    notify_mac(
+        "invo-agent",
+        "hud-sync uninstalled",
+        subtitle="Service",
+        sound=None,
+        enabled=settings.mac_notify,
+        sticky=settings.mac_notify_sticky,
+    )
+
+
 @app.command("uninstall-service")
 def uninstall_service_cmd() -> None:
     """Unload and remove the launchd agent."""
@@ -481,20 +551,39 @@ def watch_cmd(
         format_pnl,
         format_pnl_24h,
         format_roe,
+        hud_file_age_seconds,
+        load_hud_file,
         write_hud_file,
     )
 
     settings = get_settings()
+    remote = bool(settings.hud_sync_url)
     console.print(
         "[dim]Watching invo-agent (Ctrl+C to stop). "
-        "PnL refreshes at most every 5s.[/dim]\n"
+        + (
+            "Reading local hud.json from hud-sync."
+            if remote
+            else "PnL refreshes at most every 5s."
+        )
+        + "[/dim]\n"
     )
     try:
         while True:
-            snap = collect_hud(settings, with_pnl=True)
-            write_hud_file(settings, snap)
+            if remote:
+                snap = load_hud_file(settings)
+                if snap is None:
+                    console.clear()
+                    console.print("[red]No hud.json yet — is hud-sync running?[/red]")
+                    _time.sleep(interval)
+                    continue
+            else:
+                snap = collect_hud(settings, with_pnl=True)
+                write_hud_file(settings, snap)
             console.clear()
-            health = "[green]ok[/green]" if snap.healthy else "[red]problem[/red]"
+            sidecar_age = hud_file_age_seconds(settings) if remote else None
+            sidecar_ok = sidecar_age is not None and sidecar_age < 5
+            ok = snap.healthy and (sidecar_ok if remote else True)
+            health = "[green]ok[/green]" if ok else "[red]problem[/red]"
             console.print(f"[bold]invo-agent[/bold]  {snap.mode}  {health}")
             age = (
                 f"{snap.poll_age_seconds:.0f}s ago"
@@ -627,6 +716,8 @@ def service_status_cmd() -> None:
     settings = get_settings()
     running = launchd_service.launchd_running()
     path = launchd_service.plist_path()
+    hud_running = launchd_service.hud_launchd_running()
+    hud_path = launchd_service.hud_plist_path()
     table = Table(title="launchd")
     table.add_column("Key")
     table.add_column("Value")
@@ -634,6 +725,10 @@ def service_status_cmd() -> None:
     table.add_row("plist", str(path))
     table.add_row("exists", str(path.exists()))
     table.add_row("loaded", str(running))
+    table.add_row("hud_label", launchd_service.HUD_LABEL)
+    table.add_row("hud_plist", str(hud_path))
+    table.add_row("hud_exists", str(hud_path.exists()))
+    table.add_row("hud_loaded", str(hud_running))
     table.add_row("log_dir", str(settings.log_dir))
     console.print(table)
 

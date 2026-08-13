@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -106,17 +106,18 @@ def _account_value_samples(portfolio: object) -> list[tuple[int, float]]:
 def _baseline_at_window_start(
     samples: list[tuple[int, float]], window_start_ms: int
 ) -> tuple[int, float] | None:
-    """Account value at T−24h: last sample at/before the window start.
+    """Account value at T−24h: HL print closest to the window open.
 
-    Using the first sample *after* T−24h bakes later trading PnL into the
-    baseline (Involio's header uses the last known equity at window open).
+    perpDay history is sparse (hours between points). Last-at-or-before can
+    sit hours early and fold that gap's trading into 24h PnL; first-after can
+    sit hours late. Involio's header uses the nearest print (tie → earlier).
     """
     if not samples:
         return None
-    before = [row for row in samples if row[0] <= window_start_ms]
-    if before:
-        return before[-1]
-    return samples[0]
+    return min(
+        samples,
+        key=lambda row: (abs(row[0] - window_start_ms), row[0] > window_start_ms),
+    )
 
 
 def _ledger_flow_usd(delta: dict, address: str) -> tuple[float, float]:
@@ -293,7 +294,12 @@ def _fetch_hl_pnl(settings: Settings) -> dict:
     return out
 
 
-def collect_hud(settings: Settings, *, with_pnl: bool = True) -> HudSnapshot:
+def collect_hud(
+    settings: Settings,
+    *,
+    with_pnl: bool = True,
+    supervisor_ok: bool | None = None,
+) -> HudSnapshot:
     db = AgentDB(settings.db_path)
     session = SessionStore(settings.session_path).load()
     last_poll = db.get_meta("last_poll_at")
@@ -302,7 +308,10 @@ def collect_hud(settings: Settings, *, with_pnl: bool = True) -> HudSnapshot:
     age = (now - poll_dt).total_seconds() if poll_dt else None
 
     stale_after = max(30.0, settings.poll_interval_seconds * 4)
-    launchd = launchd_service.launchd_running()
+    if supervisor_ok is None:
+        launchd = launchd_service.launchd_running()
+    else:
+        launchd = supervisor_ok
     healthy = bool(launchd and age is not None and age <= stale_after)
 
     if settings.live and not settings.dry_run:
@@ -362,6 +371,38 @@ def collect_hud(settings: Settings, *, with_pnl: bool = True) -> HudSnapshot:
         positions=positions,
         pnl_updated_at=pnl_updated_at,
     )
+
+
+def load_hud_file(settings: Settings) -> HudSnapshot | None:
+    path = hud_path(settings)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    allowed = {f.name for f in fields(HudSnapshot)}
+    payload = {k: v for k, v in data.items() if k in allowed}
+    rows = []
+    for row in payload.get("positions") or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            rows.append(PositionRow(**row))
+        except TypeError:
+            continue
+    payload["positions"] = rows
+    try:
+        return HudSnapshot(**payload)
+    except TypeError:
+        return None
+
+
+def hud_file_age_seconds(settings: Settings) -> float | None:
+    path = hud_path(settings)
+    if not path.exists():
+        return None
+    return time.time() - path.stat().st_mtime
 
 
 def write_hud_file(settings: Settings, snap: HudSnapshot | None = None) -> Path:

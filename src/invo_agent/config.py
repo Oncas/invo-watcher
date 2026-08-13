@@ -70,6 +70,15 @@ class Settings(BaseSettings):
     mac_notify_sticky: bool = True
     log_level: str = "INFO"
 
+    # Snapshot HTTP API (VPS). Empty token = server disabled.
+    hud_token: str = ""
+    hud_bind: str = "127.0.0.1"
+    hud_port: int = 8787
+
+    # Mac sidecar: poll this base URL (e.g. http://invo-vps:8787).
+    hud_sync_url: str = ""
+    hud_sync_interval_seconds: float = 1.0
+
     @property
     def portfolio_ids(self) -> set[str]:
         raw = self.portfolio_allowlist.strip()

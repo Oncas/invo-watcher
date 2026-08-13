@@ -1,0 +1,36 @@
+name: Deploy VPS
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Join tailnet
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: SSH and deploy
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${VPS_HOST:-}" ]]; then
+            echo "Set repo secret VPS_HOST (Tailscale MagicDNS name)" >&2
+            exit 1
+          fi
+          user="${VPS_USER:-invo}"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          if [[ -n "${VPS_SSH_KEY:-}" ]]; then
+            printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
+            chmod 600 ~/.ssh/id_ed25519
+          fi
+          ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            "${user}@${VPS_HOST}" \
+            '/opt/invo-agent/scripts/vps-deploy.sh'

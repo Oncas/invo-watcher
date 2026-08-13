@@ -163,6 +163,29 @@ class AgentDB:
         )
         self._conn.commit()
 
+    def actions_after(self, after_id: int, *, limit: int = 50) -> list[ActionLogRow]:
+        rows = self._conn.execute(
+            """
+            SELECT id, created_at, action, summary, notification_id, dry_run
+            FROM action_log
+            WHERE id > ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (after_id, limit),
+        ).fetchall()
+        return [
+            ActionLogRow(
+                id=row["id"],
+                created_at=row["created_at"],
+                action=row["action"],
+                summary=row["summary"],
+                notification_id=row["notification_id"],
+                dry_run=bool(row["dry_run"]),
+            )
+            for row in rows
+        ]
+
     def recent_actions(self, limit: int = 20) -> list[ActionLogRow]:
         rows = self._conn.execute(
             """

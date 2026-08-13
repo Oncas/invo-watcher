@@ -1,17 +1,37 @@
 # invo-agent
 
-Mac-local agent that watches Involio portfolio trade notifications and auto-mimics **OPEN / UPDATE / CLOSE** on Hyperliquid (via Involio’s DEX / Turnkey wallet).
+Watches Involio portfolio trade notifications and copies **OPEN / UPDATE / CLOSE** on Hyperliquid (via Involio’s DEX / Turnkey wallet).
 
-**Risk:** Involio’s Terms ban bots/scrapers. This uses their private web API with your own account. Ban risk is real. Default mode is **dry-run only** (no real orders).
+**Recommended layout:** the trader runs 24/7 on a cheap Tailscale VPS. Your Mac is a thin client — SwiftBar + sticky `alerter` notifications — that polls **your** snapshot API every 1s. The Mac never calls Involio or Hyperliquid.
+
+**Risk:** Involio’s Terms ban bots/scrapers. This uses their private web API with your own account. Ban risk is real. Default mode is **dry-run only** (no real orders). Do not run two LIVE pollers against the same wallet.
+
+---
+
+## Architecture
+
+```
+Involio / Hyperliquid  →  VPS poller + agent.db + logs
+                              ↓  GET /v1/hud|events|logs  (Tailscale, HUD_TOKEN)
+Mac hud-sync (1s)  →  ~/.invo-agent/hud.json + log tails  →  SwiftBar / alerter
+```
+
+| Where | What |
+|-------|------|
+| **VPS** | Involio poll (~4s), DEX/Turnkey, IMAP OTP, `agent.db`, HL PnL snapshot, `GET /v1/*` |
+| **Mac** | `invo-agent hud-sync` LaunchAgent, SwiftBar, sticky notifications |
+
+`healthy` on the server means the poller loop is current. Green in SwiftBar also requires `hud.json` newer than ~5s (sidecar is alive).
 
 ---
 
 ## Requirements (Mac)
 
-- macOS (Notification Center + optional `launchd`)
+- macOS (Notification Center + SwiftBar + `launchd` sidecar)
 - Python **3.12+** (`python3 --version`)
-- An Involio account with email OTP login
-- Gmail (or IMAP) for auto-reading OTP codes
+- Tailscale on the same tailnet as the VPS
+- An Involio account with email OTP login (used on the **VPS**)
+- Gmail (or IMAP) on the **VPS** for OTP auto-login
 - Hyperliquid equity in the Involio wallet (for live trading later)
 
 ---
@@ -73,8 +93,11 @@ MAC_NOTIFY_SOUND=Glass
 | `MIN_EQUITY_USD` | Skip trades if HL equity is below this |
 | `MIN_ORDER_USD` | Skip if sized margin is below this |
 | `PORTFOLIO_ALLOWLIST` | Only act on these followed portfolios |
-| `MAC_NOTIFY` | macOS notifications on actions/errors |
+| `MAC_NOTIFY` | macOS notifications on actions/errors (Mac sidecar; set `false` on the VPS) |
 | `MAC_NOTIFY_STICKY` | Stay until **Dismiss** (Slack-style via `alerter`) |
+| `HUD_TOKEN` | Shared bearer token. Set on the VPS to enable `GET /v1/*`; same value on the Mac |
+| `HUD_BIND` / `HUD_PORT` | Snapshot API bind (VPS: `0.0.0.0:8787`, firewall only on `tailscale0`) |
+| `HUD_SYNC_URL` | Mac sidecar base URL, e.g. `http://invo-vps:8787` |
 
 Sessions and state are stored under `~/.invo-agent/` (not in the repo):
 
@@ -217,9 +240,92 @@ LIVE=false
 
 ---
 
-## 7. Keep it running on Mac (`launchd`)
+## 7. Mac menu bar (after the VPS is up)
 
-Foreground is fine for testing. For always-on:
+On the Mac `.env` (no Turnkey keys, no `LIVE=true`):
+
+```env
+HUD_SYNC_URL=http://<vps-magicdns>:8787
+HUD_TOKEN=<same as /etc/invo-agent.env on the VPS>
+MAC_NOTIFY=true
+MAC_NOTIFY_STICKY=true
+```
+
+```bash
+invo-agent install-hud-sync
+invo-agent service-status
+```
+
+That writes `~/Library/LaunchAgents/com.invo-agent.hud.plist`. Every 1s it:
+
+- writes `~/.invo-agent/hud.json`
+- appends log tails into `~/.invo-agent/logs/`
+- fires `notify_mac()` for new OPEN / UPDATE / CLOSE / ERROR_* / SKIP_* / RECOVERY_*
+
+SwiftBar only reads `hud.json` (no live HL/Turnkey). Copy `scripts/swiftbar/invo-agent.5s.sh` into your SwiftBar plugins folder.
+
+Unload the old Mac trader if it is still loaded:
+
+```bash
+invo-agent uninstall-service
+```
+
+---
+
+## 8. VPS (24/7 trader)
+
+1 vCPU / 1GB RAM / 10GB Ubuntu 24.04 is enough (no Docker). On a fresh box, as root:
+
+```bash
+# after cloning this repo onto the box, or curl the script
+sudo bash /opt/invo-agent/scripts/vps-bootstrap.sh
+sudo tailscale up
+```
+
+Bootstrap: 1GB swap, `invo` user, venv, systemd, logrotate (~14 days), journald cap, ufw on `tailscale0:22` + `tailscale0:8787` only, generates `HUD_TOKEN` in `/etc/invo-agent.env`.
+
+Copy state from the Mac **before** going LIVE (secrets stay outside git):
+
+```bash
+# on the Mac
+scp ~/.invo-agent/session.json ~/.invo-agent/dex-session.json ~/.invo-agent/agent.db \
+  invo@<vps-magicdns>:/tmp/
+# on the VPS
+sudo install -o invo -g invo -m 600 /tmp/session.json /var/lib/invo-agent/session.json
+sudo install -o invo -g invo -m 600 /tmp/dex-session.json /var/lib/invo-agent/dex-session.json
+sudo install -o invo -g invo -m 600 /tmp/agent.db /var/lib/invo-agent/agent.db
+sudo -e /etc/invo-agent.env   # IMAP + INVO_EMAIL + PORTFOLIO_ALLOWLIST; keep MAC_NOTIFY=false
+```
+
+Start dry-run first:
+
+```bash
+sudo systemctl start invo-agent
+curl -sS -H "Authorization: Bearer $HUD_TOKEN" http://127.0.0.1:8787/v1/health
+```
+
+### Auto-deploy on push to `main`
+
+Repo secrets: `TAILSCALE_AUTHKEY` (ephemeral, tagged `tag:ci`), `VPS_HOST` (MagicDNS), optional `VPS_SSH_KEY` / `VPS_USER` (default `invo`).
+
+The Action joins the tailnet and SSHes to run `scripts/vps-deploy.sh`: fetch `origin/main`, `pip install -e .`, `systemctl restart invo-agent`, wait until `GET /v1/health` is OK. A failed health check leaves the unit as-is (check `journalctl -u invo-agent`) — no silent rollback. Deploy never overwrites `/etc/invo-agent.env` or `/var/lib/invo-agent/`.
+
+Mac `hud-sync` / SwiftBar are **not** auto-deployed.
+
+### Cutover (no dual traders)
+
+1. Ship API + `hud-sync` while the Mac still runs the trader (API unused).
+2. Point SwiftBar at local `hud.json` from `hud-sync` against the VPS in **dry-run**.
+3. `invo-agent uninstall-service` on the Mac, set `LIVE=true` / `DRY_RUN=false` on the VPS, `systemctl restart invo-agent`, `invo-agent install-hud-sync` on the Mac.
+4. Confirm one `last_poll_at` advancing and no second process calling Involio.
+
+Do not put Turnkey keys on the Mac after cutover. IMAP on the VPS is required so OTP auto-login still works when keys expire.
+
+---
+
+## Local Mac trader (optional)
+
+Foreground is fine for testing without a VPS:
 
 ```bash
 # Safe: forces dry-run even if .env has LIVE=true
@@ -229,7 +335,7 @@ invo-agent service-status
 tail -f ~/.invo-agent/logs/agent.log
 ```
 
-After you trust live:
+After you trust live (Mac-only — skip if the VPS is the trader):
 
 ```bash
 invo-agent install-service --mode run   # honors DRY_RUN / LIVE from .env
@@ -257,8 +363,11 @@ invo-agent run                   # loop, honors .env LIVE/DRY_RUN
 invo-agent dex-login             # Turnkey / wallet OTP
 invo-agent dex-status            # HL equity
 invo-agent notify-test           # sticky alert until Dismiss
-invo-agent install-service       # launchd background
+invo-agent install-service       # launchd Mac trader (optional)
 invo-agent uninstall-service
+invo-agent hud-sync              # Mac sidecar (foreground)
+invo-agent install-hud-sync      # launchd sidecar
+invo-agent uninstall-hud-sync
 invo-agent service-status
 invo-agent reset-state -y        # clear local DB (not login)
 ```
@@ -293,9 +402,9 @@ rm -f "$HOME/Library/Application Support/SwiftBar/Plugins/invo-agent.15s.sh"
 # Open SwiftBar once; pick …/SwiftBar/Plugins if asked
 ```
 
-Menu bar: green/red `●`. Click for open-trade PnL (cached ≤5s), recent actions, Status / Watch / Logs.
+Menu bar: green/red `●`. Green = server poller current **and** `hud.json` newer than 5s. Click for open-trade PnL, recent actions, Status / Watch / Logs (local cache).
 
-Also written every refresh: `~/.invo-agent/hud.json`.
+`hud-sync` writes `~/.invo-agent/hud.json` every 1s. SwiftBar does not call Hyperliquid.
 
 ---
 
@@ -393,8 +502,10 @@ src/invo_agent/
   poller.py      # notification loop + startup catch-up / missed-close reconcile
   engine.py      # notification → OPEN/UPDATE/CLOSE
   db.py          # processed ids + open copies (entry + recovery state)
+  server.py      # Tailscale snapshot API (GET /v1/hud|events|logs|health)
+  hud_sync.py    # Mac sidecar
   notify.py      # macOS Notification Center
-  service.py     # launchd install/unload
+  service.py     # launchd install/unload (trader + hud-sync)
   logging_setup.py
   cli.py
 ```

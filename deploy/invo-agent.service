@@ -1,0 +1,21 @@
+[Unit]
+Description=invo-agent trader (Involio poll + Hyperliquid + HUD API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=invo
+Group=invo
+WorkingDirectory=/opt/invo-agent
+EnvironmentFile=-/etc/invo-agent.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/invo-agent/.venv/bin/invo-agent run
+Restart=always
+RestartSec=3
+# Do not wipe logs or state on restart.
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

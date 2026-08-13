@@ -4,7 +4,9 @@ import subprocess
 from pathlib import Path
 
 LABEL = "com.invo-agent"
+HUD_LABEL = "com.invo-agent.hud"
 PLIST_NAME = f"{LABEL}.plist"
+HUD_PLIST_NAME = f"{HUD_LABEL}.plist"
 
 
 def project_root() -> Path:
@@ -18,6 +20,10 @@ def launch_agents_dir() -> Path:
 
 def plist_path() -> Path:
     return launch_agents_dir() / PLIST_NAME
+
+
+def hud_plist_path() -> Path:
+    return launch_agents_dir() / HUD_PLIST_NAME
 
 
 def render_plist(
@@ -109,11 +115,109 @@ def uninstall_launchd() -> Path | None:
     return None
 
 
+def _label_loaded(label: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["launchctl", "list"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return False
+    for line in (result.stdout or "").splitlines():
+        parts = line.split()
+        if parts and parts[-1] == label:
+            return True
+    return False
+
+
 def launchd_running() -> bool:
+    return _label_loaded(LABEL)
+
+
+def render_hud_plist(
+    *,
+    working_directory: Path,
+    wrapper: Path,
+    log_dir: Path,
+) -> str:
+    log_dir = log_dir.expanduser()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{HUD_LABEL}</string>
+  <key>WorkingDirectory</key>
+  <string>{working_directory}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>{wrapper}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>INVO_AGENT_LOG_DIR</key>
+    <string>{log_dir}</string>
+  </dict>
+</dict>
+</plist>
+"""
+
+
+def _load_plist(path: Path) -> None:
+    subprocess.run(["launchctl", "unload", str(path)], check=False, capture_output=True)
     result = subprocess.run(
-        ["launchctl", "list"],
+        ["launchctl", "load", str(path)],
         check=False,
         capture_output=True,
         text=True,
     )
-    return LABEL in (result.stdout or "")
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "launchctl load failed")
+
+
+def install_hud_launchd(*, log_dir: Path) -> Path:
+    root = project_root()
+    wrapper = (root / "scripts" / "hud-sync-run.sh").absolute()
+    if not wrapper.exists():
+        raise RuntimeError(f"Missing hud-sync wrapper: {wrapper}")
+    wrapper.chmod(0o755)
+
+    launch_agents_dir().mkdir(parents=True, exist_ok=True)
+    path = hud_plist_path()
+    path.write_text(
+        render_hud_plist(
+            working_directory=root.absolute(),
+            wrapper=wrapper,
+            log_dir=log_dir,
+        )
+    )
+    _load_plist(path)
+    return path
+
+
+def uninstall_hud_launchd() -> Path | None:
+    path = hud_plist_path()
+    if path.exists():
+        subprocess.run(["launchctl", "unload", str(path)], check=False, capture_output=True)
+        path.unlink(missing_ok=True)
+        return path
+    subprocess.run(["launchctl", "remove", HUD_LABEL], check=False, capture_output=True)
+    return None
+
+
+def hud_launchd_running() -> bool:
+    return _label_loaded(HUD_LABEL)
