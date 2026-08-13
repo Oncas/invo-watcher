@@ -121,7 +121,7 @@ def _account_value_samples(portfolio: object) -> list[tuple[int, float]]:
     """Merge perpDay+perpWeek accountValueHistory (Involio baseline source)."""
     samples: list[tuple[int, float]] = []
     seen: set[int] = set()
-    for series in _portfolio_series(portfolio, "perpDay", "perpWeek", "day", "week"):
+    for series in _portfolio_series(portfolio, "perpDay", "perpWeek"):
         for row in series.get("accountValueHistory") or []:
             try:
                 ts = int(row[0])
@@ -139,18 +139,21 @@ def _account_value_samples(portfolio: object) -> list[tuple[int, float]]:
 def _baseline_at_window_start(
     samples: list[tuple[int, float]], window_start_ms: int
 ) -> tuple[int, float] | None:
-    """Account value at T−24h: HL print closest to the window open.
+    """Account value at T−24h: last perp print at or before the window open.
 
-    perpDay history is sparse (hours between points). Last-at-or-before can
-    sit hours early and fold that gap's trading into 24h PnL; first-after can
-    sit hours late. Involio's header uses the nearest print (tie → earlier).
+    Involio's wallet header is rolling 24h (now − 24h, not local midnight).
+    perpDay prints are hours apart. ``nearest`` looks right until T−24h slides
+    closer to the next print, then we jump and the HUD drifts from the site.
+    The site keeps the last print with ``ts <= T−24h`` (else the first after).
     """
-    if not samples:
-        return None
-    return min(
-        samples,
-        key=lambda row: (abs(row[0] - window_start_ms), row[0] > window_start_ms),
-    )
+    last_at_or_before: tuple[int, float] | None = None
+    first_after: tuple[int, float] | None = None
+    for row in samples:
+        if row[0] <= window_start_ms:
+            last_at_or_before = row
+        elif first_after is None:
+            first_after = row
+    return last_at_or_before or first_after
 
 
 def _ledger_flow_usd(delta: dict, address: str) -> tuple[float, float]:
