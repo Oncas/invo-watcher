@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,8 +17,10 @@ from invo_agent.dex.turnkey_crypto import (
     generate_p256_keypair,
     public_key_from_private,
 )
+from invo_agent.events import log_event
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 class DexSessionData(BaseModel):
@@ -166,10 +169,33 @@ def establish_dex_session(
     api_private = decrypt_credential_bundle(bundle, keypair.private_key_hex)
     api_public = public_key_from_private(api_private)
 
-    expires_at_ms = login.get("expiresAtMs")
+    raw_expires_at_ms = login.get("expiresAtMs")
+    expires_at_ms = raw_expires_at_ms
     if expires_at_ms is None:
         # API often omits this; estimate from requested TTL so we can warn.
         expires_at_ms = int(datetime.now(UTC).timestamp() * 1000) + expiration_seconds * 1000
+    remaining_s = (int(expires_at_ms) / 1000.0) - datetime.now(UTC).timestamp()
+    logger_msg = (
+        f"DEX login TTL requested={expiration_seconds}s "
+        f"raw_expiresAtMs={raw_expires_at_ms} stored={expires_at_ms} "
+        f"remaining_s={remaining_s:.0f}"
+    )
+    logger.info("%s", logger_msg)
+    console.print(f"[dim]{logger_msg}[/dim]")
+    log_event(
+        "dex_login_ttl",
+        requested_expiration_seconds=expiration_seconds,
+        raw_expires_at_ms=raw_expires_at_ms,
+        stored_expires_at_ms=int(expires_at_ms),
+        remaining_seconds=round(remaining_s, 1),
+        api_key_id=login.get("apiKeyId"),
+    )
+    if remaining_s < 3600:
+        console.print(
+            f"[yellow]DEX key TTL is only {remaining_s / 60:.1f} min "
+            f"(requested {expiration_seconds / 86400:.0f}d) — "
+            f"will background-renew before it dies.[/yellow]"
+        )
 
     session = DexSessionData(
         organization_id=str(org_id),
@@ -200,18 +226,52 @@ def establish_dex_session(
     return session
 
 
-def session_is_expired(data: DexSessionData, *, skew_seconds: int = 60) -> bool:
+def session_ttl_remaining_seconds(data: DexSessionData) -> float | None:
     if data.expires_at_ms is None:
+        return None
+    return (int(data.expires_at_ms) / 1000.0) - datetime.now(UTC).timestamp()
+
+
+def session_is_expired(data: DexSessionData, *, skew_seconds: int = 60) -> bool:
+    remaining = session_ttl_remaining_seconds(data)
+    if remaining is None:
         return False
-    now_ms = int(datetime.now(UTC).timestamp() * 1000)
-    return now_ms >= int(data.expires_at_ms) - skew_seconds * 1000
+    return remaining <= float(skew_seconds)
 
 
-def load_signer(store: DexSessionStore) -> tuple[DexSessionData, TurnkeySigner]:
+def session_should_proactive_renew(
+    data: DexSessionData,
+    *,
+    renew_before_seconds: float = 6 * 3600,
+) -> bool:
+    """True when we should IMAP-OTP a new key off the trade path.
+
+    Lead time is ``renew_before_seconds``, but never more than 25% of the
+    issued TTL (so a 15-minute key renews ~4 minutes before death, not every poll).
+    """
+    remaining = session_ttl_remaining_seconds(data)
+    if remaining is None:
+        return False
+    if remaining <= 0:
+        return True
+    issued: float | None = None
+    if data.updated_at is not None and data.expires_at_ms is not None:
+        issued = (int(data.expires_at_ms) / 1000.0) - data.updated_at.timestamp()
+    lead = float(renew_before_seconds)
+    if issued is not None and issued > 0:
+        lead = min(lead, max(90.0, issued * 0.25))
+    else:
+        lead = max(90.0, lead)
+    return remaining <= lead
+
+
+def load_signer(
+    store: DexSessionStore, *, require_fresh: bool = False
+) -> tuple[DexSessionData, TurnkeySigner]:
     data = store.load()
     if data is None:
         raise DexSessionError("No DEX session. Run: invo-agent dex-login")
-    if session_is_expired(data):
+    if require_fresh and session_is_expired(data):
         raise DexSessionError(
             "DEX session expired. Run: invo-agent dex-login"
         )

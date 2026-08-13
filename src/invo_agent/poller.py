@@ -5,23 +5,30 @@ import random
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from uuid import UUID
 
 import httpx
 from rich.console import Console
 
 from invo_agent.api.client import InvolioAPIError, InvolioClient
-from invo_agent.api.models import ActionType, InvestmentUpdate, TradeAction
+from invo_agent.api.models import ActionType, InvestmentUpdate, Notification, TradeAction
 from invo_agent.auth.email_otp import login_with_otp
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings
-from invo_agent.db import AgentDB, OpenCopy
+from invo_agent.db import AgentDB, OpenCopy, PendingIntent
 from invo_agent.dex.executor import DexExecutor, RecoveryResult
-from invo_agent.dex.hl_trader import InsufficientMarginError, SameCoinOpenError
+from invo_agent.dex.hl_trader import (
+    InsufficientMarginError,
+    IocUnfilledError,
+    PriceNotBetterError,
+    SameCoinOpenError,
+)
 from invo_agent.dex.session import (
     DexSessionError,
     DexSessionStore,
     establish_dex_session,
-    session_is_expired,
+    session_should_proactive_renew,
+    session_ttl_remaining_seconds,
 )
 from invo_agent.engine import CopyEngine
 from invo_agent.events import log_event
@@ -349,11 +356,39 @@ class NotificationPoller:
             action = self.engine.enrich(notification)
             if not self.is_dry_run:
                 self._ensure_dex_session()
+
+            if action.action is ActionType.CLOSE:
+                self._cancel_pending_for_action(action, reason="trader_close")
+            elif (
+                action.action is ActionType.UPDATE
+                and self._refresh_pending_from_update(action)
+            ):
+                self.db.mark_processed(nid, "QUEUED_UPDATE", action.summary)
+                self.db.log_action(
+                    action="QUEUED_UPDATE",
+                    summary=action.summary,
+                    notification_id=nid,
+                    dry_run=self.is_dry_run,
+                )
+                logger.info("queued UPDATE refreshed pending %s", action.summary)
+                continue
+
             try:
                 self.executor.handle(action)
             except Exception as exc:  # noqa: BLE001
                 if self._handle_live_failure(nid, action, exc):
                     continue
+            if action.action is ActionType.OPEN and action.investment:
+                coin = (action.investment.ticker or action.investment.name or "").upper()
+                if coin:
+                    self.db.delete_pending_for_coin(
+                        coin,
+                        exclude_base_id=str(action.investment.base_id)
+                        if action.investment.base_id
+                        else None,
+                    )
+                if action.investment.base_id:
+                    self.db.delete_pending_intent(str(action.investment.base_id))
             self.engine.remember(action)
             self.db.log_action(
                 action=action.action.value,
@@ -364,6 +399,9 @@ class NotificationPoller:
             self._notify_action(action)
             logger.info("%s %s", action.action.value, action.summary)
             actions.append(action)
+        if not self.is_dry_run:
+            self._expire_pending()
+            self._drain_pending()
         return actions
 
     def _handle_live_failure(
@@ -385,6 +423,8 @@ class NotificationPoller:
                         )
                         self._notify_dex_login_needed(retry_exc)
                         return True
+                    if self._queue_open_from_error(nid, action, retry_exc):
+                        return True
                     self._record_executor_error(nid, action, retry_exc)
                     return True
                 return False  # retry succeeded — fall through to remember
@@ -393,14 +433,96 @@ class NotificationPoller:
             )
             self._notify_dex_login_needed(exc)
             return True
+        if self._queue_open_from_error(nid, action, exc):
+            return True
         self._record_executor_error(nid, action, exc)
+        return True
+
+    def _queueable_open_reason(self, action: TradeAction, exc: BaseException) -> str | None:
+        if action.action is not ActionType.OPEN:
+            return None
+        if isinstance(exc, PriceNotBetterError) or isinstance(exc, IocUnfilledError):
+            return "price"
+        if isinstance(exc, SameCoinOpenError):
+            return "same_coin"
+        if self._is_insufficient_margin_error(exc):
+            return "margin"
+        return None
+
+    def _queue_open_from_error(
+        self, nid: str, action: TradeAction, exc: BaseException
+    ) -> bool:
+        reason = self._queueable_open_reason(action, exc)
+        if reason is None:
+            return False
+        intent = self._intent_from_action(action, reason)
+        if intent is None:
+            return False
+        other = self.db.get_pending_for_coin(
+            intent.coin, exclude_base_id=intent.investment_base_id
+        )
+        if other is not None:
+            self.db.mark_processed(nid, "QUEUED_SKIP_SAME_COIN", action.summary)
+            self.db.log_action(
+                action="QUEUED_SKIP_SAME_COIN",
+                summary=(
+                    f"{action.summary}: pending "
+                    f"{other.base_short_id or other.investment_base_id}"
+                ),
+                notification_id=nid,
+                dry_run=self.is_dry_run,
+            )
+            logger.info(
+                "skip newer pending %s — already queued %s %s",
+                action.summary,
+                other.coin,
+                other.base_short_id,
+            )
+            log_event(
+                "pending_skip_same_coin",
+                coin=intent.coin,
+                kept=other.investment_base_id,
+                skipped=intent.investment_base_id,
+            )
+            notify_mac(
+                "invo-agent · queued skip",
+                f"Already waiting on {intent.coin} — {action.summary}",
+                subtitle="One pending per coin",
+                sound=None,
+                enabled=self.settings.mac_notify,
+                sticky=False,
+            )
+            return True
+        self.db.upsert_pending_intent(intent)
+        self.db.mark_processed(nid, "QUEUED_OPEN", f"{reason}: {exc}"[:500])
+        self.db.log_action(
+            action="QUEUED_OPEN",
+            summary=f"{action.summary} ({reason})",
+            notification_id=nid,
+            dry_run=self.is_dry_run,
+        )
+        logger.info("queued OPEN %s reason=%s", action.summary, reason)
+        log_event(
+            "pending_enqueue",
+            coin=intent.coin,
+            reason=reason,
+            base_id=intent.investment_base_id,
+            trader_entry=intent.trader_entry,
+            error=str(exc),
+        )
+        notify_mac(
+            "invo-agent · queued",
+            f"Waiting ({reason}) — {action.summary}",
+            subtitle="Entry-or-better / margin / coin",
+            sound=None,
+            enabled=self.settings.mac_notify,
+            sticky=False,
+        )
         return True
 
     def _record_executor_error(
         self, nid: str, action: TradeAction, exc: BaseException
     ) -> None:
-        # No free margin: skip permanently. A later retry after other closes
-        # can be a stale/expired move — only act on fresh signals.
         if self._is_insufficient_margin_error(exc):
             self.db.mark_processed(
                 nid, f"SKIP_NO_MARGIN_{action.action.value}", str(exc)[:500]
@@ -430,7 +552,6 @@ class NotificationPoller:
             )
             return
 
-        # Already mimicking this coin via another trader — one HL position per coin.
         if isinstance(exc, SameCoinOpenError):
             self.db.mark_processed(
                 nid, f"SKIP_SAME_COIN_{action.action.value}", str(exc)[:500]
@@ -521,17 +642,41 @@ class NotificationPoller:
         return "turnkey" in msg and "401" in msg
 
     def _ensure_dex_session(self) -> None:
-        """Proactively refresh Turnkey session if local expiry is known."""
-        store = self.executor.dex_store
-        data = store.load()
-        if data is None or not session_is_expired(data):
+        """Cheap local TTL log only — never OTP on the trade path."""
+        data = self.executor.dex_store.load()
+        if data is None:
             return
-        console.print("[yellow]DEX session expired — auto dex-login...[/yellow]")
-        logger.warning("DEX session expired locally; attempting auto dex-login")
+        remaining = session_ttl_remaining_seconds(data)
+        if remaining is not None and remaining <= 60:
+            logger.info(
+                "DEX key locally expired (remaining=%.0fs) — trade may 401 then recover",
+                remaining,
+            )
+
+    def _maybe_proactive_dex_renew(self) -> None:
+        """IMAP-OTP a new Turnkey key before expiry, off the OPEN hot path."""
+        if self.is_dry_run:
+            return
+        data = self.executor.dex_store.load()
+        if data is None:
+            return
+        if not session_should_proactive_renew(
+            data, renew_before_seconds=self.settings.dex_renew_before_seconds
+        ):
+            return
+        remaining = session_ttl_remaining_seconds(data)
+        logger.info(
+            "DEX key TTL remaining=%.0fs — background renew",
+            remaining if remaining is not None else -1,
+        )
+        console.print("[yellow]DEX key near expiry — background auto dex-login...[/yellow]")
         self._recover_dex_session()
 
     def _recover_dex_session(self) -> bool:
-        """IMAP Turnkey OTP → new DEX API key. Rate-limited."""
+        """IMAP Turnkey OTP → new DEX API key. Rate-limited.
+
+        Keeps the old key on disk until the new login succeeds.
+        """
         now = time.monotonic()
         if now < self._dex_recover_after:
             logger.info(
@@ -545,9 +690,6 @@ class NotificationPoller:
             self._dex_recover_after = now + DEX_RECOVER_COOLDOWN_SECONDS
             return False
 
-        self.executor.invalidate_trader()
-        # Drop the dead key so we never keep signing with a revoked pubkey.
-        DexSessionStore(self.settings.dex_session_path).clear()
         console.print("[yellow]Auto dex-login via Turnkey OTP email...[/yellow]")
         logger.info("attempting auto dex-login via IMAP")
         try:
@@ -556,11 +698,21 @@ class NotificationPoller:
                 self.settings,
                 DexSessionStore(self.settings.dex_session_path),
             )
-            self._dex_recover_after = 0.0
+            self.executor.invalidate_trader()
+            new = self.executor.dex_store.load()
+            remaining = session_ttl_remaining_seconds(new) if new else None
+            if remaining is not None and remaining < 120:
+                logger.warning(
+                    "DEX key TTL after login is only %.0fs — backing off renew",
+                    remaining,
+                )
+                self._dex_recover_after = now + DEX_RECOVER_COOLDOWN_SECONDS
+            else:
+                self._dex_recover_after = 0.0
             self._dex_dead_notified = False
             console.print("[green]DEX session renewed.[/green]")
-            logger.info("auto dex-login succeeded")
-            log_event("dex_auto_login", ok=True)
+            logger.info("auto dex-login succeeded remaining_s=%s", remaining)
+            log_event("dex_auto_login", ok=True, remaining_seconds=remaining)
             notify_mac(
                 "invo-agent",
                 "DEX session renewed (auto dex-login)",
@@ -575,6 +727,259 @@ class NotificationPoller:
             logger.error("auto dex-login failed: %s", exc)
             log_event("dex_auto_login", ok=False, error=str(exc))
             return False
+
+    def _intent_from_action(self, action: TradeAction, reason: str) -> PendingIntent | None:
+        inv = action.investment
+        if inv is None or inv.base_id is None:
+            return None
+        coin = (inv.ticker or inv.name or "").upper()
+        if not coin:
+            return None
+        now = datetime.now(UTC).isoformat()
+        return PendingIntent(
+            investment_base_id=str(inv.base_id),
+            coin=coin,
+            side="long" if inv.direction_long else "short",
+            reason=reason,
+            created_at=now,
+            updated_at=now,
+            base_short_id=inv.base_short_id,
+            notification_id=str(action.notification.id),
+            investment_id=str(inv.id) if inv.id else None,
+            leverage=float(inv.leverage) if inv.leverage is not None else None,
+            trader_entry=float(inv.entry_price) if inv.entry_price else None,
+            tp=float(inv.price_target) if inv.price_target else None,
+            sl=float(inv.stop_loss) if inv.stop_loss else None,
+            entry_size=float(inv.entry_size) if inv.entry_size is not None else None,
+            portfolio_id=str(inv.portfolio.id)
+            if inv.portfolio and inv.portfolio.id
+            else (
+                str(action.notification.portfolio_id)
+                if action.notification.portfolio_id
+                else None
+            ),
+            summary=action.summary,
+        )
+
+    def _refresh_pending_from_update(self, action: TradeAction) -> bool:
+        inv = action.investment
+        if inv is None or inv.base_id is None:
+            return False
+        existing = self.db.get_pending_intent(str(inv.base_id))
+        if existing is None and inv.base_short_id:
+            for row in self.db.list_pending_intents():
+                if row.base_short_id == inv.base_short_id:
+                    existing = row
+                    break
+        if existing is None:
+            return False
+        refreshed = self._intent_from_action(action, existing.reason)
+        if refreshed is None:
+            return False
+        refreshed.reason = existing.reason
+        self.db.upsert_pending_intent(refreshed)
+        log_event(
+            "pending_refresh",
+            base_id=refreshed.investment_base_id,
+            trader_entry=refreshed.trader_entry,
+            entry_size=refreshed.entry_size,
+        )
+        return True
+
+    def _cancel_pending_for_action(self, action: TradeAction, *, reason: str) -> bool:
+        inv = action.investment
+        base_id = None
+        if inv and inv.base_id:
+            base_id = str(inv.base_id)
+        elif action.notification.investment_base_id:
+            base_id = str(action.notification.investment_base_id)
+        if not base_id:
+            return False
+        existing = self.db.get_pending_intent(base_id)
+        if existing is None and inv and inv.base_short_id:
+            for row in self.db.list_pending_intents():
+                if row.base_short_id == inv.base_short_id:
+                    existing = row
+                    base_id = row.investment_base_id
+                    break
+        if existing is None:
+            return False
+        self.db.delete_pending_intent(base_id)
+        logger.info("cancelled pending %s (%s)", existing.summary or base_id, reason)
+        log_event(
+            "pending_cancel",
+            base_id=base_id,
+            coin=existing.coin,
+            reason=reason,
+        )
+        notify_mac(
+            "invo-agent · queue",
+            f"Cancelled pending {existing.coin} ({reason})",
+            sound=None,
+            enabled=self.settings.mac_notify,
+            sticky=False,
+        )
+        return True
+
+    def _pending_age_seconds(self, intent: PendingIntent) -> float:
+        try:
+            created = datetime.fromisoformat(intent.created_at)
+        except ValueError:
+            return 0.0
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - created.astimezone(UTC)).total_seconds()
+
+    def _expire_pending(self) -> None:
+        max_age = float(self.settings.pending_max_age_seconds)
+        for intent in self.db.list_pending_intents():
+            age = self._pending_age_seconds(intent)
+            if age < max_age:
+                continue
+            self.db.delete_pending_intent(intent.investment_base_id)
+            logger.warning(
+                "expired pending %s age=%.0fs",
+                intent.summary or intent.investment_base_id,
+                age,
+            )
+            log_event(
+                "pending_expire",
+                base_id=intent.investment_base_id,
+                coin=intent.coin,
+                age_seconds=age,
+            )
+            notify_mac(
+                "invo-agent · queue",
+                f"Dropped stale pending {intent.coin} after {age / 3600:.1f}h",
+                sound=None,
+                enabled=self.settings.mac_notify,
+                sticky=False,
+            )
+
+    def _drain_pending(self) -> None:
+        intents = self.db.list_pending_intents()
+        if not intents:
+            return
+        for intent in intents:
+            try:
+                resp = self.client.get_current_shadow_post_by_investment_base_id(
+                    intent.investment_base_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "pending drain shadow failed base_id=%s: %s",
+                    intent.investment_base_id,
+                    exc,
+                )
+                continue
+            inv = resp.post.update if resp.post else None
+            if inv is None:
+                continue
+            if self._investment_closed(inv):
+                self.db.delete_pending_intent(intent.investment_base_id)
+                log_event(
+                    "pending_cancel",
+                    base_id=intent.investment_base_id,
+                    coin=intent.coin,
+                    reason="trader_closed_on_drain",
+                )
+                continue
+            action = self._action_from_pending(intent, inv)
+            try:
+                self.executor.handle(action)
+            except Exception as exc:  # noqa: BLE001
+                if self._is_dex_session_error(exc):
+                    self.executor.invalidate_trader()
+                    if self._recover_dex_session():
+                        try:
+                            self.executor.handle(action)
+                        except Exception as retry_exc:  # noqa: BLE001
+                            if self._apply_drain_failure(intent, action, retry_exc):
+                                if self._is_insufficient_margin_error(retry_exc):
+                                    break
+                            continue
+                    else:
+                        break
+                elif self._apply_drain_failure(intent, action, exc):
+                    if self._is_insufficient_margin_error(exc):
+                        break
+                    continue
+                else:
+                    logger.exception(
+                        "pending drain failed %s: %s",
+                        intent.summary or intent.investment_base_id,
+                        exc,
+                    )
+                    continue
+            self.db.delete_pending_intent(intent.investment_base_id)
+            self.db.delete_pending_for_coin(
+                intent.coin, exclude_base_id=intent.investment_base_id
+            )
+            self.engine.remember(action)
+            self.db.log_action(
+                action="OPEN",
+                summary=action.summary,
+                notification_id=intent.notification_id,
+                dry_run=False,
+            )
+            self._notify_action(action)
+            logger.info("drained pending OPEN %s", action.summary)
+            log_event(
+                "pending_fill",
+                base_id=intent.investment_base_id,
+                coin=intent.coin,
+                trader_entry=inv.entry_price,
+            )
+
+    def _apply_drain_failure(
+        self, intent: PendingIntent, action: TradeAction, exc: BaseException
+    ) -> bool:
+        """Update pending reason. Return True if this was an expected queueable miss."""
+        reason = self._queueable_open_reason(action, exc)
+        if reason is None:
+            return False
+        refreshed = self._intent_from_action(action, reason)
+        if refreshed is not None:
+            self.db.upsert_pending_intent(refreshed)
+        else:
+            intent.reason = reason
+            self.db.upsert_pending_intent(intent)
+        log_event(
+            "pending_still_waiting",
+            base_id=intent.investment_base_id,
+            coin=intent.coin,
+            reason=reason,
+            error=str(exc),
+        )
+        return True
+
+    def _action_from_pending(
+        self, intent: PendingIntent, inv: InvestmentUpdate
+    ) -> TradeAction:
+        try:
+            nid = UUID(intent.notification_id) if intent.notification_id else UUID(int=0)
+        except ValueError:
+            nid = UUID(int=0)
+        try:
+            created = datetime.fromisoformat(intent.created_at)
+        except ValueError:
+            created = datetime.now(UTC)
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        notification = Notification.model_validate(
+            {
+                "id": str(nid),
+                "content": intent.summary or f"queued OPEN {intent.coin}",
+                "notificationType": "user_added_investment",
+                "createdAt": created.isoformat(),
+                "investmentBaseId": intent.investment_base_id,
+            }
+        )
+        return TradeAction(
+            action=ActionType.OPEN,
+            notification=notification,
+            investment=inv,
+        )
 
     def _sleep_interval(self) -> None:
         base = float(self.settings.poll_interval_seconds)
@@ -667,6 +1072,7 @@ class NotificationPoller:
                 break
             try:
                 actions = self.poll_once()
+                self._maybe_proactive_dex_renew()
                 self._transient_failures = 0
                 if actions:
                     self._idle_polls = 0

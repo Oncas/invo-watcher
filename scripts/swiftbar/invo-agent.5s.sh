@@ -66,7 +66,9 @@ age_poll = (
     else "never"
 )
 fresh_note = f"sidecar {age:.1f}s" if age is not None else "sidecar missing"
-print(f"{snap.mode} · {'ok' if ok else 'problem'} · poll {age_poll} · {fresh_note}")
+q = len(getattr(snap, "pending", None) or [])
+q_note = f" · Q:{q}" if q else ""
+print(f"{snap.mode} · {'ok' if ok else 'problem'} · poll {age_poll} · {fresh_note}{q_note}")
 if snap.equity is not None:
     eq_line = f"Equity ${snap.equity:.2f}"
     if snap.pnl_24h is not None:
@@ -87,6 +89,19 @@ else:
             f"{format_pnl(p.unrealized_pnl)} ({format_roe(p.return_on_equity)})"
         )
         print(f"{line} | color={pnl_color}")
+pending = getattr(snap, "pending", None) or []
+if pending:
+    print("---")
+    print("Queued opens")
+    for item in pending:
+        coin = item.get("coin") or "?"
+        side = (item.get("side") or "").upper()
+        reason = item.get("reason") or "?"
+        entry = item.get("trader_entry")
+        age = item.get("age_s")
+        age_s = f"{age:.0f}s" if isinstance(age, (int, float)) else "?"
+        entry_s = f" @{entry:g}" if isinstance(entry, (int, float)) else ""
+        print(f"{coin} {side}{entry_s} · {reason} · {age_s}")
 if snap.pnl_updated_at:
     ts = (
         snap.pnl_updated_at[11:19]

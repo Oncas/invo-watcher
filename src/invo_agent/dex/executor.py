@@ -21,7 +21,15 @@ from invo_agent.dex.hl_trader import (
     HlTrader,
     HlTraderError,
     InsufficientMarginError,
+    IocUnfilledError,
+    PriceNotBetterError,
     SameCoinOpenError,
+)
+from invo_agent.dex.pricing import (
+    extract_avg_px,
+    fill_gaps,
+    ioc_unfilled_message,
+    price_is_at_or_better,
 )
 from invo_agent.dex.recovery import RecoveryDecision, decide_missed_close
 from invo_agent.dex.session import DexSessionError, DexSessionStore, load_signer
@@ -170,6 +178,26 @@ class DexExecutor:
                 notification_id=str(action.notification.id),
             )
             raise
+        except PriceNotBetterError as exc:
+            logger.info("LIVE %s queued (price): %s", action.action.value, exc)
+            log_event(
+                "live_queue_price",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=str(action.notification.id),
+            )
+            raise
+        except IocUnfilledError as exc:
+            logger.info("LIVE %s queued (ioc unfilled): %s", action.action.value, exc)
+            log_event(
+                "live_queue_ioc",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=str(action.notification.id),
+            )
+            raise
         except Exception as exc:
             logger.exception("LIVE %s failed: %s", action.action.value, exc)
             log_event(
@@ -296,6 +324,14 @@ class DexExecutor:
             )
 
         mid = trader.mid_price(coin)
+        trader_entry = float(inv.entry_price) if inv.entry_price else None
+        if trader_entry is not None and trader_entry <= 0:
+            trader_entry = None
+        if not price_is_at_or_better(mid=mid, trader_entry=trader_entry, is_long=is_long):
+            raise PriceNotBetterError(
+                f"{coin} mid={mid} worse than trader entry={trader_entry} "
+                f"({'long' if is_long else 'short'}) — queue"
+            )
         sz = trader.round_size(coin, order_notional / mid)
         bump_note = ""
         if size_meta["bumped_to_hl_min"]:
@@ -311,12 +347,13 @@ class DexExecutor:
             f"{bump_note}"
         )
         logger.info(
-            "OPEN %s %s lev=%sx mid=%s sz=%s margin=%.4f notional=%.4f "
+            "OPEN %s %s lev=%sx mid=%s trader_entry=%s sz=%s margin=%.4f notional=%.4f "
             "equity=%.4f pct=%.4f source=%s bumped=%s",
             coin,
             "LONG" if is_long else "SHORT",
             leverage,
             mid,
+            trader_entry,
             sz,
             margin,
             order_notional,
@@ -339,7 +376,12 @@ class DexExecutor:
             sl=inv.stop_loss,
             base_short_id=inv.base_short_id,
             entry_size=inv.entry_size,
-            **{k: v for k, v in size_meta.items() if k not in {"margin_usd", "order_notional_usd", "leverage"}},
+            trader_entry=trader_entry,
+            **{
+                k: v
+                for k, v in size_meta.items()
+                if k not in {"margin_usd", "order_notional_usd", "leverage"}
+            },
         )
 
         try:
@@ -359,18 +401,38 @@ class DexExecutor:
                 inv.base_short_id,
             )
         hl_order, hl_resp, nonce = trader.market_order(
-            coin, is_buy=is_long, sz=sz, cloid=entry_cloid
+            coin,
+            is_buy=is_long,
+            sz=sz,
+            limit_px=trader_entry,
+            cloid=entry_cloid,
         )
         try:
             self._check_hl_ok(hl_resp, "open")
+        except IocUnfilledError:
+            raise
         except HlTraderError as exc:
             if "insufficient margin" in str(exc).lower():
                 raise InsufficientMarginError(str(exc)) from exc
             raise
+        avg_px = extract_avg_px(hl_resp)
+        our_px = avg_px if avg_px is not None else mid
+        price_gap_pct, roe_gap_pct = fill_gaps(
+            our_px=our_px,
+            trader_entry=trader_entry,
+            is_long=is_long,
+            leverage=leverage,
+        )
         logger.info(
-            "OPEN HL ok coin=%s cloid=%s resp=%s",
+            "OPEN HL ok coin=%s cloid=%s trader_entry=%s mid=%s avgPx=%s "
+            "price_gap_pct=%s roe_gap_pct=%s resp=%s",
             coin,
             entry_cloid.to_raw() if entry_cloid else None,
+            trader_entry,
+            mid,
+            avg_px,
+            price_gap_pct,
+            roe_gap_pct,
             hl_resp,
         )
         log_event(
@@ -379,6 +441,11 @@ class DexExecutor:
             sz=sz,
             nonce=nonce,
             cloid=entry_cloid.to_raw() if entry_cloid else None,
+            trader_entry=trader_entry,
+            mid=mid,
+            avg_px=avg_px,
+            price_gap_pct=price_gap_pct,
+            roe_gap_pct=roe_gap_pct,
             hl_response=hl_resp,
         )
 
@@ -575,7 +642,6 @@ class DexExecutor:
         client_tx = new_client_tx_id()
         submissions: list[dict[str, Any]] = []
         has_tp = inv.price_target is not None and float(inv.price_target) > 0
-        has_sl = inv.stop_loss is not None and float(inv.stop_loss) > 0
         # One Copy card → one primary updateType. Prefer size_increase when we added.
         if size_sub is not None:
             update_type = "increase"
@@ -792,7 +858,9 @@ class DexExecutor:
                 log_event("close_recorded", via="mimic/copy", coin=coin, sz=sz, response=recorded)
                 return
             except Exception as exc:  # noqa: BLE001
-                console.print(f"[yellow]mimic/copy close failed, trying position/close:[/yellow] {exc}")
+                console.print(
+                    f"[yellow]mimic/copy close failed, trying position/close:[/yellow] {exc}"
+                )
                 logger.warning("mimic/copy close failed: %s", exc)
 
         body: dict[str, Any] = {
@@ -909,10 +977,20 @@ class DexExecutor:
         target_notional = float(meta["order_notional_usd"])
         hl_min = float(self.settings.hl_min_order_usd)
         delta_notional = target_notional - current_notional
-        if delta_notional + 1e-9 < hl_min:
+        pending_add = 0.0
+        if self.db is not None and inv.base_id is not None:
+            copy = self.db.get_open_copy(str(inv.base_id))
+            if copy is not None:
+                pending_add = float(copy.pending_add_notional or 0)
+        effective_delta = delta_notional + pending_add
+        if effective_delta + 1e-9 < hl_min:
+            accumulated = pending_add + max(0.0, delta_notional)
+            if self.db is not None and inv.base_id is not None:
+                self.db.set_pending_add_notional(str(inv.base_id), accumulated)
             console.print(
                 f"[dim]UPDATE {coin}: size increase too small "
-                f"(Δnotional=${delta_notional:.2f} < HL min ${hl_min:g}) — skip[/dim]"
+                f"(Δnotional=${delta_notional:.2f} + pending=${pending_add:.2f} "
+                f"< HL min ${hl_min:g}) — accumulated ${accumulated:.2f}[/dim]"
             )
             log_event(
                 "size_increase_skip",
@@ -921,8 +999,10 @@ class DexExecutor:
                 current_notional=current_notional,
                 target_notional=target_notional,
                 delta_notional=delta_notional,
+                pending_add_notional=accumulated,
             )
             return current_sz, None
+        delta_notional = effective_delta
 
         available = trader.available_margin()
         need_margin = delta_notional / max(1, leverage)
@@ -942,6 +1022,27 @@ class DexExecutor:
                 f"[yellow]UPDATE {coin}: shrunk size-increase notional to "
                 f"${delta_notional:.2f} (available margin)[/yellow]"
             )
+
+        trader_entry = float(inv.entry_price) if inv.entry_price else None
+        if trader_entry is not None and trader_entry <= 0:
+            trader_entry = None
+        if not price_is_at_or_better(mid=mid, trader_entry=trader_entry, is_long=is_long):
+            if self.db is not None and inv.base_id is not None:
+                self.db.set_pending_add_notional(str(inv.base_id), effective_delta)
+            console.print(
+                f"[dim]UPDATE {coin}: size increase waiting for entry-or-better "
+                f"(mid={mid} trader={trader_entry}) — accumulated "
+                f"${effective_delta:.2f}[/dim]"
+            )
+            log_event(
+                "size_increase_skip",
+                coin=coin,
+                reason="price_worse",
+                mid=mid,
+                trader_entry=trader_entry,
+                pending_add_notional=effective_delta,
+            )
+            return current_sz, None
 
         add_sz = trader.round_size(coin, delta_notional / mid)
         if add_sz <= 0:
@@ -965,9 +1066,23 @@ class DexExecutor:
         )
         try:
             hl_order, hl_resp, nonce = trader.market_order(
-                coin, is_buy=is_long, sz=add_sz, cloid=cloid
+                coin,
+                is_buy=is_long,
+                sz=add_sz,
+                limit_px=trader_entry,
+                cloid=cloid,
             )
             self._check_hl_ok(hl_resp, "size_increase")
+        except IocUnfilledError:
+            if self.db is not None and inv.base_id is not None:
+                self.db.set_pending_add_notional(str(inv.base_id), effective_delta)
+            log_event(
+                "size_increase_skip",
+                coin=coin,
+                reason="ioc_unfilled",
+                pending_add_notional=effective_delta,
+            )
+            return current_sz, None
         except HlTraderError as exc:
             if "insufficient margin" in str(exc).lower():
                 raise InsufficientMarginError(str(exc)) from exc
@@ -992,7 +1107,16 @@ class DexExecutor:
                 size=new_sz,
                 leverage=float(leverage),
             )
+            self.db.set_pending_add_notional(str(inv.base_id), 0.0)
 
+        avg_px = extract_avg_px(hl_resp)
+        our_px = avg_px if avg_px is not None else entry_px
+        price_gap_pct, roe_gap_pct = fill_gaps(
+            our_px=our_px,
+            trader_entry=trader_entry,
+            is_long=is_long,
+            leverage=leverage,
+        )
         log_event(
             "size_increase_hl",
             coin=coin,
@@ -1000,6 +1124,11 @@ class DexExecutor:
             qty_before=current_sz,
             qty_after=new_sz,
             cloid=cloid.to_raw() if cloid else None,
+            trader_entry=trader_entry,
+            mid=mid,
+            avg_px=avg_px,
+            price_gap_pct=price_gap_pct,
+            roe_gap_pct=roe_gap_pct,
             hl_response=hl_resp,
             **{k: v for k, v in meta.items() if k not in {"margin_usd", "order_notional_usd"}},
         )
@@ -1230,6 +1359,8 @@ class DexExecutor:
             base_id=base_id,
             coin=coin,
             our_entry_px=entry_px,
+            trader_entry=inv.entry_price,
+            mid=mid,
             side="long" if is_long else "short",
             size=fill_sz,
             leverage=leverage,
@@ -1645,8 +1776,15 @@ class DexExecutor:
         data = resp.get("response", {}).get("data", {})
         statuses = data.get("statuses") or []
         for st in statuses:
-            if isinstance(st, dict) and st.get("error"):
-                raise HlTraderError(f"HL {label} order error: {st['error']}")
+            if not isinstance(st, dict):
+                continue
+            err = st.get("error")
+            if not err:
+                continue
+            err_s = str(err)
+            if ioc_unfilled_message(err_s):
+                raise IocUnfilledError(f"HL {label} IoC unfilled: {err_s}")
+            raise HlTraderError(f"HL {label} order error: {err_s}")
 
 
 def _pct(value: float | None) -> str:

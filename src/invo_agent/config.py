@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     recovery_enabled: bool = True
     # Adverse % from current mid for parked reduce-only SL while waiting for TP.
     recovery_sl_pct: float = 3.0
+    # Background Turnkey renew when remaining TTL is below this (capped to 25% of issued TTL).
+    dex_renew_before_seconds: float = 6 * 3600
+    # Drop queued opens the trader never closed after this many seconds.
+    pending_max_age_seconds: float = 24 * 3600
 
     portfolio_allowlist: str = ""
 

@@ -35,6 +35,18 @@ class SameCoinOpenError(HlTraderError):
     pass
 
 
+class PriceNotBetterError(HlTraderError):
+    """Mid is worse than the trader's entry — queue instead of chasing."""
+
+    pass
+
+
+class IocUnfilledError(HlTraderError):
+    """IoC at trader entry did not fill — stay pending."""
+
+    pass
+
+
 class TurnkeyWalletAdapter:
     """Minimal wallet duck-type for hyperliquid sign_inner / LocalAccount.sign_message."""
 
@@ -147,10 +159,17 @@ class HlTrader:
         *,
         reduce_only: bool = False,
         slippage: float = 0.02,
+        limit_px: float | None = None,
         cloid: Cloid | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], int]:
-        """Place IoC market-style order. Returns (hl_order_payload, hl_response, nonce)."""
-        limit_px = self.slippage_price(coin, is_buy, slippage)
+        """Place IoC order. Returns (hl_order_payload, hl_response, nonce).
+
+        ``limit_px`` overrides the mid±slippage cap (used for trader-entry-or-better).
+        """
+        if limit_px is not None:
+            limit_px = self.round_price(coin, float(limit_px))
+        else:
+            limit_px = self.slippage_price(coin, is_buy, slippage)
         sz = self.round_size(coin, sz)
         if sz <= 0:
             raise HlTraderError(f"Size rounded to zero for {coin}")

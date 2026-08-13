@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Optional
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from invo_agent import service as launchd_service
 from invo_agent.api.client import InvolioClient
 from invo_agent.auth.email_otp import LoginError, login_with_otp
 from invo_agent.auth.session import SessionStore
@@ -14,11 +14,15 @@ from invo_agent.config import Settings, get_settings
 from invo_agent.db import AgentDB
 from invo_agent.dex.executor import DexExecutor
 from invo_agent.dex.hl_trader import HlTrader
-from invo_agent.dex.session import DexSessionError, DexSessionStore, establish_dex_session, load_signer
+from invo_agent.dex.session import (
+    DexSessionError,
+    DexSessionStore,
+    establish_dex_session,
+    load_signer,
+)
 from invo_agent.logging_setup import setup_logging
 from invo_agent.notify import ensure_alerter, find_alerter, notify_mac
 from invo_agent.poller import CATCHUP_META, NotificationPoller
-from invo_agent import service as launchd_service
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Involio copy-trade agent")
 console = Console()
@@ -36,8 +40,8 @@ def _bootstrap(*, with_logging: bool = False) -> tuple[Settings, SessionStore, A
 
 @app.command()
 def login(
-    email: Optional[str] = typer.Option(None, help="Involio account email"),
-    code: Optional[str] = typer.Option(None, help="OTP from email (skips IMAP/prompt wait)"),
+    email: str | None = typer.Option(None, help="Involio account email"),
+    code: str | None = typer.Option(None, help="OTP from email (skips IMAP/prompt wait)"),
 ) -> None:
     """Start email OTP login and persist session tokens."""
     settings, session, db = _bootstrap()
@@ -168,6 +172,34 @@ def status_cmd() -> None:
     else:
         console.print("[dim]No open copies tracked yet.[/dim]")
 
+    pending = db.list_pending_intents()
+    if pending:
+        pt = Table(title="Queued opens (entry-or-better / margin / coin)")
+        pt.add_column("Coin")
+        pt.add_column("Side")
+        pt.add_column("Trader entry")
+        pt.add_column("Reason")
+        pt.add_column("Age")
+        pt.add_column("Summary")
+        now = datetime.now(UTC)
+        for intent in pending:
+            try:
+                created = datetime.fromisoformat(intent.created_at)
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=UTC)
+                age = f"{(now - created.astimezone(UTC)).total_seconds():.0f}s"
+            except ValueError:
+                age = "?"
+            pt.add_row(
+                intent.coin,
+                intent.side,
+                f"{intent.trader_entry:g}" if intent.trader_entry is not None else "?",
+                intent.reason,
+                age,
+                (intent.summary or "")[:48],
+            )
+        console.print(pt)
+
     recent = db.recent_actions(10)
     if recent:
         lt = Table(title="Recent actions")
@@ -183,7 +215,7 @@ def status_cmd() -> None:
 
 @app.command("dex-login")
 def dex_login_cmd(
-    code: Optional[str] = typer.Option(None, help="DEX trading OTP from email"),
+    code: str | None = typer.Option(None, help="DEX trading OTP from email"),
 ) -> None:
     """Create a Turnkey trading session via Involio DEX email OTP (IMAP if configured)."""
     settings, session, db = _bootstrap()

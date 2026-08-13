@@ -22,6 +22,27 @@ class OpenCopy:
     recovery_tp: float | None = None
     recovery_sl: float | None = None
     trader_closing_px: float | None = None
+    pending_add_notional: float = 0.0
+
+
+@dataclass
+class PendingIntent:
+    investment_base_id: str
+    coin: str
+    side: str
+    reason: str
+    created_at: str
+    updated_at: str
+    base_short_id: str | None = None
+    notification_id: str | None = None
+    investment_id: str | None = None
+    leverage: float | None = None
+    trader_entry: float | None = None
+    tp: float | None = None
+    sl: float | None = None
+    entry_size: float | None = None
+    portfolio_id: str | None = None
+    summary: str | None = None
 
 
 @dataclass
@@ -43,6 +64,7 @@ _OPEN_COPY_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("recovery_tp", "REAL"),
     ("recovery_sl", "REAL"),
     ("trader_closing_px", "REAL"),
+    ("pending_add_notional", "REAL NOT NULL DEFAULT 0"),
 )
 
 
@@ -88,6 +110,25 @@ class AgentDB:
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_intents (
+                investment_base_id TEXT PRIMARY KEY,
+                coin TEXT NOT NULL,
+                side TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                base_short_id TEXT,
+                notification_id TEXT,
+                investment_id TEXT,
+                leverage REAL,
+                trader_entry REAL,
+                tp REAL,
+                sl REAL,
+                entry_size REAL,
+                portfolio_id TEXT,
+                summary TEXT
             );
             """
         )
@@ -251,8 +292,9 @@ class AgentDB:
                 investment_base_id, base_short_id, ticker, portfolio_id,
                 opened_at, last_notification_id,
                 our_entry_px, side, size, leverage,
-                recovery_pending, recovery_tp, recovery_sl, trader_closing_px
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                recovery_pending, recovery_tp, recovery_sl, trader_closing_px,
+                pending_add_notional
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 investment_base_id,
@@ -273,6 +315,7 @@ class AgentDB:
                 existing["recovery_tp"] if existing else None,
                 existing["recovery_sl"] if existing else None,
                 existing["trader_closing_px"] if existing else None,
+                float(existing["pending_add_notional"] or 0) if existing else 0.0,
             ),
         )
         self._conn.commit()
@@ -373,6 +416,126 @@ class AgentDB:
             trader_closing_px=row["trader_closing_px"]
             if "trader_closing_px" in keys
             else None,
+            pending_add_notional=float(row["pending_add_notional"] or 0)
+            if "pending_add_notional" in keys
+            else 0.0,
+        )
+
+    def set_pending_add_notional(self, investment_base_id: str, notional: float) -> None:
+        self._conn.execute(
+            """
+            UPDATE open_copies
+            SET pending_add_notional = ?
+            WHERE investment_base_id = ?
+            """,
+            (max(0.0, float(notional)), investment_base_id),
+        )
+        self._conn.commit()
+
+    def upsert_pending_intent(self, intent: PendingIntent) -> None:
+        existing = self.get_pending_intent(intent.investment_base_id)
+        created_at = existing.created_at if existing else intent.created_at
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO pending_intents (
+                investment_base_id, coin, side, reason, created_at, updated_at,
+                base_short_id, notification_id, investment_id, leverage,
+                trader_entry, tp, sl, entry_size, portfolio_id, summary
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                intent.investment_base_id,
+                intent.coin,
+                intent.side,
+                intent.reason,
+                created_at,
+                now,
+                intent.base_short_id,
+                intent.notification_id,
+                intent.investment_id,
+                intent.leverage,
+                intent.trader_entry,
+                intent.tp,
+                intent.sl,
+                intent.entry_size,
+                intent.portfolio_id,
+                intent.summary,
+            ),
+        )
+        self._conn.commit()
+
+    def get_pending_intent(self, investment_base_id: str) -> PendingIntent | None:
+        row = self._conn.execute(
+            "SELECT * FROM pending_intents WHERE investment_base_id = ?",
+            (investment_base_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_pending(row)
+
+    def get_pending_for_coin(
+        self, coin: str, *, exclude_base_id: str | None = None
+    ) -> PendingIntent | None:
+        rows = self._conn.execute(
+            """
+            SELECT * FROM pending_intents
+            WHERE upper(coin) = upper(?)
+            ORDER BY created_at ASC
+            """,
+            (coin,),
+        ).fetchall()
+        for row in rows:
+            intent = self._row_to_pending(row)
+            if exclude_base_id and intent.investment_base_id == exclude_base_id:
+                continue
+            return intent
+        return None
+
+    def list_pending_intents(self) -> list[PendingIntent]:
+        rows = self._conn.execute(
+            "SELECT * FROM pending_intents ORDER BY created_at ASC"
+        ).fetchall()
+        return [self._row_to_pending(row) for row in rows]
+
+    def delete_pending_intent(self, investment_base_id: str) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM pending_intents WHERE investment_base_id = ?",
+            (investment_base_id,),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_pending_for_coin(
+        self, coin: str, *, exclude_base_id: str | None = None
+    ) -> list[str]:
+        removed: list[str] = []
+        for intent in self.list_pending_intents():
+            if intent.coin.upper() != coin.upper():
+                continue
+            if exclude_base_id and intent.investment_base_id == exclude_base_id:
+                continue
+            self.delete_pending_intent(intent.investment_base_id)
+            removed.append(intent.investment_base_id)
+        return removed
+
+    @staticmethod
+    def _row_to_pending(row: sqlite3.Row) -> PendingIntent:
+        return PendingIntent(
+            investment_base_id=row["investment_base_id"],
+            coin=row["coin"],
+            side=row["side"],
+            reason=row["reason"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            base_short_id=row["base_short_id"],
+            notification_id=row["notification_id"],
+            investment_id=row["investment_id"],
+            leverage=row["leverage"],
+            trader_entry=row["trader_entry"],
+            tp=row["tp"],
+            sl=row["sl"],
+            entry_size=row["entry_size"],
+            portfolio_id=row["portfolio_id"],
+            summary=row["summary"],
         )
 
     def processed_count(self) -> int:
@@ -385,6 +548,7 @@ class AgentDB:
             """
             DELETE FROM processed_notifications;
             DELETE FROM open_copies;
+            DELETE FROM pending_intents;
             DELETE FROM action_log;
             DELETE FROM meta;
             """

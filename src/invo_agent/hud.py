@@ -45,6 +45,7 @@ class HudSnapshot:
     pnl_24h_pct: float | None = None  # percent points, e.g. 11.6
     positions: list[PositionRow] = field(default_factory=list)
     pnl_updated_at: str | None = None
+    pending: list[dict] = field(default_factory=list)
 
 
 def hud_path(settings: Settings) -> Path:
@@ -239,8 +240,8 @@ def _fetch_hl_pnl(settings: Settings) -> dict:
     if cached is not None:
         return cached
 
-    from invo_agent.dex.session import DexSessionError, DexSessionStore, load_signer
     from invo_agent.dex.hl_trader import HlTrader
+    from invo_agent.dex.session import DexSessionError, DexSessionStore, load_signer
 
     out: dict = {
         "fetched_at": time.time(),
@@ -332,6 +333,26 @@ def collect_hud(
     ]
     last = recent[0] if recent else None
     open_copies = len(db.list_open_copies())
+    now_hud = datetime.now(UTC)
+    pending_rows: list[dict] = []
+    for intent in db.list_pending_intents():
+        try:
+            created = datetime.fromisoformat(intent.created_at)
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            age_s = (now_hud - created.astimezone(UTC)).total_seconds()
+        except ValueError:
+            age_s = None
+        pending_rows.append(
+            {
+                "coin": intent.coin,
+                "side": intent.side,
+                "trader_entry": intent.trader_entry,
+                "reason": intent.reason,
+                "age_s": age_s,
+                "summary": intent.summary,
+            }
+        )
     db.close()
 
     positions: list[PositionRow] = []
@@ -370,6 +391,7 @@ def collect_hud(
         pnl_24h_pct=pnl_24h_pct,
         positions=positions,
         pnl_updated_at=pnl_updated_at,
+        pending=pending_rows,
     )
 
 
@@ -392,6 +414,8 @@ def load_hud_file(settings: Settings) -> HudSnapshot | None:
         except TypeError:
             continue
     payload["positions"] = rows
+    if not isinstance(payload.get("pending"), list):
+        payload["pending"] = []
     try:
         return HudSnapshot(**payload)
     except TypeError:
