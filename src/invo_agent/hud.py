@@ -58,6 +58,26 @@ def _pnl_cache_path(settings: Settings) -> Path:
     return settings.session_path.expanduser().parent / "pnl-cache.json"
 
 
+def format_age(seconds: float | None) -> str:
+    if seconds is None:
+        return "?"
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        mins = seconds / 60.0
+        return f"{mins:.0f}m" if mins >= 10 else f"{mins:.1f}m"
+    hours = seconds / 3600.0
+    return f"{hours:.0f}h" if hours >= 10 else f"{hours:.1f}h"
+
+
+def _age_seconds(raw: str | None, now: datetime) -> float | None:
+    dt = _parse_ts(raw)
+    if dt is None:
+        return None
+    return (now - dt).total_seconds()
+
+
 def _parse_ts(raw: str | None) -> datetime | None:
     if not raw:
         return None
@@ -370,13 +390,6 @@ def collect_hud(
     now_hud = datetime.now(UTC)
     pending_rows: list[dict] = []
     for intent in db.list_pending_intents():
-        try:
-            created = datetime.fromisoformat(intent.created_at)
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=UTC)
-            age_s = (now_hud - created.astimezone(UTC)).total_seconds()
-        except ValueError:
-            age_s = None
         pending_rows.append(
             {
                 "coin": intent.coin,
@@ -385,7 +398,9 @@ def collect_hud(
                 "trader_entry": intent.trader_entry,
                 "trader": intent.trader or trader_from_summary(intent.summary),
                 "reason": intent.reason,
-                "age_s": age_s,
+                "age_s": _age_seconds(intent.created_at, now_hud),
+                "last_tried_at": intent.last_tried_at,
+                "tried_age_s": _age_seconds(intent.last_tried_at, now_hud),
                 "summary": intent.summary,
             }
         )

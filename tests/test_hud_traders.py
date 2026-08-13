@@ -2,7 +2,20 @@ from pathlib import Path
 
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB, OpenCopy, PendingIntent
-from invo_agent.hud import PositionRow, _traders_by_coin, collect_hud, load_hud_file
+from invo_agent.hud import (
+    PositionRow,
+    _traders_by_coin,
+    collect_hud,
+    format_age,
+    load_hud_file,
+)
+
+
+def test_format_age() -> None:
+    assert format_age(None) == "?"
+    assert format_age(4) == "4s"
+    assert format_age(90) == "1.5m"
+    assert format_age(720) == "12m"
 
 
 def test_traders_by_coin() -> None:
@@ -61,6 +74,7 @@ def test_collect_hud_pending_includes_trader(tmp_path: Path) -> None:
             updated_at=now,
             leverage=40,
             trader="gamma_trader",
+            last_tried_at="2026-08-13T12:00:10+00:00",
             summary="OPEN BTC LONG 40x @gamma_trader ShortIdJ10",
         )
     )
@@ -70,6 +84,8 @@ def test_collect_hud_pending_includes_trader(tmp_path: Path) -> None:
     assert snap.pending
     assert snap.pending[0]["trader"] == "gamma_trader"
     assert snap.pending[0]["leverage"] == 40
+    assert snap.pending[0]["last_tried_at"] == "2026-08-13T12:00:10+00:00"
+    assert snap.pending[0]["tried_age_s"] is not None
 
     db = AgentDB(settings.db_path)
     copy = db.get_open_copy("eth")

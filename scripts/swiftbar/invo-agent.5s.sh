@@ -29,6 +29,7 @@ cli = sys.argv[1]
 
 from invo_agent.config import get_settings
 from invo_agent.hud import (
+    format_age,
     format_pnl,
     format_pnl_24h,
     format_roe,
@@ -103,11 +104,16 @@ else:
         reason = item.get("reason") or "?"
         trader = item.get("trader")
         lev = item.get("leverage")
-        age = item.get("age_s")
-        age_s = f"{age:.0f}s" if isinstance(age, (int, float)) else "?"
+        age_s = format_age(item.get("age_s"))
+        tried = item.get("tried_age_s")
+        tried_s = (
+            f"tried {format_age(tried)} ago"
+            if isinstance(tried, (int, float))
+            else "tried —"
+        )
         lev_s = f" {int(lev)}x" if isinstance(lev, (int, float)) else ""
         trader_s = f"  @{trader}" if trader else ""
-        print(f"{coin} {side}{lev_s}{trader_s}  · {reason} · {age_s}")
+        print(f"{coin} {side}{lev_s}{trader_s}  · {reason} · queued {age_s} · {tried_s}")
 if snap.pnl_updated_at:
     ts = (
         snap.pnl_updated_at[11:19]

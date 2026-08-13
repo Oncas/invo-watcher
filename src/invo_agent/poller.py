@@ -494,6 +494,7 @@ class NotificationPoller:
                 sticky=False,
             )
             return True
+        intent.last_tried_at = datetime.now(UTC).isoformat()
         self.db.upsert_pending_intent(intent)
         self.db.mark_processed(nid, "QUEUED_OPEN", f"{reason}: {exc}"[:500])
         self.db.log_action(
@@ -863,6 +864,7 @@ class NotificationPoller:
         if not intents:
             return
         for intent in intents:
+            self.db.mark_pending_tried(intent.investment_base_id)
             try:
                 resp = self.client.get_current_shadow_post_by_investment_base_id(
                     intent.investment_base_id

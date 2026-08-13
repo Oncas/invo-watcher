@@ -12,6 +12,7 @@ from invo_agent.auth.email_otp import LoginError, login_with_otp
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings, get_settings
 from invo_agent.db import AgentDB
+from invo_agent.hud import format_age
 from invo_agent.dex.executor import DexExecutor
 from invo_agent.dex.hl_trader import HlTrader
 from invo_agent.dex.session import (
@@ -182,7 +183,8 @@ def status_cmd() -> None:
         pt.add_column("Side")
         pt.add_column("Trader entry")
         pt.add_column("Reason")
-        pt.add_column("Age")
+        pt.add_column("Queued")
+        pt.add_column("Last tried")
         pt.add_column("Summary")
         now = datetime.now(UTC)
         for intent in pending:
@@ -190,9 +192,18 @@ def status_cmd() -> None:
                 created = datetime.fromisoformat(intent.created_at)
                 if created.tzinfo is None:
                     created = created.replace(tzinfo=UTC)
-                age = f"{(now - created.astimezone(UTC)).total_seconds():.0f}s"
+                age = format_age((now - created.astimezone(UTC)).total_seconds())
             except ValueError:
                 age = "?"
+            tried = "—"
+            if intent.last_tried_at:
+                try:
+                    last = datetime.fromisoformat(intent.last_tried_at)
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=UTC)
+                    tried = f"{format_age((now - last.astimezone(UTC)).total_seconds())} ago"
+                except ValueError:
+                    tried = "?"
             pt.add_row(
                 intent.coin,
                 f"@{intent.trader}" if intent.trader else "?",
@@ -200,6 +211,7 @@ def status_cmd() -> None:
                 f"{intent.trader_entry:g}" if intent.trader_entry is not None else "?",
                 intent.reason,
                 age,
+                tried,
                 (intent.summary or "")[:48],
             )
         console.print(pt)
@@ -654,6 +666,27 @@ def watch_cmd(
                 console.print(pt)
             else:
                 console.print("[dim]No open HL positions[/dim]")
+
+            pending = getattr(snap, "pending", None) or []
+            if pending:
+                qt = Table(title="Queued opens")
+                qt.add_column("Coin")
+                qt.add_column("Trader")
+                qt.add_column("Reason")
+                qt.add_column("Queued")
+                qt.add_column("Last tried")
+                for item in pending:
+                    tried = item.get("tried_age_s")
+                    qt.add_row(
+                        str(item.get("coin") or "?"),
+                        f"@{item['trader']}" if item.get("trader") else "?",
+                        str(item.get("reason") or "?"),
+                        format_age(item.get("age_s")),
+                        f"{format_age(tried)} ago"
+                        if isinstance(tried, (int, float))
+                        else "—",
+                    )
+                console.print(qt)
 
             if snap.recent:
                 table = Table(title="Recent actions")

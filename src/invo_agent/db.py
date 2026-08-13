@@ -45,6 +45,7 @@ class PendingIntent:
     portfolio_id: str | None = None
     summary: str | None = None
     trader: str | None = None
+    last_tried_at: str | None = None
 
 
 @dataclass
@@ -72,6 +73,7 @@ _OPEN_COPY_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
 
 _PENDING_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("trader", "TEXT"),
+    ("last_tried_at", "TEXT"),
 )
 
 
@@ -136,7 +138,8 @@ class AgentDB:
                 entry_size REAL,
                 portfolio_id TEXT,
                 summary TEXT,
-                trader TEXT
+                trader TEXT,
+                last_tried_at TEXT
             );
             """
         )
@@ -494,8 +497,9 @@ class AgentDB:
             INSERT OR REPLACE INTO pending_intents (
                 investment_base_id, coin, side, reason, created_at, updated_at,
                 base_short_id, notification_id, investment_id, leverage,
-                trader_entry, tp, sl, entry_size, portfolio_id, summary, trader
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                trader_entry, tp, sl, entry_size, portfolio_id, summary, trader,
+                last_tried_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 intent.investment_base_id,
@@ -515,6 +519,7 @@ class AgentDB:
                 intent.portfolio_id,
                 intent.summary,
                 intent.trader or (existing.trader if existing else None),
+                intent.last_tried_at or (existing.last_tried_at if existing else None),
             ),
         )
         self._conn.commit()
@@ -591,7 +596,20 @@ class AgentDB:
             portfolio_id=row["portfolio_id"],
             summary=row["summary"],
             trader=row["trader"] if "trader" in row.keys() else None,
+            last_tried_at=row["last_tried_at"] if "last_tried_at" in row.keys() else None,
         )
+
+    def mark_pending_tried(self, investment_base_id: str) -> None:
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            """
+            UPDATE pending_intents
+            SET last_tried_at = ?, updated_at = ?
+            WHERE investment_base_id = ?
+            """,
+            (now, now, investment_base_id),
+        )
+        self._conn.commit()
 
     def processed_count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS c FROM processed_notifications").fetchone()

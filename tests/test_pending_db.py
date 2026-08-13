@@ -113,6 +113,41 @@ def test_trader_survives_upsert(tmp_path: Path) -> None:
     db.close()
 
 
+def test_last_tried_survives_upsert(tmp_path: Path) -> None:
+    db = AgentDB(tmp_path / "agent.db")
+    now = "2026-08-13T12:00:00+00:00"
+    db.upsert_pending_intent(
+        PendingIntent(
+            investment_base_id="btc",
+            coin="BTC",
+            side="long",
+            reason="price",
+            created_at=now,
+            updated_at=now,
+            last_tried_at="2026-08-13T12:01:00+00:00",
+        )
+    )
+    db.mark_pending_tried("btc")
+    first = db.get_pending_intent("btc")
+    assert first is not None
+    assert first.last_tried_at is not None
+    tried = first.last_tried_at
+    db.upsert_pending_intent(
+        PendingIntent(
+            investment_base_id="btc",
+            coin="BTC",
+            side="long",
+            reason="price",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    again = db.get_pending_intent("btc")
+    assert again is not None
+    assert again.last_tried_at == tried
+    db.close()
+
+
 def test_lookup_trader_from_logs_prefers_short_id(tmp_path: Path) -> None:
     db = AgentDB(tmp_path / "agent.db")
     db.log_action(
