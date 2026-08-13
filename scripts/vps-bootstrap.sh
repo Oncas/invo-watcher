@@ -3,7 +3,7 @@
 # Run as root. Does not start LIVE trading and does not overwrite existing secrets.
 set -euo pipefail
 
-REPO_URL="${INVO_AGENT_REPO:-https://github.com/Once4thewin/invo-agent-public.git}"
+REPO_URL="${INVO_AGENT_REPO:-git@github.com:Once4thewin/invo-agent-public.git}"
 ROOT=/opt/invo-agent
 DATA=/var/lib/invo-agent
 ENV_FILE=/etc/invo-agent.env
@@ -107,14 +107,11 @@ fi
 
 ufw default deny incoming
 ufw default allow outgoing
-# Keep public SSH so first-time setup over VPS_IP cannot lock you out.
-# HUD API: tailnet + optional extra source (e.g. Mac public IP) — not 0.0.0.0/0.
+# Public SSH + HUD API. HUD is authenticated with HUD_TOKEN (Mac IPs change).
 ufw allow 22/tcp
+ufw allow 8787/tcp comment 'invo-agent HUD (HUD_TOKEN auth)'
 ufw allow in on tailscale0 to any port 22 proto tcp || true
 ufw allow in on tailscale0 to any port 8787 proto tcp || true
-if [[ -n "${HUD_ALLOW_IP:-}" ]]; then
-  ufw allow from "$HUD_ALLOW_IP" to any port 8787 proto tcp || true
-fi
 ufw --force enable
 
 echo
