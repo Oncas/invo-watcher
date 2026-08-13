@@ -22,6 +22,7 @@ from invo_agent.dex.hl_trader import (
     HlTraderError,
     InsufficientMarginError,
     IocUnfilledError,
+    NotOpenCopyError,
     PriceNotBetterError,
     SameCoinOpenError,
 )
@@ -172,6 +173,16 @@ class DexExecutor:
             logger.warning("LIVE %s skipped (same coin): %s", action.action.value, exc)
             log_event(
                 "live_skip_same_coin",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=str(action.notification.id),
+            )
+            raise
+        except NotOpenCopyError as exc:
+            logger.info("LIVE %s skipped (not open): %s", action.action.value, exc)
+            log_event(
+                "live_skip_not_open",
                 action=action.action.value,
                 summary=action.summary,
                 error=str(exc),
@@ -564,7 +575,9 @@ class DexExecutor:
                 base_short_id=inv.base_short_id,
                 summary=action.summary,
             )
-            return
+            raise NotOpenCopyError(
+                f"UPDATE {coin}: not open (shortId={inv.base_short_id}) — skip"
+            )
 
         pos = trader.position_size(coin)
         if pos is None:
@@ -757,7 +770,10 @@ class DexExecutor:
                 base_short_id=inv.base_short_id if inv else None,
                 summary=action.summary,
             )
-            return
+            raise NotOpenCopyError(
+                f"CLOSE {coin}: not open "
+                f"(shortId={inv.base_short_id if inv else None}) — skip"
+            )
         pos = trader.position_size(coin)
         if pos is None:
             console.print(f"[yellow]CLOSE {coin}: already flat on HL[/yellow]")

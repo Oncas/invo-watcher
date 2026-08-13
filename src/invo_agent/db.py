@@ -458,7 +458,7 @@ class AgentDB:
 
         rows = self._conn.execute(
             """
-            SELECT summary FROM action_log
+            SELECT action, summary FROM action_log
             WHERE summary LIKE '%@%'
             ORDER BY id DESC
             LIMIT 300
@@ -473,9 +473,16 @@ class AgentDB:
                 continue
             if short_id and short_id in summary:
                 return name
+            # A later CLOSE/SKIP on the same ticker is a different trader's
+            # investment — never use it to label the copy we actually opened.
+            if short_id:
+                continue
             if ticker_u and ticker_u in summary.upper() and ticker_hit is None:
+                action = (row["action"] or "").upper()
+                if action.startswith(("CLOSE", "SKIP", "QUEUED", "ERROR")):
+                    continue
                 ticker_hit = name
-        return ticker_hit
+        return None if short_id else ticker_hit
 
     def set_pending_add_notional(self, investment_base_id: str, notional: float) -> None:
         self._conn.execute(

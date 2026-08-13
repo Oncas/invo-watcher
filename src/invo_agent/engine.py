@@ -85,13 +85,18 @@ class CopyEngine:
             if existing is None:
                 return
             inv = action.investment
+            same = existing.investment_base_id == base_id
             self.db.upsert_open_copy(
                 investment_base_id=existing.investment_base_id,
-                base_short_id=inv.base_short_id if inv else existing.base_short_id,
-                ticker=(inv.ticker or inv.name) if inv else existing.ticker,
-                portfolio_id=str(notif.portfolio_id)
-                if notif.portfolio_id
-                else existing.portfolio_id,
+                base_short_id=existing.base_short_id
+                or (inv.base_short_id if inv and same else None),
+                ticker=existing.ticker
+                or ((inv.ticker or inv.name) if inv else None),
+                portfolio_id=existing.portfolio_id
+                or (
+                    str(notif.portfolio_id) if notif.portfolio_id else None
+                ),
                 notification_id=str(notif.id),
-                trader=trader_from_action(action),
+                trader=existing.trader
+                or (trader_from_action(action) if same else None),
             )

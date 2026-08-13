@@ -340,12 +340,12 @@ def _traders_by_coin(copies: list[OpenCopy]) -> dict[str, str]:
 
 def _backfill_trader_names(db: AgentDB, copies: list[OpenCopy]) -> None:
     for copy in copies:
-        if copy.trader:
-            continue
-        name = db.lookup_trader_from_logs(
-            ticker=copy.ticker, short_id=copy.base_short_id
-        )
-        if name:
+        name = None
+        if copy.base_short_id:
+            name = db.lookup_trader_from_logs(short_id=copy.base_short_id)
+        if not name and not copy.trader:
+            name = db.lookup_trader_from_logs(ticker=copy.ticker)
+        if name and name != copy.trader:
             db.set_open_copy_trader(copy.investment_base_id, name)
     for intent in db.list_pending_intents():
         if intent.trader:

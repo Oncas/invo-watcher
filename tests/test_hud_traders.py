@@ -49,6 +49,64 @@ def test_traders_by_coin() -> None:
     assert _traders_by_coin(copies) == {"ETH": "beta_trader"}
 
 
+def test_lookup_trader_ignores_later_same_ticker_close(tmp_path: Path) -> None:
+    db = AgentDB(tmp_path / "agent.db")
+    db.log_action(
+        action="OPEN",
+        summary="OPEN KAITO LONG 5x @epsilon_trader ShortIdB02",
+        notification_id="n1",
+        dry_run=False,
+    )
+    db.log_action(
+        action="CLOSE",
+        summary="CLOSE KAITO LONG 5x @alpha_trader ShortIdI09",
+        notification_id="n2",
+        dry_run=False,
+    )
+    assert db.lookup_trader_from_logs(short_id="ShortIdB02") == "epsilon_trader"
+    assert db.lookup_trader_from_logs(ticker="KAITO") == "epsilon_trader"
+    assert db.lookup_trader_from_logs(short_id="missing") is None
+    db.close()
+
+
+def test_collect_hud_corrects_trader_stolen_by_later_close(tmp_path: Path) -> None:
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=False,
+        dry_run=True,
+    )
+    db = AgentDB(settings.db_path)
+    db.upsert_open_copy(
+        investment_base_id="00000000-0000-4000-8000-000000000014",
+        base_short_id="ShortIdB02",
+        ticker="KAITO",
+        portfolio_id=None,
+        notification_id="n1",
+        trader="alpha_trader",
+    )
+    db.log_action(
+        action="OPEN",
+        summary="OPEN KAITO LONG 5x @epsilon_trader ShortIdB02",
+        notification_id="n1",
+        dry_run=False,
+    )
+    db.log_action(
+        action="CLOSE",
+        summary="CLOSE KAITO LONG 5x @alpha_trader ShortIdI09",
+        notification_id="n2",
+        dry_run=False,
+    )
+    db.close()
+
+    collect_hud(settings, with_pnl=False, supervisor_ok=True)
+    db = AgentDB(settings.db_path)
+    copy = db.get_open_copy("00000000-0000-4000-8000-000000000014")
+    db.close()
+    assert copy is not None
+    assert copy.trader == "epsilon_trader"
+
+
 def test_collect_hud_pending_includes_trader(tmp_path: Path) -> None:
     settings = Settings(
         db_path=tmp_path / "agent.db",

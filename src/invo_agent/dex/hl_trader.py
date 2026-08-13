@@ -35,6 +35,12 @@ class SameCoinOpenError(HlTraderError):
     pass
 
 
+class NotOpenCopyError(HlTraderError):
+    """CLOSE/UPDATE for an investment we never opened (or already closed)."""
+
+    pass
+
+
 class PriceNotBetterError(HlTraderError):
     """Mid is worse than the trader's entry — queue instead of chasing."""
 

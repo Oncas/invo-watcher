@@ -20,6 +20,7 @@ from invo_agent.dex.executor import DexExecutor, RecoveryResult
 from invo_agent.dex.hl_trader import (
     InsufficientMarginError,
     IocUnfilledError,
+    NotOpenCopyError,
     PriceNotBetterError,
     SameCoinOpenError,
 )
@@ -583,6 +584,27 @@ class NotificationPoller:
                 sound=None,
                 enabled=self.settings.mac_notify,
                 sticky=False,
+            )
+            return
+
+        if isinstance(exc, NotOpenCopyError):
+            self.db.mark_processed(
+                nid, f"SKIP_NOT_OPEN_{action.action.value}", str(exc)[:500]
+            )
+            self.db.log_action(
+                action=f"SKIP_NOT_OPEN_{action.action.value}",
+                summary=f"{action.summary}: {exc}"[:500],
+                notification_id=nid,
+                dry_run=self.is_dry_run,
+            )
+            logger.info("skip (not our copy) %s: %s", action.summary, exc)
+            log_event(
+                "skip_not_open",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=nid,
+                will_retry=False,
             )
             return
 
