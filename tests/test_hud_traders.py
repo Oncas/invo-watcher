@@ -4,12 +4,21 @@ from invo_agent.config import Settings
 from invo_agent.db import AgentDB, OpenCopy, PendingIntent
 from invo_agent.hud import (
     PositionRow,
+    _opened_at_by_coin,
     _traders_by_coin,
     collect_hud,
     format_age,
     load_hud_file,
+    pending_kind,
     pending_last_tried_age,
 )
+
+
+def test_pending_kind() -> None:
+    assert pending_kind(None) == "OPEN"
+    assert pending_kind("UPDATE BTC LONG 33x @beta_trader") == "OPEN"
+    assert pending_kind(kind="UPDATE") == "UPDATE"
+    assert pending_kind(kind="OPEN") == "OPEN"
 
 
 def test_pending_last_tried_age() -> None:
@@ -49,6 +58,7 @@ def test_traders_by_coin() -> None:
         ),
     ]
     assert _traders_by_coin(copies) == {"ETH": "beta_trader"}
+    assert _opened_at_by_coin(copies) == {"ETH": "t", "STX": "t"}
 
 
 def test_lookup_trader_ignores_later_same_ticker_close(tmp_path: Path) -> None:
@@ -204,14 +214,42 @@ def test_collect_hud_pending_includes_trader(tmp_path: Path) -> None:
             summary="OPEN BTC LONG 40x @gamma_trader ShortIdJ10",
         )
     )
+    db.upsert_pending_intent(
+        PendingIntent(
+            investment_base_id="sol",
+            coin="SOL",
+            side="long",
+            reason="same_coin",
+            created_at=now,
+            updated_at=now,
+            leverage=20,
+            trader="beta_trader",
+            summary="UPDATE SOL LONG 20x @beta_trader ShortIdC03",
+        )
+    )
+    db.upsert_open_copy(
+        investment_base_id="dot",
+        base_short_id="Rq48",
+        ticker="DOT",
+        portfolio_id=None,
+        notification_id="n2",
+        side="long",
+        leverage=10,
+        trader="gamma_trader",
+    )
+    db.set_pending_add_notional("dot", 12.5)
     db.close()
 
     snap = collect_hud(settings, with_pnl=False, supervisor_ok=True)
-    assert snap.pending
-    assert snap.pending[0]["trader"] == "gamma_trader"
-    assert snap.pending[0]["leverage"] == 40
-    assert snap.pending[0]["last_tried_at"] == "2026-08-13T12:00:10+00:00"
-    assert snap.pending[0]["tried_age_s"] is not None
+    by_coin = {row["coin"]: row for row in snap.pending}
+    assert by_coin["BTC"]["kind"] == "OPEN"
+    assert by_coin["BTC"]["trader"] == "gamma_trader"
+    assert by_coin["BTC"]["leverage"] == 40
+    assert by_coin["BTC"]["last_tried_at"] == "2026-08-13T12:00:10+00:00"
+    assert by_coin["BTC"]["tried_age_s"] is not None
+    assert by_coin["SOL"]["kind"] == "OPEN"
+    assert by_coin["DOT"]["kind"] == "UPDATE"
+    assert by_coin["DOT"]["reason"] == "size"
 
     db = AgentDB(settings.db_path)
     copy = db.get_open_copy("eth")
@@ -250,7 +288,8 @@ def test_load_hud_file_accepts_trader(tmp_path: Path, monkeypatch) -> None:
               "position_value": 14400,
               "unrealized_pnl": 1.2,
               "return_on_equity": 0.02,
-              "trader": "beta_trader"
+              "trader": "beta_trader",
+              "open_age_s": 5400
             }
           ],
           "pending": []
@@ -261,4 +300,5 @@ def test_load_hud_file_accepts_trader(tmp_path: Path, monkeypatch) -> None:
     snap = load_hud_file(settings)
     assert snap is not None
     assert snap.positions[0].trader == "beta_trader"
+    assert snap.positions[0].open_age_s == 5400
     assert isinstance(snap.positions[0], PositionRow)

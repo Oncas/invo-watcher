@@ -302,6 +302,32 @@ class NotificationPoller:
             )
         return result
 
+    def _notify_if_size_queued(self, action: TradeAction) -> bool:
+        """True when an UPDATE left a size-add waiting (margin / price)."""
+        if action.action is not ActionType.UPDATE or action.investment is None:
+            return False
+        if action.investment.base_id is None:
+            return False
+        copy = self.db.get_open_copy(str(action.investment.base_id))
+        if copy is None or float(copy.pending_add_notional or 0) <= 0:
+            return False
+        reason = copy.pending_add_reason or "size"
+        self.db.log_action(
+            action="QUEUED_SIZE",
+            summary=f"{action.summary} ({reason} +${copy.pending_add_notional:.2f})",
+            notification_id=str(action.notification.id),
+            dry_run=self.is_dry_run,
+        )
+        notify_mac(
+            "invo-agent · queued",
+            f"Waiting ({reason}) — {action.summary}",
+            subtitle="Size add · entry-or-better / margin",
+            sound=None,
+            enabled=self.settings.mac_notify,
+            sticky=False,
+        )
+        return True
+
     def _notify_action(self, action: TradeAction) -> None:
         mode = "DRY-RUN" if self.is_dry_run else "LIVE"
         title = f"invo-agent · {action.action.value}"
@@ -401,12 +427,15 @@ class NotificationPoller:
                 notification_id=nid,
                 dry_run=self.is_dry_run,
             )
-            self._notify_action(action)
+            if not self._notify_if_size_queued(action):
+                self._notify_action(action)
             logger.info("%s %s", action.action.value, action.summary)
             actions.append(action)
         if not self.is_dry_run:
             self._expire_pending()
             self._drain_pending()
+            self._expire_pending_adds()
+            self._drain_pending_adds()
         return actions
 
     def _handle_live_failure(
@@ -816,6 +845,11 @@ class NotificationPoller:
         inv = action.investment
         if inv is None or inv.base_id is None:
             return False
+        # Already our live copy — do not treat this as a queued-open refresh.
+        if self.db.get_open_copy(str(inv.base_id)) is not None:
+            return False
+        if inv.base_short_id and self.db.get_open_copy_by_short_id(inv.base_short_id):
+            return False
         existing = self.db.get_pending_intent(str(inv.base_id))
         if existing is None and inv.base_short_id:
             for row in self.db.list_pending_intents():
@@ -986,6 +1020,159 @@ class NotificationPoller:
                 coin=intent.coin,
                 trader_entry=inv.entry_price,
             )
+
+    def _pending_add_age_seconds(self, copy: OpenCopy) -> float:
+        raw = copy.pending_add_at
+        if not raw:
+            return 0.0
+        try:
+            created = datetime.fromisoformat(raw)
+        except ValueError:
+            return 0.0
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - created.astimezone(UTC)).total_seconds()
+
+    def _expire_pending_adds(self) -> None:
+        max_age = float(self.settings.pending_max_age_seconds)
+        for copy in self.db.list_open_copies():
+            if float(copy.pending_add_notional or 0) <= 0:
+                continue
+            age = self._pending_add_age_seconds(copy)
+            if age < max_age:
+                continue
+            self.db.set_pending_add_notional(copy.investment_base_id, 0.0)
+            coin = (copy.ticker or "?").upper()
+            logger.warning(
+                "expired pending size-add %s %s age=%.0fs",
+                coin,
+                copy.base_short_id or copy.investment_base_id,
+                age,
+            )
+            log_event(
+                "pending_add_expire",
+                base_id=copy.investment_base_id,
+                coin=coin,
+                age_seconds=age,
+            )
+            notify_mac(
+                "invo-agent · queue",
+                f"Dropped stale size-add {coin} after {age / 3600:.1f}h",
+                sound=None,
+                enabled=self.settings.mac_notify,
+                sticky=False,
+            )
+
+    def _drain_pending_adds(self) -> None:
+        waiting = [
+            copy
+            for copy in self.db.list_open_copies()
+            if float(copy.pending_add_notional or 0) > 0
+        ]
+        if not waiting:
+            return
+        for copy in waiting:
+            self.db.mark_pending_add_tried(copy.investment_base_id)
+            try:
+                resp = self.client.get_current_shadow_post_by_investment_base_id(
+                    copy.investment_base_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "pending size-add shadow failed base_id=%s: %s",
+                    copy.investment_base_id,
+                    exc,
+                )
+                continue
+            inv = resp.post.update if resp.post else None
+            if inv is None or self._investment_closed(inv):
+                self.db.set_pending_add_notional(copy.investment_base_id, 0.0)
+                log_event(
+                    "pending_add_cancel",
+                    base_id=copy.investment_base_id,
+                    coin=copy.ticker,
+                    reason="trader_closed_on_drain",
+                )
+                continue
+            action = self._action_from_pending_add(copy, inv)
+            try:
+                self.executor.handle(action)
+            except Exception as exc:  # noqa: BLE001
+                if self._is_dex_session_error(exc):
+                    self.executor.invalidate_trader()
+                    if self._recover_dex_session():
+                        try:
+                            self.executor.handle(action)
+                        except Exception as retry_exc:  # noqa: BLE001
+                            if self._is_insufficient_margin_error(retry_exc):
+                                break
+                            continue
+                    else:
+                        break
+                elif self._is_insufficient_margin_error(exc):
+                    break
+                elif isinstance(exc, NotOpenCopyError):
+                    self.db.set_pending_add_notional(copy.investment_base_id, 0.0)
+                    continue
+                else:
+                    logger.exception(
+                        "pending size-add drain failed %s: %s",
+                        copy.ticker or copy.investment_base_id,
+                        exc,
+                    )
+                    continue
+            still = self.db.get_open_copy(copy.investment_base_id)
+            leftover = float(still.pending_add_notional or 0) if still else 0.0
+            if leftover > 0:
+                continue
+            self.db.log_action(
+                action="UPDATE",
+                summary=action.summary,
+                notification_id=copy.last_notification_id,
+                dry_run=False,
+            )
+            self._notify_action(action)
+            logger.info("drained pending size-add %s", action.summary)
+            log_event(
+                "pending_add_fill",
+                base_id=copy.investment_base_id,
+                coin=copy.ticker,
+                trader_entry=inv.entry_price,
+            )
+
+    def _action_from_pending_add(
+        self, copy: OpenCopy, inv: InvestmentUpdate
+    ) -> TradeAction:
+        try:
+            nid = (
+                UUID(copy.last_notification_id)
+                if copy.last_notification_id
+                else UUID(int=0)
+            )
+        except ValueError:
+            nid = UUID(int=0)
+        try:
+            created = datetime.fromisoformat(copy.pending_add_at or copy.opened_at)
+        except ValueError:
+            created = datetime.now(UTC)
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        coin = (copy.ticker or inv.ticker or "?").upper()
+        notification = Notification.model_validate(
+            {
+                "id": str(nid),
+                "content": f"queued UPDATE {coin} size +${copy.pending_add_notional:.2f}",
+                "notificationType": "user_updated_investment",
+                "createdAt": created.isoformat(),
+                "investmentBaseId": copy.investment_base_id,
+                "notifier": {"username": copy.trader} if copy.trader else None,
+            }
+        )
+        return TradeAction(
+            action=ActionType.UPDATE,
+            notification=notification,
+            investment=inv,
+        )
 
     def _apply_drain_failure(
         self, intent: PendingIntent, action: TradeAction, exc: BaseException

@@ -22,7 +22,7 @@ from invo_agent.dex.session import (
     refresh_dex_session,
     session_ttl_remaining_seconds,
 )
-from invo_agent.hud import format_age, pending_last_tried_age
+from invo_agent.hud import format_age, pending_kind, pending_last_tried_age
 from invo_agent.logging_setup import setup_logging
 from invo_agent.notify import ensure_alerter, find_alerter, notify_mac
 from invo_agent.poller import CATCHUP_META, NotificationPoller
@@ -191,10 +191,11 @@ def status_cmd() -> None:
                 tried_ages.append((now - last.astimezone(UTC)).total_seconds())
             except ValueError:
                 continue
-        title = "Queued opens (entry-or-better / margin / coin)"
+        title = "Queued (entry-or-better / margin / coin)"
         if tried_ages:
             title += f" · tried {format_age(min(tried_ages))} ago"
         pt = Table(title=title)
+        pt.add_column("Kind")
         pt.add_column("Coin")
         pt.add_column("Trader")
         pt.add_column("Side")
@@ -211,6 +212,7 @@ def status_cmd() -> None:
             except ValueError:
                 age = "?"
             pt.add_row(
+                "OPEN",
                 intent.coin,
                 f"@{intent.trader}" if intent.trader else "?",
                 intent.side,
@@ -691,6 +693,7 @@ def watch_cmd(
                 pt.add_column("Lev")
                 pt.add_column("uPnL")
                 pt.add_column("ROE")
+                pt.add_column("Open for")
                 for p in snap.positions:
                     style = "green" if p.unrealized_pnl >= 0 else "red"
                     pt.add_row(
@@ -699,6 +702,7 @@ def watch_cmd(
                         f"{p.leverage}x",
                         f"[{style}]{format_pnl(p.unrealized_pnl)}[/{style}]",
                         f"[{style}]{format_roe(p.return_on_equity)}[/{style}]",
+                        format_age(getattr(p, "open_age_s", None)),
                     )
                 console.print(pt)
             else:
@@ -707,16 +711,18 @@ def watch_cmd(
             pending = getattr(snap, "pending", None) or []
             if pending:
                 tried = pending_last_tried_age(pending)
-                q_title = "Queued opens"
+                q_title = "Queued"
                 if tried is not None:
                     q_title += f" · tried {format_age(tried)} ago"
                 qt = Table(title=q_title)
+                qt.add_column("Kind")
                 qt.add_column("Coin")
                 qt.add_column("Trader")
                 qt.add_column("Reason")
                 qt.add_column("Queued")
                 for item in pending:
                     qt.add_row(
+                        pending_kind(kind=item.get("kind")),
                         str(item.get("coin") or "?"),
                         f"@{item['trader']}" if item.get("trader") else "?",
                         str(item.get("reason") or "?"),

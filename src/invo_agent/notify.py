@@ -84,11 +84,13 @@ def _notify_alerter(
     *,
     subtitle: str | None,
     sound: str | None,
+    timeout: int = 0,
 ) -> None:
-    """Sticky alert. Fire-and-forget — alerter blocks until dismiss.
+    """Alerter alert. Fire-and-forget — alerter blocks until dismiss or timeout.
 
     Unique --group per alert so a new event does NOT replace the previous one
     (otherwise Notification Center looks like history is overwritten).
+    timeout=0 stays until dismissed; >0 auto-dismisses after that many seconds.
     """
     cmd = [
         alerter,
@@ -97,7 +99,7 @@ def _notify_alerter(
         "--message",
         body,
         "--timeout",
-        "0",  # 0 = stay until dismissed
+        str(max(0, int(timeout))),
         "--close-label",
         "Dismiss",
         "--ignore-dnd",
@@ -167,20 +169,23 @@ def notify_mac(
     subtitle = _clean(subtitle, 80) if subtitle else None
 
     try:
-        if sticky:
-            alerter = ensure_alerter(download=True)
-            if alerter:
-                _notify_alerter(
-                    alerter, title, body, subtitle=subtitle, sound=sound
-                )
-                return
-            if not _WARNED_FALLBACK:
-                _WARNED_FALLBACK = True
-                logger.warning(
-                    "Sticky notifications unavailable — using auto-dismiss banners. "
-                    "Install: brew install vjeantet/tap/alerter"
-                )
-
+        alerter = ensure_alerter(download=True)
+        if alerter:
+            _notify_alerter(
+                alerter,
+                title,
+                body,
+                subtitle=subtitle,
+                sound=sound,
+                timeout=0 if sticky else 10,
+            )
+            return
+        if not _WARNED_FALLBACK:
+            _WARNED_FALLBACK = True
+            logger.warning(
+                "Alerter unavailable — using osascript banners. "
+                "Install: brew install vjeantet/tap/alerter"
+            )
         _notify_osascript(title, body, subtitle=subtitle, sound=sound)
     except Exception as exc:  # noqa: BLE001
         logger.debug("mac notification failed: %s", exc)

@@ -24,6 +24,10 @@ class OpenCopy:
     trader_closing_px: float | None = None
     pending_add_notional: float = 0.0
     trader: str | None = None
+    pending_add_entry: float | None = None
+    pending_add_at: str | None = None
+    pending_add_tried_at: str | None = None
+    pending_add_reason: str | None = None
 
 
 @dataclass
@@ -69,6 +73,10 @@ _OPEN_COPY_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("trader_closing_px", "REAL"),
     ("pending_add_notional", "REAL NOT NULL DEFAULT 0"),
     ("trader", "TEXT"),
+    ("pending_add_entry", "REAL"),
+    ("pending_add_at", "TEXT"),
+    ("pending_add_tried_at", "TEXT"),
+    ("pending_add_reason", "TEXT"),
 )
 
 _PENDING_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -314,8 +322,10 @@ class AgentDB:
                 opened_at, last_notification_id,
                 our_entry_px, side, size, leverage,
                 recovery_pending, recovery_tp, recovery_sl, trader_closing_px,
-                pending_add_notional, trader
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                pending_add_notional, trader,
+                pending_add_entry, pending_add_at, pending_add_tried_at,
+                pending_add_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 investment_base_id,
@@ -338,6 +348,10 @@ class AgentDB:
                 existing["trader_closing_px"] if existing else None,
                 float(existing["pending_add_notional"] or 0) if existing else 0.0,
                 _keep(trader, "trader"),
+                existing["pending_add_entry"] if existing else None,
+                existing["pending_add_at"] if existing else None,
+                existing["pending_add_tried_at"] if existing else None,
+                existing["pending_add_reason"] if existing else None,
             ),
         )
         self._conn.commit()
@@ -442,6 +456,16 @@ class AgentDB:
             if "pending_add_notional" in keys
             else 0.0,
             trader=row["trader"] if "trader" in keys else None,
+            pending_add_entry=float(row["pending_add_entry"])
+            if "pending_add_entry" in keys and row["pending_add_entry"] is not None
+            else None,
+            pending_add_at=row["pending_add_at"] if "pending_add_at" in keys else None,
+            pending_add_tried_at=row["pending_add_tried_at"]
+            if "pending_add_tried_at" in keys
+            else None,
+            pending_add_reason=row["pending_add_reason"]
+            if "pending_add_reason" in keys
+            else None,
         )
 
     def set_open_copy_trader(self, investment_base_id: str, trader: str) -> None:
@@ -483,14 +507,61 @@ class AgentDB:
                 ticker_hit = name
         return ticker_hit
 
-    def set_pending_add_notional(self, investment_base_id: str, notional: float) -> None:
+    def set_pending_add_notional(
+        self,
+        investment_base_id: str,
+        notional: float,
+        *,
+        entry: float | None = None,
+        reason: str | None = None,
+    ) -> None:
+        amount = max(0.0, float(notional))
+        if amount <= 1e-12:
+            self._conn.execute(
+                """
+                UPDATE open_copies
+                SET pending_add_notional = 0,
+                    pending_add_entry = NULL,
+                    pending_add_at = NULL,
+                    pending_add_tried_at = NULL,
+                    pending_add_reason = NULL
+                WHERE investment_base_id = ?
+                """,
+                (investment_base_id,),
+            )
+            self._conn.commit()
+            return
+        existing = self.get_open_copy(investment_base_id)
+        queued_at = (
+            existing.pending_add_at
+            if existing and existing.pending_add_notional > 0 and existing.pending_add_at
+            else datetime.now(UTC).isoformat()
+        )
+        entry_px = entry if entry is not None else (
+            existing.pending_add_entry if existing else None
+        )
+        why = reason or (existing.pending_add_reason if existing else None) or "size"
         self._conn.execute(
             """
             UPDATE open_copies
-            SET pending_add_notional = ?
+            SET pending_add_notional = ?,
+                pending_add_entry = ?,
+                pending_add_at = ?,
+                pending_add_reason = ?
             WHERE investment_base_id = ?
             """,
-            (max(0.0, float(notional)), investment_base_id),
+            (amount, entry_px, queued_at, why, investment_base_id),
+        )
+        self._conn.commit()
+
+    def mark_pending_add_tried(self, investment_base_id: str) -> None:
+        self._conn.execute(
+            """
+            UPDATE open_copies
+            SET pending_add_tried_at = ?
+            WHERE investment_base_id = ?
+            """,
+            (datetime.now(UTC).isoformat(), investment_base_id),
         )
         self._conn.commit()
 

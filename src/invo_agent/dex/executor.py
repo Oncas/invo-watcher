@@ -625,7 +625,16 @@ class DexExecutor:
             f"entrySize={inv.entry_size})"
         )
         leverage = int(inv.leverage or 1)
-        trader.update_leverage(coin, leverage, is_cross=True)
+        try:
+            trader.update_leverage(coin, leverage, is_cross=True)
+        except HlTraderError as exc:
+            # Size-add / TP/SL must still run — leverage is best-effort on UPDATE.
+            console.print(
+                f"[yellow]UPDATE {coin}: leverage failed — continuing "
+                f"size/TP/SL ({exc})[/yellow]"
+            )
+            logger.warning("UPDATE %s leverage failed (continuing): %s", coin, exc)
+            log_event("update_leverage_skip", coin=coin, error=str(exc))
 
         qty_before = sz
         size_sub: dict[str, Any] | None = None
@@ -959,9 +968,16 @@ class DexExecutor:
             )
         return hl_sz
 
-    @staticmethod
-    def _should_increase_size(inv: InvestmentUpdate) -> bool:
-        """True when Involio marks a position increase (Copy on Position Increased)."""
+    def _has_pending_add(self, inv: InvestmentUpdate) -> bool:
+        if self.db is None or inv.base_id is None:
+            return False
+        copy = self.db.get_open_copy(str(inv.base_id))
+        return bool(copy and float(copy.pending_add_notional or 0) > 0)
+
+    def _should_increase_size(self, inv: InvestmentUpdate) -> bool:
+        """True when Involio marks a position increase, or a leftover add is queued."""
+        if self._has_pending_add(inv):
+            return True
         changes = inv.changes or {}
         if changes.get("simIncrease") is True:
             return True
@@ -972,6 +988,23 @@ class DexExecutor:
             return float(inv.entry_size) > float(prev) * 1.02
         except (TypeError, ValueError):
             return False
+
+    def _stash_pending_add(
+        self,
+        inv: InvestmentUpdate,
+        notional: float,
+        *,
+        reason: str,
+        entry: float | None,
+    ) -> None:
+        if self.db is None or inv.base_id is None:
+            return
+        self.db.set_pending_add_notional(
+            str(inv.base_id),
+            notional,
+            entry=entry,
+            reason=reason,
+        )
 
     def _apply_size_increase(
         self,
@@ -992,21 +1025,42 @@ class DexExecutor:
         )
         target_notional = float(meta["order_notional_usd"])
         hl_min = float(self.settings.hl_min_order_usd)
-        delta_notional = target_notional - current_notional
+        gap = target_notional - current_notional
         pending_add = 0.0
+        pending_entry: float | None = None
         if self.db is not None and inv.base_id is not None:
             copy = self.db.get_open_copy(str(inv.base_id))
             if copy is not None:
                 pending_add = float(copy.pending_add_notional or 0)
-        effective_delta = delta_notional + pending_add
-        if effective_delta + 1e-9 < hl_min:
-            accumulated = pending_add + max(0.0, delta_notional)
-            if self.db is not None and inv.base_id is not None:
-                self.db.set_pending_add_notional(str(inv.base_id), accumulated)
+                pending_entry = copy.pending_add_entry
+        # Live trader allocation is the source of truth — don't add pending on top.
+        if inv.entry_size is not None:
+            need = max(0.0, gap)
+        else:
+            need = max(0.0, pending_add)
+
+        trader_entry = float(inv.entry_price) if inv.entry_price else None
+        if trader_entry is not None and trader_entry <= 0:
+            trader_entry = None
+        if trader_entry is None and pending_entry is not None and pending_entry > 0:
+            trader_entry = float(pending_entry)
+
+        if need + 1e-9 < hl_min:
+            accumulated = (
+                need
+                if inv.entry_size is not None
+                else pending_add + max(0.0, gap)
+            )
+            if accumulated <= 1e-9:
+                if self.db is not None and inv.base_id is not None:
+                    self.db.set_pending_add_notional(str(inv.base_id), 0.0)
+                return current_sz, None
+            self._stash_pending_add(
+                inv, accumulated, reason="size", entry=trader_entry
+            )
             console.print(
                 f"[dim]UPDATE {coin}: size increase too small "
-                f"(Δnotional=${delta_notional:.2f} + pending=${pending_add:.2f} "
-                f"< HL min ${hl_min:g}) — accumulated ${accumulated:.2f}[/dim]"
+                f"(need=${need:.2f} < HL min ${hl_min:g}) — queued ${accumulated:.2f}[/dim]"
             )
             log_event(
                 "size_increase_skip",
@@ -1014,41 +1068,45 @@ class DexExecutor:
                 reason="below_hl_min",
                 current_notional=current_notional,
                 target_notional=target_notional,
-                delta_notional=delta_notional,
                 pending_add_notional=accumulated,
             )
             return current_sz, None
-        delta_notional = effective_delta
 
         available = trader.available_margin()
-        need_margin = delta_notional / max(1, leverage)
-        if available + 1e-9 < self.settings.min_order_usd:
-            raise InsufficientMarginError(
-                f"UPDATE {coin} size increase: no free margin "
-                f"(available=${available:.2f})"
+        lev = max(1, leverage)
+        buyable = available * 0.98 * lev
+        if available + 1e-9 < self.settings.min_order_usd or buyable + 1e-9 < hl_min:
+            self._stash_pending_add(inv, need, reason="margin", entry=trader_entry)
+            console.print(
+                f"[yellow]UPDATE {coin}: size increase queued "
+                f"(no free margin; available=${available:.2f}; +${need:.2f})[/yellow]"
             )
-        if need_margin > available:
-            delta_notional = available * 0.98 * max(1, leverage)
-            if delta_notional + 1e-9 < hl_min:
-                raise InsufficientMarginError(
-                    f"UPDATE {coin} size increase: free margin too small "
-                    f"(available=${available:.2f})"
-                )
+            log_event(
+                "size_increase_skip",
+                coin=coin,
+                reason="no_margin",
+                current_notional=current_notional,
+                target_notional=target_notional,
+                pending_add_notional=need,
+            )
+            return current_sz, None
+
+        remainder = 0.0
+        delta_notional = need
+        if need / lev > available:
+            delta_notional = buyable
+            remainder = max(0.0, need - delta_notional)
             console.print(
                 f"[yellow]UPDATE {coin}: shrunk size-increase notional to "
-                f"${delta_notional:.2f} (available margin)[/yellow]"
+                f"${delta_notional:.2f} (available margin); "
+                f"queued leftover ${remainder:.2f}[/yellow]"
             )
 
-        trader_entry = float(inv.entry_price) if inv.entry_price else None
-        if trader_entry is not None and trader_entry <= 0:
-            trader_entry = None
         if not price_is_at_or_better(mid=mid, trader_entry=trader_entry, is_long=is_long):
-            if self.db is not None and inv.base_id is not None:
-                self.db.set_pending_add_notional(str(inv.base_id), effective_delta)
+            self._stash_pending_add(inv, need, reason="price", entry=trader_entry)
             console.print(
                 f"[dim]UPDATE {coin}: size increase waiting for entry-or-better "
-                f"(mid={mid} trader={trader_entry}) — accumulated "
-                f"${effective_delta:.2f}[/dim]"
+                f"(mid={mid} trader={trader_entry}) — queued ${need:.2f}[/dim]"
             )
             log_event(
                 "size_increase_skip",
@@ -1056,7 +1114,7 @@ class DexExecutor:
                 reason="price_worse",
                 mid=mid,
                 trader_entry=trader_entry,
-                pending_add_notional=effective_delta,
+                pending_add_notional=need,
             )
             return current_sz, None
 
@@ -1090,18 +1148,25 @@ class DexExecutor:
             )
             self._check_hl_ok(hl_resp, "size_increase")
         except IocUnfilledError:
-            if self.db is not None and inv.base_id is not None:
-                self.db.set_pending_add_notional(str(inv.base_id), effective_delta)
+            self._stash_pending_add(inv, need, reason="price", entry=trader_entry)
             log_event(
                 "size_increase_skip",
                 coin=coin,
                 reason="ioc_unfilled",
-                pending_add_notional=effective_delta,
+                pending_add_notional=need,
             )
             return current_sz, None
         except HlTraderError as exc:
             if "insufficient margin" in str(exc).lower():
-                raise InsufficientMarginError(str(exc)) from exc
+                self._stash_pending_add(inv, need, reason="margin", entry=trader_entry)
+                log_event(
+                    "size_increase_skip",
+                    coin=coin,
+                    reason="no_margin",
+                    error=str(exc),
+                    pending_add_notional=need,
+                )
+                return current_sz, None
             raise
 
         new_sz = current_sz + add_sz
@@ -1123,7 +1188,13 @@ class DexExecutor:
                 size=new_sz,
                 leverage=float(leverage),
             )
-            self.db.set_pending_add_notional(str(inv.base_id), 0.0)
+            leftover = remainder
+            if leftover + 1e-9 >= hl_min:
+                self._stash_pending_add(
+                    inv, leftover, reason="margin", entry=trader_entry
+                )
+            else:
+                self.db.set_pending_add_notional(str(inv.base_id), 0.0)
 
         avg_px = extract_avg_px(hl_resp)
         our_px = avg_px if avg_px is not None else entry_px
