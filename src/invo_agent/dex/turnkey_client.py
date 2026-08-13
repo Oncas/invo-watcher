@@ -55,6 +55,20 @@ class TurnkeySigner:
             raise TurnkeyError(f"Turnkey {path} failed ({response.status_code}): {data}")
         return data
 
+    def whoami(self) -> dict[str, Any]:
+        return self._submit(
+            "/public/v1/query/whoami",
+            {"organizationId": self.organization_id},
+        )
+
+    def get_api_keys(self, user_id: str) -> list[dict[str, Any]]:
+        data = self._submit(
+            "/public/v1/query/get_api_keys",
+            {"organizationId": self.organization_id, "userId": user_id},
+        )
+        keys = data.get("apiKeys")
+        return keys if isinstance(keys, list) else []
+
     def sign_eip712(self, typed_data: dict[str, Any]) -> dict[str, Any]:
         """Sign EIP-712 typed data; returns {r,s,v} hex fields for Hyperliquid.
 

@@ -1,7 +1,9 @@
 from datetime import UTC, datetime, timedelta
 
 from invo_agent.dex.session import (
+    TURNKEY_DEFAULT_EXPIRATION_SECONDS,
     DexSessionData,
+    infer_dex_expires_at_ms,
     session_should_proactive_renew,
     session_ttl_remaining_seconds,
 )
@@ -34,6 +36,18 @@ def test_long_key_uses_six_hour_lead() -> None:
     assert not session_should_proactive_renew(data, renew_before_seconds=6 * 3600)
     data_near = _session(remaining_s=5 * 3600, issued_s=30 * 24 * 3600)
     assert session_should_proactive_renew(data_near, renew_before_seconds=6 * 3600)
+
+
+def test_missing_expires_at_uses_turnkey_15m_not_requested_30d() -> None:
+    now_ms = 1_700_000_000_000
+    expires, source = infer_dex_expires_at_ms({}, now_ms=now_ms)
+    assert source == "turnkey_default_15m"
+    assert expires == now_ms + TURNKEY_DEFAULT_EXPIRATION_SECONDS * 1000
+    expires_api, source_api = infer_dex_expires_at_ms(
+        {"expiresAtMs": now_ms + 3600_000}, now_ms=now_ms
+    )
+    assert source_api == "involio"
+    assert expires_api == now_ms + 3600_000
 
 
 def test_remaining_none_without_expiry() -> None:
