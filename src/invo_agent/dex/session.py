@@ -11,7 +11,7 @@ from rich.console import Console
 from invo_agent.api.client import InvolioClient
 from invo_agent.auth.inbox import InboxError, wait_for_otp
 from invo_agent.config import Settings
-from invo_agent.dex.turnkey_client import TurnkeySigner
+from invo_agent.dex.turnkey_client import TurnkeyError, TurnkeySigner
 from invo_agent.dex.turnkey_crypto import (
     decrypt_credential_bundle,
     generate_p256_keypair,
@@ -317,12 +317,112 @@ def session_is_expired(data: DexSessionData, *, skew_seconds: int = 60) -> bool:
     return remaining <= float(skew_seconds)
 
 
+def refresh_failed_because_key_dead(exc: BaseException) -> bool:
+    """True when API-key refresh cannot work and email OTP is required."""
+    if isinstance(exc, TurnkeyError) and exc.status_code in (401, 403):
+        return True
+    if isinstance(exc, DexSessionError) and "no dex session" in str(exc).lower():
+        return True
+    msg = str(exc).lower()
+    needles = (
+        "api_key_expired",
+        "expired api key",
+        "public_key_not_found",
+        "could not find public key",
+        "unauthenticated",
+        "401",
+        "403",
+    )
+    return any(n in msg for n in needles)
+
+
+def refresh_dex_session(
+    store: DexSessionStore,
+    client: InvolioClient | None = None,
+    *,
+    expiration_seconds: int = DEFAULT_DEX_EXPIRATION_SECONDS,
+) -> DexSessionData:
+    """Mint a new Turnkey API key using the current still-valid key.
+
+    Matches the Involio website renew path: stamp
+    ``ACTIVITY_TYPE_CREATE_READ_WRITE_SESSION_V2`` with ``invalidateExisting=false``.
+    No email OTP. When the current key is already dead, Turnkey returns 401/403
+    and the caller should fall back to ``establish_dex_session``.
+    """
+    data, signer = load_signer(store, require_fresh=False)
+    try:
+        org_id = data.organization_id
+        if client is not None:
+            try:
+                prepared = client.dex_get("/dex/session/rw/prepare")
+                payload = prepared.get("data") or prepared
+                org = payload.get("organizationId")
+                if org:
+                    org_id = str(org)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("DEX rw/prepare skipped: %s", exc)
+
+        keypair = generate_p256_keypair()
+        target_pub = keypair.public_key_otp_hex.removeprefix("0x").removeprefix("0X")
+        label = f"{DEFAULT_DEX_DEVICE_LABEL} · {target_pub[-8:]}"
+        minted = signer.create_read_write_session(
+            target_public_key=target_pub,
+            api_key_name=label,
+            expiration_seconds=expiration_seconds,
+            invalidate_existing=False,
+        )
+        bundle = minted.get("credentialBundle")
+        if not bundle:
+            raise DexSessionError("Turnkey refresh returned no credentialBundle")
+        api_private = decrypt_credential_bundle(str(bundle), keypair.private_key_hex)
+        api_public = public_key_from_private(api_private)
+        expires_at_ms, ttl_source = infer_dex_expires_at_ms({})
+        session = data.model_copy(
+            update={
+                "organization_id": org_id,
+                "api_public_key": api_public,
+                "api_private_key": api_private,
+                "api_key_id": minted.get("apiKeyId") or None,
+                "expires_at_ms": expires_at_ms,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        refined = refine_expiry_from_turnkey(session)
+        if refined is not None:
+            session = refined
+            ttl_source = "turnkey_api_keys"
+        remaining_s = session_ttl_remaining_seconds(session)
+        store.save(session)
+        logger.info(
+            "DEX refresh TTL requested=%ss source=%s stored=%s remaining_s=%s api_key_id=%s",
+            expiration_seconds,
+            ttl_source,
+            session.expires_at_ms,
+            remaining_s,
+            session.api_key_id,
+        )
+        log_event(
+            "dex_refresh",
+            ok=True,
+            requested_expiration_seconds=expiration_seconds,
+            stored_expires_at_ms=session.expires_at_ms,
+            remaining_seconds=None if remaining_s is None else round(remaining_s, 1),
+            ttl_source=ttl_source,
+            api_key_id=session.api_key_id,
+        )
+        return session
+    except TurnkeyError as exc:
+        raise DexSessionError(f"DEX API-key refresh failed: {exc}") from exc
+    finally:
+        signer.close()
+
+
 def session_should_proactive_renew(
     data: DexSessionData,
     *,
     renew_before_seconds: float = 6 * 3600,
 ) -> bool:
-    """True when we should IMAP-OTP a new key off the trade path.
+    """True when we should mint a new key off the trade path (refresh, then OTP).
 
     Lead time is ``renew_before_seconds``, but never more than 25% of the
     issued TTL (so a 15-minute key renews ~4 minutes before death, not every poll).

@@ -12,7 +12,6 @@ from invo_agent.auth.email_otp import LoginError, login_with_otp
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings, get_settings
 from invo_agent.db import AgentDB
-from invo_agent.hud import format_age
 from invo_agent.dex.executor import DexExecutor
 from invo_agent.dex.hl_trader import HlTrader
 from invo_agent.dex.session import (
@@ -20,7 +19,10 @@ from invo_agent.dex.session import (
     DexSessionStore,
     establish_dex_session,
     load_signer,
+    refresh_dex_session,
+    session_ttl_remaining_seconds,
 )
+from invo_agent.hud import format_age, pending_last_tried_age
 from invo_agent.logging_setup import setup_logging
 from invo_agent.notify import ensure_alerter, find_alerter, notify_mac
 from invo_agent.poller import CATCHUP_META, NotificationPoller
@@ -177,16 +179,29 @@ def status_cmd() -> None:
 
     pending = db.list_pending_intents()
     if pending:
-        pt = Table(title="Queued opens (entry-or-better / margin / coin)")
+        now = datetime.now(UTC)
+        tried_ages = []
+        for intent in pending:
+            if not intent.last_tried_at:
+                continue
+            try:
+                last = datetime.fromisoformat(intent.last_tried_at)
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=UTC)
+                tried_ages.append((now - last.astimezone(UTC)).total_seconds())
+            except ValueError:
+                continue
+        title = "Queued opens (entry-or-better / margin / coin)"
+        if tried_ages:
+            title += f" · tried {format_age(min(tried_ages))} ago"
+        pt = Table(title=title)
         pt.add_column("Coin")
         pt.add_column("Trader")
         pt.add_column("Side")
         pt.add_column("Trader entry")
         pt.add_column("Reason")
         pt.add_column("Queued")
-        pt.add_column("Last tried")
         pt.add_column("Summary")
-        now = datetime.now(UTC)
         for intent in pending:
             try:
                 created = datetime.fromisoformat(intent.created_at)
@@ -195,15 +210,6 @@ def status_cmd() -> None:
                 age = format_age((now - created.astimezone(UTC)).total_seconds())
             except ValueError:
                 age = "?"
-            tried = "—"
-            if intent.last_tried_at:
-                try:
-                    last = datetime.fromisoformat(intent.last_tried_at)
-                    if last.tzinfo is None:
-                        last = last.replace(tzinfo=UTC)
-                    tried = f"{format_age((now - last.astimezone(UTC)).total_seconds())} ago"
-                except ValueError:
-                    tried = "?"
             pt.add_row(
                 intent.coin,
                 f"@{intent.trader}" if intent.trader else "?",
@@ -211,7 +217,6 @@ def status_cmd() -> None:
                 f"{intent.trader_entry:g}" if intent.trader_entry is not None else "?",
                 intent.reason,
                 age,
-                tried,
                 (intent.summary or "")[:48],
             )
         console.print(pt)
@@ -269,6 +274,38 @@ def dex_login_cmd(
         sound=settings.mac_notify_sound or None,
         enabled=settings.mac_notify,
         sticky=settings.mac_notify_sticky,
+    )
+
+
+@app.command("dex-refresh")
+def dex_refresh_cmd() -> None:
+    """Mint a new Turnkey API key with the current key (no email OTP)."""
+    settings, session, db = _bootstrap()
+    db.close()
+    if session.load() is None:
+        console.print("[red]Not logged in to Involio.[/red] Run: invo-agent login")
+        raise typer.Exit(1)
+
+    dex_store = DexSessionStore(settings.dex_session_path)
+    if dex_store.load() is None:
+        console.print("[yellow]No DEX session.[/yellow] Run: invo-agent dex-login")
+        raise typer.Exit(1)
+
+    with InvolioClient(settings, session) as client:
+        try:
+            data = refresh_dex_session(dex_store, client)
+        except (DexSessionError, Exception) as exc:
+            console.print(f"[red]DEX refresh failed:[/red] {exc}")
+            console.print("[dim]If the key is already dead, run: invo-agent dex-login[/dim]")
+            raise typer.Exit(1) from exc
+
+    remaining = session_ttl_remaining_seconds(data)
+    remaining_txt = (
+        f"{remaining:.0f}s" if remaining is not None else "unknown"
+    )
+    console.print(
+        f"[green]DEX session refreshed[/green] api_key_id={data.api_key_id} "
+        f"remaining={remaining_txt}"
     )
 
 
@@ -669,22 +706,21 @@ def watch_cmd(
 
             pending = getattr(snap, "pending", None) or []
             if pending:
-                qt = Table(title="Queued opens")
+                tried = pending_last_tried_age(pending)
+                q_title = "Queued opens"
+                if tried is not None:
+                    q_title += f" · tried {format_age(tried)} ago"
+                qt = Table(title=q_title)
                 qt.add_column("Coin")
                 qt.add_column("Trader")
                 qt.add_column("Reason")
                 qt.add_column("Queued")
-                qt.add_column("Last tried")
                 for item in pending:
-                    tried = item.get("tried_age_s")
                     qt.add_row(
                         str(item.get("coin") or "?"),
                         f"@{item['trader']}" if item.get("trader") else "?",
                         str(item.get("reason") or "?"),
                         format_age(item.get("age_s")),
-                        f"{format_age(tried)} ago"
-                        if isinstance(tried, (int, float))
-                        else "—",
                     )
                 console.print(qt)
 

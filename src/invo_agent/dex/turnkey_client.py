@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import httpx
@@ -9,7 +10,23 @@ from turnkey_api_key_stamper import ApiKeyStamper, ApiKeyStamperConfig
 
 
 class TurnkeyError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def parse_read_write_session_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Pull apiKeyId + credentialBundle from V2 or V1 Turnkey result."""
+    v2 = result.get("createReadWriteSessionResultV2") or {}
+    v1 = result.get("createReadWriteSessionResult") or {}
+    if not isinstance(v2, dict):
+        v2 = {}
+    if not isinstance(v1, dict):
+        v1 = {}
+    return {
+        "apiKeyId": v2.get("apiKeyId") or v1.get("apiKeyId"),
+        "credentialBundle": v2.get("credentialBundle") or v1.get("credentialBundle"),
+    }
 
 
 class TurnkeySigner:
@@ -52,7 +69,10 @@ class TurnkeySigner:
         )
         data = response.json()
         if response.status_code >= 400:
-            raise TurnkeyError(f"Turnkey {path} failed ({response.status_code}): {data}")
+            raise TurnkeyError(
+                f"Turnkey {path} failed ({response.status_code}): {data}",
+                status_code=response.status_code,
+            )
         return data
 
     def whoami(self) -> dict[str, Any]:
@@ -69,6 +89,50 @@ class TurnkeySigner:
         keys = data.get("apiKeys")
         return keys if isinstance(keys, list) else []
 
+    def create_read_write_session(
+        self,
+        *,
+        target_public_key: str,
+        api_key_name: str,
+        expiration_seconds: int,
+        invalidate_existing: bool = False,
+    ) -> dict[str, Any]:
+        """Stamp a new API-key session with the current still-valid key.
+
+        Same as the Involio web renew path: ACTIVITY_TYPE_CREATE_READ_WRITE_SESSION_V2
+        with invalidateExisting=false. No email OTP.
+        """
+        pub = target_public_key.removeprefix("0x").removeprefix("0X")
+        if not pub.startswith("04") or len(pub) != 130:
+            raise TurnkeyError(
+                "targetPublicKey must be uncompressed P-256 hex "
+                f"(04…, 130 chars), got len={len(pub)} prefix={pub[:2]!r}"
+            )
+        body = {
+            "type": "ACTIVITY_TYPE_CREATE_READ_WRITE_SESSION_V2",
+            "timestampMs": str(int(time.time() * 1000)),
+            "organizationId": self.organization_id,
+            "parameters": {
+                "targetPublicKey": pub,
+                "apiKeyName": api_key_name,
+                "expirationSeconds": str(int(expiration_seconds)),
+                "invalidateExisting": bool(invalidate_existing),
+            },
+        }
+        data = self._submit("/public/v1/submit/create_read_write_session", body)
+        activity = data.get("activity") or data
+        status = activity.get("status")
+        if status and status != "ACTIVITY_STATUS_COMPLETED":
+            raise TurnkeyError(
+                f"create_read_write_session incomplete (status={status}): {data}"
+            )
+        parsed = parse_read_write_session_result(activity.get("result") or {})
+        if not parsed.get("credentialBundle"):
+            raise TurnkeyError(
+                f"Missing credentialBundle in create_read_write_session: {data}"
+            )
+        return parsed
+
     def sign_eip712(self, typed_data: dict[str, Any]) -> dict[str, Any]:
         """Sign EIP-712 typed data; returns {r,s,v} hex fields for Hyperliquid.
 
@@ -83,7 +147,7 @@ class TurnkeySigner:
 
         body = {
             "type": "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
-            "timestampMs": str(int(__import__("time").time() * 1000)),
+            "timestampMs": str(int(time.time() * 1000)),
             "organizationId": self.organization_id,
             "parameters": {
                 "signWith": self.sign_with,

@@ -16,7 +16,6 @@ from invo_agent.auth.email_otp import login_with_otp
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB, OpenCopy, PendingIntent
-from invo_agent.labels import trader_from_action
 from invo_agent.dex.executor import DexExecutor, RecoveryResult
 from invo_agent.dex.hl_trader import (
     InsufficientMarginError,
@@ -28,11 +27,14 @@ from invo_agent.dex.session import (
     DexSessionError,
     DexSessionStore,
     establish_dex_session,
+    refresh_dex_session,
+    refresh_failed_because_key_dead,
     session_should_proactive_renew,
     session_ttl_remaining_seconds,
 )
 from invo_agent.engine import CopyEngine
 from invo_agent.events import log_event
+from invo_agent.labels import trader_from_action
 from invo_agent.notify import notify_mac
 
 console = Console()
@@ -656,7 +658,11 @@ class NotificationPoller:
             )
 
     def _maybe_proactive_dex_renew(self) -> None:
-        """IMAP-OTP a new Turnkey key before expiry, off the OPEN hot path."""
+        """Refresh the Turnkey key before expiry, off the OPEN hot path.
+
+        Uses the current API key (no OTP) like the website. OTP only if that
+        key is already dead.
+        """
         if self.is_dry_run:
             return
         data = self.executor.dex_store.load()
@@ -671,63 +677,78 @@ class NotificationPoller:
             "DEX key TTL remaining=%.0fs — background renew",
             remaining if remaining is not None else -1,
         )
-        console.print("[yellow]DEX key near expiry — background auto dex-login...[/yellow]")
+        console.print("[yellow]DEX key near expiry — background refresh...[/yellow]")
         self._recover_dex_session()
 
-    def _recover_dex_session(self) -> bool:
-        """IMAP Turnkey OTP → new DEX API key. Rate-limited.
+    def _mark_dex_renewed(self, *, via: str, remaining: float | None) -> bool:
+        self.executor.invalidate_trader()
+        if remaining is not None and remaining < 120:
+            logger.warning(
+                "DEX key TTL after %s is only %.0fs — backing off renew",
+                via,
+                remaining,
+            )
+            self._dex_recover_after = time.monotonic() + DEX_RECOVER_COOLDOWN_SECONDS
+        else:
+            self._dex_recover_after = 0.0
+        self._dex_dead_notified = False
+        console.print(f"[green]DEX session renewed ({via}).[/green]")
+        logger.info("DEX renew succeeded via=%s remaining_s=%s", via, remaining)
+        log_event("dex_auto_login", ok=True, via=via, remaining_seconds=remaining)
+        notify_mac(
+            "invo-agent",
+            f"DEX session renewed ({via})",
+            sound=self.settings.mac_notify_sound or None,
+            enabled=self.settings.mac_notify,
+            sticky=self.settings.mac_notify_sticky,
+        )
+        return True
 
-        Keeps the old key on disk until the new login succeeds.
+    def _recover_dex_session(self) -> bool:
+        """Refresh via current API key; IMAP OTP only if that key is dead.
+
+        Keeps the old key on disk until the new session is saved.
         """
         now = time.monotonic()
         if now < self._dex_recover_after:
             logger.info(
-                "DEX auto-login cooling down (%.0fs left)",
+                "DEX renew cooling down (%.0fs left)",
                 self._dex_recover_after - now,
             )
             return False
 
+        store = DexSessionStore(self.settings.dex_session_path)
+        try:
+            console.print("[yellow]Refreshing DEX session (no OTP)...[/yellow]")
+            logger.info("attempting DEX API-key refresh")
+            session = refresh_dex_session(store, self.client)
+            remaining = session_ttl_remaining_seconds(session)
+            return self._mark_dex_renewed(via="api-key refresh", remaining=remaining)
+        except Exception as refresh_exc:  # noqa: BLE001
+            logger.info("DEX API-key refresh failed: %s", refresh_exc)
+            log_event("dex_refresh", ok=False, error=str(refresh_exc))
+            if not refresh_failed_because_key_dead(refresh_exc):
+                self._dex_recover_after = now + DEX_RECOVER_COOLDOWN_SECONDS
+                console.print(f"[red]DEX refresh failed:[/red] {refresh_exc}")
+                return False
+
         if not self.settings.imap_configured:
-            console.print("[red]Cannot auto dex-login — configure IMAP.[/red]")
+            console.print("[red]DEX key dead and IMAP not configured — cannot OTP.[/red]")
             self._dex_recover_after = now + DEX_RECOVER_COOLDOWN_SECONDS
             return False
 
-        console.print("[yellow]Auto dex-login via Turnkey OTP email...[/yellow]")
+        console.print("[yellow]DEX key dead — auto dex-login via Turnkey OTP...[/yellow]")
         logger.info("attempting auto dex-login via IMAP")
         try:
-            establish_dex_session(
-                self.client,
-                self.settings,
-                DexSessionStore(self.settings.dex_session_path),
-            )
-            self.executor.invalidate_trader()
-            new = self.executor.dex_store.load()
+            establish_dex_session(self.client, self.settings, store)
+            new = store.load()
             remaining = session_ttl_remaining_seconds(new) if new else None
-            if remaining is not None and remaining < 120:
-                logger.warning(
-                    "DEX key TTL after login is only %.0fs — backing off renew",
-                    remaining,
-                )
-                self._dex_recover_after = now + DEX_RECOVER_COOLDOWN_SECONDS
-            else:
-                self._dex_recover_after = 0.0
-            self._dex_dead_notified = False
-            console.print("[green]DEX session renewed.[/green]")
-            logger.info("auto dex-login succeeded remaining_s=%s", remaining)
-            log_event("dex_auto_login", ok=True, remaining_seconds=remaining)
-            notify_mac(
-                "invo-agent",
-                "DEX session renewed (auto dex-login)",
-                sound=self.settings.mac_notify_sound or None,
-                enabled=self.settings.mac_notify,
-                sticky=self.settings.mac_notify_sticky,
-            )
-            return True
+            return self._mark_dex_renewed(via="otp", remaining=remaining)
         except Exception as exc:  # noqa: BLE001
             self._dex_recover_after = now + DEX_RECOVER_COOLDOWN_SECONDS
             console.print(f"[red]Auto dex-login failed:[/red] {exc}")
             logger.error("auto dex-login failed: %s", exc)
-            log_event("dex_auto_login", ok=False, error=str(exc))
+            log_event("dex_auto_login", ok=False, via="otp", error=str(exc))
             return False
 
     def _intent_from_action(self, action: TradeAction, reason: str) -> PendingIntent | None:
