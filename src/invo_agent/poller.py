@@ -16,6 +16,7 @@ from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB, OpenCopy
 from invo_agent.dex.executor import DexExecutor, RecoveryResult
+from invo_agent.dex.hl_trader import InsufficientMarginError, SameCoinOpenError
 from invo_agent.dex.session import (
     DexSessionError,
     DexSessionStore,
@@ -235,7 +236,7 @@ class NotificationPoller:
             )
             return None
         if not self._investment_closed(inv):
-            logger.info(
+            logger.debug(
                 "open copy still open on Involio base_id=%s ticker=%s",
                 copy.investment_base_id,
                 inv.ticker or copy.ticker,
@@ -255,6 +256,8 @@ class NotificationPoller:
             inv=inv,
             our_entry_px=copy.our_entry_px,
             our_side=copy.side,
+            our_size=copy.size,
+            copy_base_id=copy.investment_base_id,
         )
         if result.status in {"closed", "already_flat"}:
             self.db.close_copy(copy.investment_base_id)
@@ -349,14 +352,7 @@ class NotificationPoller:
             try:
                 self.executor.handle(action)
             except Exception as exc:  # noqa: BLE001
-                if self._is_dex_session_error(exc) and self._recover_dex_session():
-                    try:
-                        self.executor.handle(action)
-                    except Exception as retry_exc:  # noqa: BLE001
-                        self._record_executor_error(nid, action, retry_exc)
-                        continue
-                else:
-                    self._record_executor_error(nid, action, exc)
+                if self._handle_live_failure(nid, action, exc):
                     continue
             self.engine.remember(action)
             self.db.log_action(
@@ -370,9 +366,100 @@ class NotificationPoller:
             actions.append(action)
         return actions
 
+    def _handle_live_failure(
+        self, nid: str, action: TradeAction, exc: BaseException
+    ) -> bool:
+        """Return True if the caller should skip remember (failure handled)."""
+        if self._is_dex_session_error(exc):
+            self.executor.invalidate_trader()
+            if self._recover_dex_session():
+                try:
+                    self.executor.handle(action)
+                except Exception as retry_exc:  # noqa: BLE001
+                    if self._is_dex_session_error(retry_exc):
+                        # Leave unprocessed so the next poll retries after cooldown.
+                        logger.error(
+                            "DEX still broken after renew for %s: %s",
+                            action.summary,
+                            retry_exc,
+                        )
+                        self._notify_dex_login_needed(retry_exc)
+                        return True
+                    self._record_executor_error(nid, action, retry_exc)
+                    return True
+                return False  # retry succeeded — fall through to remember
+            logger.warning(
+                "DEX session error for %s (will retry): %s", action.summary, exc
+            )
+            self._notify_dex_login_needed(exc)
+            return True
+        self._record_executor_error(nid, action, exc)
+        return True
+
     def _record_executor_error(
         self, nid: str, action: TradeAction, exc: BaseException
     ) -> None:
+        # No free margin: skip permanently. A later retry after other closes
+        # can be a stale/expired move — only act on fresh signals.
+        if self._is_insufficient_margin_error(exc):
+            self.db.mark_processed(
+                nid, f"SKIP_NO_MARGIN_{action.action.value}", str(exc)[:500]
+            )
+            self.db.log_action(
+                action=f"SKIP_NO_MARGIN_{action.action.value}",
+                summary=f"{action.summary}: {exc}"[:500],
+                notification_id=nid,
+                dry_run=self.is_dry_run,
+            )
+            logger.warning("skip (no free margin) %s: %s", action.summary, exc)
+            log_event(
+                "skip_no_margin",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=nid,
+                will_retry=False,
+            )
+            notify_mac(
+                "invo-agent · skipped",
+                f"No free margin for {action.summary}",
+                subtitle="Won't retry — wait for next signal",
+                sound=None,
+                enabled=self.settings.mac_notify,
+                sticky=False,
+            )
+            return
+
+        # Already mimicking this coin via another trader — one HL position per coin.
+        if isinstance(exc, SameCoinOpenError):
+            self.db.mark_processed(
+                nid, f"SKIP_SAME_COIN_{action.action.value}", str(exc)[:500]
+            )
+            self.db.log_action(
+                action=f"SKIP_SAME_COIN_{action.action.value}",
+                summary=f"{action.summary}: {exc}"[:500],
+                notification_id=nid,
+                dry_run=self.is_dry_run,
+            )
+            logger.warning("skip (same coin open) %s: %s", action.summary, exc)
+            log_event(
+                "skip_same_coin",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=nid,
+                will_retry=False,
+            )
+            notify_mac(
+                "invo-agent · skipped",
+                f"Already in that coin — {action.summary}",
+                subtitle="One position per coin",
+                sound=None,
+                enabled=self.settings.mac_notify,
+                sticky=False,
+            )
+            return
+
         # Mark processed so we don't retry the same trade every poll.
         self.db.mark_processed(nid, f"ERROR_{action.action.value}", str(exc)[:500])
         self.db.log_action(
@@ -381,21 +468,6 @@ class NotificationPoller:
             notification_id=nid,
             dry_run=self.is_dry_run,
         )
-        if self._is_dex_session_error(exc):
-            self.executor.invalidate_trader()
-            logger.error("DEX session error for %s: %s", action.summary, exc)
-            if not self._dex_dead_notified:
-                self._dex_dead_notified = True
-                notify_mac(
-                    "invo-agent · DEX LOGIN NEEDED",
-                    "Turnkey key expired and auto dex-login failed. "
-                    "Check IMAP / run: invo-agent dex-login",
-                    subtitle="Trading paused",
-                    sound="Basso",
-                    enabled=self.settings.mac_notify,
-                    sticky=self.settings.mac_notify_sticky,
-                )
-            return
         logger.exception("executor failed for %s", action.summary)
         notify_mac(
             "invo-agent · ERROR",
@@ -407,11 +479,46 @@ class NotificationPoller:
         )
 
     @staticmethod
+    def _is_insufficient_margin_error(exc: BaseException) -> bool:
+        if isinstance(exc, InsufficientMarginError):
+            return True
+        msg = str(exc).lower()
+        return (
+            "insufficient margin" in msg
+            or "minimum value of $10" in msg
+            or "free margin too small" in msg
+        )
+
+    def _notify_dex_login_needed(self, exc: BaseException) -> None:
+        if self._dex_dead_notified:
+            return
+        self._dex_dead_notified = True
+        notify_mac(
+            "invo-agent · DEX LOGIN NEEDED",
+            "Turnkey session invalid and auto dex-login failed. "
+            f"Check IMAP / run: invo-agent dex-login ({exc})",
+            subtitle="Trading paused",
+            sound="Basso",
+            enabled=self.settings.mac_notify,
+            sticky=self.settings.mac_notify_sticky,
+        )
+
+    @staticmethod
     def _is_dex_session_error(exc: BaseException) -> bool:
         if isinstance(exc, DexSessionError):
             return True
         msg = str(exc).lower()
-        return "api_key_expired" in msg or "expired api key" in msg
+        needles = (
+            "api_key_expired",
+            "expired api key",
+            "public_key_not_found",
+            "could not find public key",
+            "unauthenticated",
+        )
+        if any(n in msg for n in needles):
+            return True
+        # Any Turnkey HTTP 401 on signing means the local API key is dead.
+        return "turnkey" in msg and "401" in msg
 
     def _ensure_dex_session(self) -> None:
         """Proactively refresh Turnkey session if local expiry is known."""
@@ -439,6 +546,8 @@ class NotificationPoller:
             return False
 
         self.executor.invalidate_trader()
+        # Drop the dead key so we never keep signing with a revoked pubkey.
+        DexSessionStore(self.settings.dex_session_path).clear()
         console.print("[yellow]Auto dex-login via Turnkey OTP email...[/yellow]")
         logger.info("attempting auto dex-login via IMAP")
         try:

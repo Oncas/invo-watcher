@@ -476,12 +476,18 @@ def watch_cmd(
     """Live terminal HUD — easiest way to see background agent health (no menu-bar app)."""
     import time as _time
 
-    from invo_agent.hud import collect_hud, format_pnl, format_roe, write_hud_file
+    from invo_agent.hud import (
+        collect_hud,
+        format_pnl,
+        format_pnl_24h,
+        format_roe,
+        write_hud_file,
+    )
 
     settings = get_settings()
     console.print(
         "[dim]Watching invo-agent (Ctrl+C to stop). "
-        "PnL refreshes at most every 60s.[/dim]\n"
+        "PnL refreshes at most every 5s.[/dim]\n"
     )
     try:
         while True:
@@ -495,7 +501,13 @@ def watch_cmd(
                 if snap.poll_age_seconds is not None
                 else "never"
             )
-            eq = f"  equity=${snap.equity:.2f}" if snap.equity is not None else ""
+            eq = ""
+            if snap.equity is not None:
+                eq = f"  equity=${snap.equity:.2f}"
+                if snap.pnl_24h is not None:
+                    day = format_pnl_24h(snap.pnl_24h, snap.pnl_24h_pct)
+                    style = "green" if snap.pnl_24h >= 0 else "red"
+                    eq += f"  [{style}]{day}[/{style}]"
             console.print(f"poll {age}{eq}")
 
             if snap.positions:
@@ -532,7 +544,7 @@ def watch_cmd(
                 console.print(table)
 
             console.print(
-                f"\n[dim]refresh {interval}s · PnL cache ≤60s · Ctrl+C quit[/dim]"
+                f"\n[dim]refresh {interval}s · PnL cache ≤5s · Ctrl+C quit[/dim]"
             )
             _time.sleep(interval)
     except KeyboardInterrupt:

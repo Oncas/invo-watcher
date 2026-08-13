@@ -67,7 +67,7 @@ MAC_NOTIFY_SOUND=Glass
 | `DRY_RUN` / `LIVE` | Keep `DRY_RUN=true` and `LIVE=false` until you’re ready |
 | `POSITION_PCT` | Fallback margin % if the source trade has no `entrySize` |
 | `HL_MIN_ORDER_USD` | Floor order notional (margin×leverage); default $10 for Hyperliquid |
-| `MAX_POSITION_PCT` | Cap on margin % of our equity (safety) |
+| `MAX_POSITION_PCT` | Cap each OPEN to this % of equity as margin (default 50) |
 | `RECOVERY_ENABLED` | On startup, reconcile open copies vs Involio closes (default true) |
 | `RECOVERY_SL_PCT` | Adverse % from mid for parked SL while waiting recovery TP (default 3) |
 | `MIN_EQUITY_USD` | Skip trades if HL equity is below this |
@@ -285,13 +285,15 @@ Leave `watch` in a small Terminal/iTerm window.
 ```bash
 brew install --cask swiftbar
 mkdir -p "$HOME/Library/Application Support/SwiftBar"
-cp "$PWD/scripts/swiftbar/invo-agent.15s.sh" \
-  "$HOME/Library/Application Support/SwiftBar/Plugins/invo-agent.15s.sh"
-chmod +x scripts/swiftbar/invo-agent.15s.sh
+cp "$PWD/scripts/swiftbar/invo-agent.5s.sh" \
+  "$HOME/Library/Application Support/SwiftBar/Plugins/invo-agent.5s.sh"
+chmod +x scripts/swiftbar/invo-agent.5s.sh
+# Remove old 15s plugin if present (SwiftBar schedule is in the filename).
+rm -f "$HOME/Library/Application Support/SwiftBar/Plugins/invo-agent.15s.sh"
 # Open SwiftBar once; pick …/SwiftBar/Plugins if asked
 ```
 
-Menu bar: green/red `●`. Click for open-trade PnL (cached ≤60s), recent actions, Status / Watch / Logs.
+Menu bar: green/red `●`. Click for open-trade PnL (cached ≤5s), recent actions, Status / Watch / Logs.
 
 Also written every refresh: `~/.invo-agent/hud.json`.
 

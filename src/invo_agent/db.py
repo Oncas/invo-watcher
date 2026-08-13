@@ -118,6 +118,28 @@ class AgentDB:
         )
         self._conn.commit()
 
+    def unmark_processed(self, notification_id: str) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM processed_notifications WHERE notification_id = ?",
+            (notification_id,),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def unmark_processed_matching(self, action_prefix: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT notification_id FROM processed_notifications WHERE action LIKE ?",
+            (f"{action_prefix}%",),
+        ).fetchall()
+        ids = [str(row["notification_id"]) for row in rows]
+        if ids:
+            self._conn.executemany(
+                "DELETE FROM processed_notifications WHERE notification_id = ?",
+                [(nid,) for nid in ids],
+            )
+            self._conn.commit()
+        return ids
+
     def log_action(
         self,
         *,
@@ -285,6 +307,20 @@ class AgentDB:
             (investment_base_id,),
         )
         self._conn.commit()
+
+    def get_open_copy(self, investment_base_id: str) -> OpenCopy | None:
+        row = self._conn.execute(
+            "SELECT * FROM open_copies WHERE investment_base_id = ?",
+            (investment_base_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_open_copy(row)
+
+    def get_open_copy_by_short_id(self, base_short_id: str) -> OpenCopy | None:
+        row = self._conn.execute(
+            "SELECT * FROM open_copies WHERE base_short_id = ?",
+            (base_short_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_open_copy(row)
 
     def list_open_copies(self) -> list[OpenCopy]:
         rows = self._conn.execute(

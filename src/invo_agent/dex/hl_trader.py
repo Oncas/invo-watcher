@@ -23,6 +23,18 @@ class HlTraderError(RuntimeError):
     pass
 
 
+class InsufficientMarginError(HlTraderError):
+    """Raised when HL has no free margin for the intended order (expected, not a bug)."""
+
+    pass
+
+
+class SameCoinOpenError(HlTraderError):
+    """Raised when we already track an open copy on this coin (one position per coin)."""
+
+    pass
+
+
 class TurnkeyWalletAdapter:
     """Minimal wallet duck-type for hyperliquid sign_inner / LocalAccount.sign_message."""
 
@@ -50,6 +62,18 @@ class HlTrader:
         state = self.info.user_state(self.address)
         summary = state.get("marginSummary") or {}
         return float(summary.get("accountValue") or 0)
+
+    def available_margin(self) -> float:
+        """Free cross margin ≈ accountValue − totalMarginUsed.
+
+        Do not clamp to ``withdrawable`` — HL often reports withdrawable=0 while
+        open positions exist even though new cross orders can still use free margin.
+        """
+        state = self.info.user_state(self.address)
+        summary = state.get("crossMarginSummary") or state.get("marginSummary") or {}
+        account_value = float(summary.get("accountValue") or 0)
+        margin_used = float(summary.get("totalMarginUsed") or 0)
+        return max(0.0, account_value - margin_used)
 
     def asset_index(self, coin: str) -> int:
         return int(self.info.name_to_asset(coin))
@@ -266,15 +290,42 @@ class HlTrader:
         sl_px: float,
     ) -> tuple[dict[str, Any], dict[str, Any], int]:
         """Cancel existing triggers, then place reduce-only TP+SL as positionTpsl."""
+        return self.sync_position_tpsl(
+            coin, is_long=is_long, sz=sz, tp_px=tp_px, sl_px=sl_px
+        )
+
+    def sync_position_tpsl(
+        self,
+        coin: str,
+        *,
+        is_long: bool,
+        sz: float,
+        tp_px: float | None,
+        sl_px: float | None,
+        tp_cloid: Cloid | None = None,
+        sl_cloid: Cloid | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], int] | None:
+        """Cancel existing reduce triggers, then place whatever TP/SL legs are set.
+
+        Returns (hl_order, response, nonce) when at least one leg is placed, else None
+        after a clear-only cancel.
+        """
         self.cancel_reduce_triggers(coin)
         sz = self.round_size(coin, sz)
         if sz <= 0:
             raise HlTraderError(f"Size rounded to zero for {coin}")
-        tp_px = self.round_price(coin, tp_px)
-        sl_px = self.round_price(coin, sl_px)
+
+        legs: list[tuple[float, str, Cloid | None]] = []
+        if tp_px is not None and float(tp_px) > 0:
+            legs.append((self.round_price(coin, float(tp_px)), "tp", tp_cloid))
+        if sl_px is not None and float(sl_px) > 0:
+            legs.append((self.round_price(coin, float(sl_px)), "sl", sl_cloid))
+        if not legs:
+            return None
+
         is_buy = not is_long  # flatten direction
         wires = []
-        for trigger_px, tpsl in ((tp_px, "tp"), (sl_px, "sl")):
+        for trigger_px, tpsl, cloid in legs:
             order_req: dict[str, Any] = {
                 "coin": coin,
                 "is_buy": is_buy,
@@ -289,8 +340,11 @@ class HlTrader:
                 },
                 "reduce_only": True,
             }
+            if cloid is not None:
+                order_req["cloid"] = cloid
             wires.append(order_request_to_order_wire(order_req, self.asset_index(coin)))
-        action = order_wires_to_order_action(wires, None, grouping="positionTpsl")
+        grouping = "positionTpsl" if len(legs) == 2 else "na"
+        action = order_wires_to_order_action(wires, None, grouping=grouping)
         nonce = get_timestamp_ms()
         signature = self.sign_action(action, nonce)
         hl_order = {"action": action, "nonce": nonce, "signature": signature}

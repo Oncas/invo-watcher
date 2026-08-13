@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     # Fallback margin % of our equity when the source trade has no entrySize.
     position_pct: float = 5.0
     # Never allocate more than this % of our equity on one open (safety).
-    max_position_pct: float = 100.0
+    max_position_pct: float = 50.0
     notification_page_size: int = 20
     min_equity_usd: float = 5.0
     min_order_usd: float = 1.0

@@ -99,3 +99,36 @@ def mimic_close_cloid(base_short_id: str | None) -> Cloid | None:
         order_type=ORDER_CLOSE,
         trade_type=TRADE_MIMIC,
     )
+
+
+def mimic_tp_cloid(
+    base_short_id: str | None, *, copy_update: bool = False
+) -> Cloid | None:
+    """TP trigger cloid — copy_update matches pressing Copy on a trade update."""
+    return stamp_cloid(
+        base_short_id,
+        order_type=ORDER_TP,
+        trade_type=TRADE_MIMIC_COPY_UPDATE if copy_update else TRADE_MIMIC,
+    )
+
+
+def mimic_sl_cloid(
+    base_short_id: str | None, *, copy_update: bool = False
+) -> Cloid | None:
+    """SL trigger cloid — copy_update matches pressing Copy on a trade update."""
+    return stamp_cloid(
+        base_short_id,
+        order_type=ORDER_SL,
+        trade_type=TRADE_MIMIC_COPY_UPDATE if copy_update else TRADE_MIMIC,
+    )
+
+
+def mimic_size_increase_cloid(
+    base_short_id: str | None, *, copy_update: bool = True
+) -> Cloid | None:
+    """Size-increase cloid — copy_update matches Copy on Position Increased."""
+    return stamp_cloid(
+        base_short_id,
+        order_type=ORDER_SIZE_INCREASE,
+        trade_type=TRADE_MIMIC_COPY_UPDATE if copy_update else TRADE_MIMIC,
+    )

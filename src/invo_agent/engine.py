@@ -61,12 +61,34 @@ class CopyEngine:
             self.db.close_copy(base_id)
             return
 
-        if action.action in (ActionType.OPEN, ActionType.UPDATE):
+        if action.action is ActionType.OPEN:
             inv = action.investment
             self.db.upsert_open_copy(
                 investment_base_id=base_id,
                 base_short_id=inv.base_short_id if inv else None,
                 ticker=(inv.ticker or inv.name) if inv else None,
                 portfolio_id=str(notif.portfolio_id) if notif.portfolio_id else None,
+                notification_id=str(notif.id),
+            )
+            return
+
+        if action.action is ActionType.UPDATE:
+            # Never create a phantom open_copy from a skipped UPDATE (not ours).
+            # Only refresh metadata when we already track this investment.
+            existing = self.db.get_open_copy(base_id)
+            if existing is None and action.investment and action.investment.base_short_id:
+                existing = self.db.get_open_copy_by_short_id(
+                    action.investment.base_short_id
+                )
+            if existing is None:
+                return
+            inv = action.investment
+            self.db.upsert_open_copy(
+                investment_base_id=existing.investment_base_id,
+                base_short_id=inv.base_short_id if inv else existing.base_short_id,
+                ticker=(inv.ticker or inv.name) if inv else existing.ticker,
+                portfolio_id=str(notif.portfolio_id)
+                if notif.portfolio_id
+                else existing.portfolio_id,
                 notification_id=str(notif.id),
             )

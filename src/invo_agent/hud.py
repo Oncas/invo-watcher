@@ -12,7 +12,7 @@ from invo_agent.config import Settings
 from invo_agent.db import AgentDB
 
 # How often to refresh Hyperliquid mark/PnL (network call).
-PNL_CACHE_SECONDS = 60.0
+PNL_CACHE_SECONDS = 5.0
 
 
 @dataclass
@@ -41,6 +41,8 @@ class HudSnapshot:
     logged_in: bool
     position_pct: float
     equity: float | None = None
+    pnl_24h: float | None = None
+    pnl_24h_pct: float | None = None  # percent points, e.g. 11.6
     positions: list[PositionRow] = field(default_factory=list)
     pnl_updated_at: str | None = None
 
@@ -63,6 +65,157 @@ def _parse_ts(raw: str | None) -> datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
+
+
+def _portfolio_series(portfolio: object, *keys: str) -> list[dict]:
+    """Extract named series payloads from HL portfolio response."""
+    out: list[dict] = []
+    if isinstance(portfolio, list):
+        by_key = {k: p for k, p in portfolio}
+        for key in keys:
+            payload = by_key.get(key)
+            if isinstance(payload, dict):
+                out.append(payload)
+    elif isinstance(portfolio, dict):
+        for key in keys:
+            payload = portfolio.get(key)
+            if isinstance(payload, dict):
+                out.append(payload)
+    return out
+
+
+def _account_value_samples(portfolio: object) -> list[tuple[int, float]]:
+    """Merge perpDay+perpWeek accountValueHistory (Involio baseline source)."""
+    samples: list[tuple[int, float]] = []
+    seen: set[int] = set()
+    for series in _portfolio_series(portfolio, "perpDay", "perpWeek", "day", "week"):
+        for row in series.get("accountValueHistory") or []:
+            try:
+                ts = int(row[0])
+                value = float(row[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if ts in seen:
+                continue
+            seen.add(ts)
+            samples.append((ts, value))
+    samples.sort(key=lambda item: item[0])
+    return samples
+
+
+def _baseline_at_window_start(
+    samples: list[tuple[int, float]], window_start_ms: int
+) -> tuple[int, float] | None:
+    """Account value at T−24h: last sample at/before the window start.
+
+    Using the first sample *after* T−24h bakes later trading PnL into the
+    baseline (Involio's header uses the last known equity at window open).
+    """
+    if not samples:
+        return None
+    before = [row for row in samples if row[0] <= window_start_ms]
+    if before:
+        return before[-1]
+    return samples[0]
+
+
+def _ledger_flow_usd(delta: dict, address: str) -> tuple[float, float]:
+    """Return (net_flow, gross_in) for one non-funding ledger delta.
+
+    Mirrors Involio AccountHeader: deposits / sends into the wallet raise the
+    baseline denominator and are excluded from trading PnL.
+    """
+    addr = address.lower()
+    typ = str(delta.get("type") or "")
+
+    def _f(*keys: str) -> float | None:
+        for key in keys:
+            raw = delta.get(key)
+            if raw is None or raw == "":
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    if typ == "deposit":
+        amount = _f("usdc", "amount", "usdcValue") or 0.0
+        return amount, max(amount, 0.0)
+    if typ == "withdraw":
+        amount = abs(_f("usdc", "amount", "usdcValue") or 0.0)
+        return -amount, 0.0
+    if typ == "accountClassTransfer":
+        amount = _f("usdc", "amount") or 0.0
+        if delta.get("toPerp"):
+            return amount, max(amount, 0.0)
+        return -abs(amount), 0.0
+    if typ == "send":
+        amount = abs(_f("amount", "usdcValue", "usdc") or 0.0)
+        token = str(delta.get("token") or "").upper()
+        if token and not token.startswith("USDC"):
+            return 0.0, 0.0
+        dest = str(delta.get("destination") or "").lower()
+        sender = str(delta.get("user") or "").lower()
+        if dest == addr:
+            return amount, amount
+        if sender == addr:
+            return -amount, 0.0
+        return 0.0, 0.0
+    if typ == "internalTransfer":
+        amount = abs(_f("usdc", "amount", "usdcValue") or 0.0)
+        dest = str(delta.get("destination") or delta.get("user") or "").lower()
+        source = str(delta.get("user") or delta.get("source") or "").lower()
+        if dest == addr and source != addr:
+            return amount, amount
+        if source == addr and dest != addr:
+            return -amount, 0.0
+    return 0.0, 0.0
+
+
+def _involio_rolling_24h_pnl(
+    trader: object, address: str, equity: float
+) -> tuple[float, float] | None:
+    """Match Involio AccountHeader rolling-24h PnL.
+
+    pnl = equity − baseline − net_external_flows
+    pct = pnl / (baseline + gross_inflows) × 100
+    """
+    info = trader.info  # type: ignore[attr-defined]
+    try:
+        portfolio = info.portfolio(address)
+    except Exception:
+        return None
+    samples = _account_value_samples(portfolio)
+    window_start_ms = int(time.time() * 1000) - 86_400_000
+    baseline = _baseline_at_window_start(samples, window_start_ms)
+    if baseline is None:
+        return None
+    baseline_ms, baseline_equity = baseline
+
+    net_flow = 0.0
+    gross_in = 0.0
+    try:
+        updates = info.user_non_funding_ledger_updates(
+            address, startTime=baseline_ms + 1
+        )
+    except Exception:
+        updates = []
+    for item in updates or []:
+        if not isinstance(item, dict):
+            continue
+        delta = item.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        net, gin = _ledger_flow_usd(delta, address)
+        net_flow += net
+        gross_in += gin
+
+    pnl = equity - baseline_equity - net_flow
+    denom = baseline_equity + gross_in
+    if abs(denom) <= 1e-9:
+        return None
+    return pnl, (pnl / denom) * 100.0
 
 
 def _load_pnl_cache(settings: Settings) -> dict | None:
@@ -91,6 +244,8 @@ def _fetch_hl_pnl(settings: Settings) -> dict:
     out: dict = {
         "fetched_at": time.time(),
         "equity": None,
+        "pnl_24h": None,
+        "pnl_24h_pct": None,
         "positions": [],
         "error": None,
     }
@@ -99,8 +254,9 @@ def _fetch_hl_pnl(settings: Settings) -> dict:
         data, signer = load_signer(store)
         trader = HlTrader(signer, data.master_address)
         state = trader.info.user_state(data.master_address)
-        summary = state.get("marginSummary") or {}
-        out["equity"] = float(summary.get("accountValue") or 0)
+        summary = state.get("marginSummary") or state.get("crossMarginSummary") or {}
+        equity = float(summary.get("accountValue") or 0)
+        out["equity"] = equity
         rows = []
         for item in state.get("assetPositions") or []:
             pos = item.get("position") or {}
@@ -121,6 +277,9 @@ def _fetch_hl_pnl(settings: Settings) -> dict:
                 }
             )
         out["positions"] = rows
+        rolling = _involio_rolling_24h_pnl(trader, data.master_address, equity)
+        if rolling is not None:
+            out["pnl_24h"], out["pnl_24h_pct"] = rolling
         trader.close()
         signer.close()
     except DexSessionError as exc:
@@ -168,10 +327,16 @@ def collect_hud(settings: Settings, *, with_pnl: bool = True) -> HudSnapshot:
 
     positions: list[PositionRow] = []
     equity: float | None = None
+    pnl_24h: float | None = None
+    pnl_24h_pct: float | None = None
     pnl_updated_at: str | None = None
     if with_pnl:
         pnl = _fetch_hl_pnl(settings)
         equity = pnl.get("equity")
+        raw_24 = pnl.get("pnl_24h")
+        raw_pct = pnl.get("pnl_24h_pct")
+        pnl_24h = float(raw_24) if raw_24 is not None else None
+        pnl_24h_pct = float(raw_pct) if raw_pct is not None else None
         if pnl.get("fetched_at"):
             pnl_updated_at = datetime.fromtimestamp(
                 float(pnl["fetched_at"]), tz=UTC
@@ -192,6 +357,8 @@ def collect_hud(settings: Settings, *, with_pnl: bool = True) -> HudSnapshot:
         logged_in=session is not None,
         position_pct=settings.position_pct,
         equity=equity,
+        pnl_24h=pnl_24h,
+        pnl_24h_pct=pnl_24h_pct,
         positions=positions,
         pnl_updated_at=pnl_updated_at,
     )
@@ -217,3 +384,13 @@ def format_roe(roe: float) -> str:
     pct = roe * 100.0
     sign = "+" if pct >= 0 else ""
     return f"{sign}{pct:.1f}%"
+
+
+def format_pnl_24h(pnl: float, pct: float | None = None) -> str:
+    """e.g. '+11.60% · +$5.59 24h' (Involio-style)."""
+    bits: list[str] = []
+    if pct is not None:
+        sign = "+" if pct >= 0 else ""
+        bits.append(f"{sign}{pct:.2f}%")
+    bits.append(format_pnl(pnl))
+    return f"{' · '.join(bits)} 24h"
