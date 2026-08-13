@@ -454,7 +454,7 @@ class AgentDB:
     def lookup_trader_from_logs(
         self, *, ticker: str | None = None, short_id: str | None = None
     ) -> str | None:
-        from invo_agent.labels import trader_from_summary
+        from invo_agent.labels import own_copy_from_summary, trader_from_summary
 
         rows = self._conn.execute(
             """
@@ -468,21 +468,20 @@ class AgentDB:
         ticker_u = ticker.upper() if ticker else None
         for row in rows:
             summary = row["summary"] or ""
-            name = trader_from_summary(summary)
-            if not name:
-                continue
-            if short_id and short_id in summary:
-                return name
-            # A later CLOSE/SKIP on the same ticker is a different trader's
-            # investment — never use it to label the copy we actually opened.
+            own = own_copy_from_summary(summary)
             if short_id:
+                if own and own[1] == short_id:
+                    return own[0]
+                continue
+            name = own[0] if own else trader_from_summary(summary)
+            if not name:
                 continue
             if ticker_u and ticker_u in summary.upper() and ticker_hit is None:
                 action = (row["action"] or "").upper()
                 if action.startswith(("CLOSE", "SKIP", "QUEUED", "ERROR")):
                     continue
                 ticker_hit = name
-        return None if short_id else ticker_hit
+        return ticker_hit
 
     def set_pending_add_notional(self, investment_base_id: str, notional: float) -> None:
         self._conn.execute(
