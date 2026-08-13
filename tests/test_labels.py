@@ -3,9 +3,12 @@ from uuid import uuid4
 
 from invo_agent.api.models import ActionType, InvestmentUpdate, Notification, TradeAction
 from invo_agent.labels import (
+    coin_from_summary,
     format_action_summary,
     format_recent_line,
     own_copy_from_summary,
+    tags_from_action_row,
+    tags_from_event,
     tags_from_summary,
     trader_from_action,
     trader_from_summary,
@@ -113,6 +116,21 @@ def test_format_recent_line_keeps_tags_visible() -> None:
     line = format_recent_line(action.action.value, summary)
     assert line.startswith("UPDATE · size · tp:")
     assert "ETH LONG 20x @beta_trader" in line
+
+
+def test_tags_from_action_row_and_events() -> None:
+    assert coin_from_summary("UPDATE ETH LONG 20x @beta_trader ShortIdG07") == "ETH"
+    assert tags_from_action_row(
+        "UPDATE", "UPDATE ETH LONG 20x @beta_trader ShortIdG07"
+    ) == []
+    assert tags_from_action_row(
+        "SKIP_NO_MARGIN_UPDATE",
+        "UPDATE BTC LONG 30x @gamma_trader: UPDATE BTC size increase: no free margin",
+    ) == ["size"]
+    assert tags_from_action_row("QUEUED_SIZE", "UPDATE ADA LONG 10x @x") == ["size"]
+    assert tags_from_event("update_recorded", "tp") == ["tp"]
+    assert tags_from_event("size_increase_skip", None) == ["size"]
+    assert tags_from_event("update_recorded", "increase") == ["size"]
 
 
 def test_trader_from_action_falls_back_to_notifier() -> None:

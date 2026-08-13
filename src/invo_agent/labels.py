@@ -95,6 +95,50 @@ def format_recent_line(action: str, summary: str, tags: list[str] | None = None)
     return f"{action}{tag_s}"
 
 
+def coin_from_summary(summary: str | None) -> str | None:
+    if not summary:
+        return None
+    for token in ("UPDATE ", "OPEN ", "CLOSE "):
+        idx = summary.find(token)
+        if idx < 0:
+            continue
+        rest = summary[idx + len(token) :].split()
+        if rest:
+            return rest[0].upper()
+    return None
+
+
+def tags_from_action_row(action: str, summary: str | None) -> list[str]:
+    """Tags from stored summary, or from skip/queue wording on older rows."""
+    found = tags_from_summary(summary)
+    if found:
+        return found
+    text = f"{action} {summary or ''}".lower()
+    extra: list[str] = []
+    if (
+        action.upper() == "QUEUED_SIZE"
+        or "size increase" in text
+        or "queued leftover" in text
+    ):
+        extra.append("size")
+    return extra
+
+
+def merge_update_tags(*groups: list[str] | None) -> list[str]:
+    seen = {tag for group in groups for tag in (group or []) if tag in _UPDATE_TAG_SET}
+    return [tag for tag in _UPDATE_TAG_ORDER if tag in seen]
+
+
+def tags_from_event(kind: str | None, update_type: str | None) -> list[str]:
+    tags: list[str] = []
+    if kind in {"size_increase_hl", "size_increase_skip"}:
+        tags.append("size")
+    mapped = {"increase": "size", "tp": "tp", "sl": "sl"}.get(update_type or "")
+    if mapped:
+        tags.append(mapped)
+    return merge_update_tags(tags)
+
+
 def tags_from_summary(summary: str | None) -> list[str]:
     """Read `` · size · tp`` suffixes written by ``format_action_summary``."""
     if not summary:

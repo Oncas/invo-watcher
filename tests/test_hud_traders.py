@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from invo_agent.config import Settings
@@ -302,3 +303,38 @@ def test_load_hud_file_accepts_trader(tmp_path: Path, monkeypatch) -> None:
     assert snap.positions[0].trader == "beta_trader"
     assert snap.positions[0].open_age_s == 5400
     assert isinstance(snap.positions[0], PositionRow)
+
+
+def test_collect_hud_infers_update_tags_from_events(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "kind": "update_recorded",
+                "coin": "ETH",
+                "update_type": "tp",
+                "base_short_id": "ShortIdG07",
+            }
+        )
+        + "\n"
+    )
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        log_dir=logs,
+        live=False,
+        dry_run=True,
+    )
+    db = AgentDB(settings.db_path)
+    db.log_action(
+        action="UPDATE",
+        summary="UPDATE ETH LONG 20x @beta_trader ShortIdG07",
+        notification_id="n-eth",
+        dry_run=False,
+    )
+    db.close()
+    snap = collect_hud(settings, with_pnl=False, supervisor_ok=True)
+    assert snap.recent
+    assert snap.recent[0]["tags"] == ["tp"]
+    assert snap.recent[0]["summary"].endswith(" · tp")

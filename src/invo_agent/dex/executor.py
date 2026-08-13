@@ -36,6 +36,7 @@ from invo_agent.dex.recovery import RecoveryDecision, decide_missed_close
 from invo_agent.dex.session import DexSessionError, DexSessionStore, load_signer
 from invo_agent.dex.turnkey_crypto import new_client_tx_id
 from invo_agent.events import log_event
+from invo_agent.labels import merge_update_tags, update_labels
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -69,6 +70,7 @@ class DexExecutor:
         self.db = db
         self._trader: HlTrader | None = None
         self._dex_session = None
+        self.last_update_tags: list[str] = []
 
     @property
     def live_enabled(self) -> bool:
@@ -88,6 +90,7 @@ class DexExecutor:
         return self._trader
 
     def handle(self, action: TradeAction) -> None:
+        self.last_update_tags = []
         if action.action is ActionType.IGNORE:
             return
 
@@ -753,6 +756,11 @@ class DexExecutor:
                 update_type=update_type,
                 error=str(exc),
             )
+
+        tags = update_labels(inv)
+        if size_sub is not None:
+            tags = merge_update_tags(tags, ["size"])
+        self.last_update_tags = tags
 
     def _close(self, action: TradeAction, trader: HlTrader) -> None:
         inv = action.investment

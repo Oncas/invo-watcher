@@ -255,6 +255,30 @@ class AgentDB:
             for row in rows
         ]
 
+    def append_summary_tags(self, action_id: int, tags: list[str]) -> str | None:
+        """Persist `` · size · tp`` on an older action_log row (once)."""
+        from invo_agent.labels import merge_update_tags, tags_from_summary
+
+        clean = merge_update_tags(tags)
+        if not clean:
+            return None
+        row = self._conn.execute(
+            "SELECT summary FROM action_log WHERE id = ?",
+            (action_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        summary = row["summary"] or ""
+        if tags_from_summary(summary):
+            return summary
+        updated = f"{summary} · {' · '.join(clean)}" if summary else " · ".join(clean)
+        self._conn.execute(
+            "UPDATE action_log SET summary = ? WHERE id = ?",
+            (updated, action_id),
+        )
+        self._conn.commit()
+        return updated
+
     def recent_actions(self, limit: int = 20) -> list[ActionLogRow]:
         rows = self._conn.execute(
             """

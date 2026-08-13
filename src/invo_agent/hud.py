@@ -9,8 +9,17 @@ from pathlib import Path
 from invo_agent import service as launchd_service
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings
-from invo_agent.db import AgentDB, OpenCopy
-from invo_agent.labels import tags_from_summary, trader_from_summary
+from invo_agent.db import ActionLogRow, AgentDB, OpenCopy
+from invo_agent.labels import (
+    coin_from_summary,
+    merge_update_tags,
+    own_copy_from_summary,
+    tags_from_action_row,
+    tags_from_event,
+    tags_from_summary,
+    trader_from_summary,
+    update_labels,
+)
 
 # How often to refresh Hyperliquid mark/PnL (network call).
 PNL_CACHE_SECONDS = 5.0
@@ -64,6 +73,118 @@ def pending_kind(summary: str | None = None, *, kind: str | None = None) -> str:
     if kind:
         return str(kind)
     return "OPEN"
+
+
+def _tail_jsonl(path: Path, max_bytes: int = 256_000) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return []
+    if len(data) > max_bytes:
+        data = data[-max_bytes:]
+        data = data.split(b"\n", 1)[-1]
+    rows: list[dict] = []
+    for line in data.decode("utf-8", errors="ignore").splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
+
+
+def _recent_event_rows(settings: Settings) -> list[dict]:
+    return _tail_jsonl(settings.log_dir.expanduser() / "events.jsonl")
+
+
+def _tags_from_events(
+    events: list[dict], *, coin: str | None, short_id: str | None
+) -> list[str]:
+    if not coin:
+        return []
+    coin_u = coin.upper()
+    short = (short_id or "").lower()
+    found: list[str] = []
+    for item in reversed(events):
+        ev_coin = str(item.get("coin") or "").upper()
+        if ev_coin and ev_coin != coin_u:
+            continue
+        ev_short = str(item.get("base_short_id") or "").lower()
+        if short and ev_short and ev_short != short:
+            continue
+        kind = item.get("kind")
+        if kind not in {
+            "update_recorded",
+            "size_increase_hl",
+            "size_increase_skip",
+        }:
+            continue
+        found = merge_update_tags(found, tags_from_event(kind, item.get("update_type")))
+        if kind == "update_recorded":
+            break
+    return found
+
+
+def _tags_from_open_copy(settings: Settings, db: AgentDB, short_id: str | None) -> list[str]:
+    if not short_id:
+        return []
+    copy = db.get_open_copy_by_short_id(short_id)
+    if copy is None:
+        return []
+    cache_key = f"update_tags:{copy.investment_base_id}"
+    raw = db.get_meta(cache_key)
+    if raw:
+        try:
+            payload = json.loads(raw)
+            tags = payload.get("tags") if isinstance(payload, dict) else None
+            if isinstance(tags, list):
+                return merge_update_tags([str(t) for t in tags])
+        except json.JSONDecodeError:
+            pass
+    try:
+        from invo_agent.api.client import InvolioClient
+
+        client = InvolioClient(settings, SessionStore(settings.session_path))
+        resp = client.get_current_shadow_post_by_investment_base_id(
+            copy.investment_base_id
+        )
+        inv = resp.post.update if resp.post else None
+        tags = update_labels(inv)
+    except Exception:
+        return []
+    db.set_meta(
+        cache_key,
+        json.dumps({"tags": tags, "at": datetime.now(UTC).isoformat()}),
+    )
+    return tags
+
+
+def _recent_row_tags(
+    settings: Settings,
+    db: AgentDB,
+    row: ActionLogRow,
+    events: list[dict],
+) -> list[str]:
+    action = row.action or ""
+    summary = row.summary or ""
+    if "UPDATE" not in action.upper() and action.upper() != "QUEUED_SIZE":
+        return tags_from_action_row(action, summary)
+    own = own_copy_from_summary(summary)
+    short_id = own[1] if own else None
+    found = merge_update_tags(
+        tags_from_action_row(action, summary),
+        _tags_from_events(
+            events,
+            coin=coin_from_summary(summary),
+            short_id=short_id,
+        ),
+    )
+    if found:
+        return found
+    return _tags_from_open_copy(settings, db, short_id)
 
 
 def pending_last_tried_age(pending: list[dict] | None) -> float | None:
@@ -488,15 +609,23 @@ def collect_hud(
         mode = "IDLE"
 
     recent_rows = db.recent_actions(5)
-    recent = [
-        {
-            "at": r.created_at,
-            "action": r.action,
-            "summary": r.summary or "",
-            "tags": tags_from_summary(r.summary),
-        }
-        for r in recent_rows
-    ]
+    event_rows = _recent_event_rows(settings)
+    recent = []
+    for r in recent_rows:
+        tags = _recent_row_tags(settings, db, r, event_rows)
+        summary = r.summary or ""
+        if tags and not tags_from_summary(summary):
+            updated = db.append_summary_tags(r.id, tags)
+            if updated:
+                summary = updated
+        recent.append(
+            {
+                "at": r.created_at,
+                "action": r.action,
+                "summary": summary,
+                "tags": tags,
+            }
+        )
     last = recent[0] if recent else None
     copies = db.list_open_copies()
     _backfill_trader_names(db, copies)

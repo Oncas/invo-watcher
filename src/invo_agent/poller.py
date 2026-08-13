@@ -36,7 +36,12 @@ from invo_agent.dex.session import (
 )
 from invo_agent.engine import CopyEngine
 from invo_agent.events import log_event
-from invo_agent.labels import format_action_summary, trader_from_action
+from invo_agent.labels import (
+    format_action_summary,
+    merge_update_tags,
+    tags_from_summary,
+    trader_from_action,
+)
 from invo_agent.notify import notify_mac
 
 console = Console()
@@ -302,6 +307,15 @@ class NotificationPoller:
             )
         return result
 
+    def _logged_summary(self, action: TradeAction) -> str:
+        summary = format_action_summary(action)
+        if action.action is not ActionType.UPDATE or tags_from_summary(summary):
+            return summary
+        extra = merge_update_tags(getattr(self.executor, "last_update_tags", None))
+        if not extra:
+            return summary
+        return f"{summary} · {' · '.join(extra)}"
+
     def _notify_if_size_queued(self, action: TradeAction) -> bool:
         """True when an UPDATE left a size-add waiting (margin / price)."""
         if action.action is not ActionType.UPDATE or action.investment is None:
@@ -423,7 +437,7 @@ class NotificationPoller:
             self.engine.remember(action)
             self.db.log_action(
                 action=action.action.value,
-                summary=format_action_summary(action),
+                summary=self._logged_summary(action),
                 notification_id=nid,
                 dry_run=self.is_dry_run,
             )
