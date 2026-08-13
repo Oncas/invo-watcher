@@ -71,7 +71,7 @@ def test_update_labels_from_changes() -> None:
             },
         }
     )
-    assert update_labels(size_down) == ["size"]
+    assert update_labels(size_down) == ["size↓"]
     tp_sl = InvestmentUpdate.model_validate(
         {
             "ticker": "ADA",
@@ -111,10 +111,10 @@ def test_format_recent_line_keeps_tags_visible() -> None:
     )
     action = TradeAction(action=ActionType.UPDATE, notification=notif, investment=inv)
     summary = format_action_summary(action)
-    assert summary.endswith(" · size · tp")
-    assert tags_from_summary(summary) == ["size", "tp"]
+    assert summary.endswith(" · size↑ · tp")
+    assert tags_from_summary(summary) == ["size↑", "tp"]
     line = format_recent_line(action.action.value, summary)
-    assert line.startswith("UPDATE · size · tp:")
+    assert line.startswith("UPDATE · size↑ · tp:")
     assert "ETH LONG 20x @beta_trader" in line
 
 
@@ -126,11 +126,12 @@ def test_tags_from_action_row_and_events() -> None:
     assert tags_from_action_row(
         "SKIP_NO_MARGIN_UPDATE",
         "UPDATE BTC LONG 30x @gamma_trader: UPDATE BTC size increase: no free margin",
-    ) == ["size"]
-    assert tags_from_action_row("QUEUED_SIZE", "UPDATE ADA LONG 10x @x") == ["size"]
+    ) == ["size↑"]
+    assert tags_from_action_row("QUEUED_SIZE", "UPDATE ADA LONG 10x @x") == ["size↑"]
     assert tags_from_event("update_recorded", "tp") == ["tp"]
-    assert tags_from_event("size_increase_skip", None) == ["size"]
-    assert tags_from_event("update_recorded", "increase") == ["size"]
+    assert tags_from_event("size_increase_skip", None) == ["size↑"]
+    assert tags_from_event("update_recorded", "increase") == ["size↑"]
+    assert tags_from_event("size_decrease_hl", None) == ["size↓"]
 
 
 def test_trader_from_action_falls_back_to_notifier() -> None:

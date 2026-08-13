@@ -132,3 +132,14 @@ def mimic_size_increase_cloid(
         order_type=ORDER_SIZE_INCREASE,
         trade_type=TRADE_MIMIC_COPY_UPDATE if copy_update else TRADE_MIMIC,
     )
+
+
+def mimic_size_reduce_cloid(
+    base_short_id: str | None, *, copy_update: bool = True
+) -> Cloid | None:
+    """Size-reduce cloid — copy_update matches Copy on a size cut."""
+    return stamp_cloid(
+        base_short_id,
+        order_type=ORDER_SIZE_REDUCE,
+        trade_type=TRADE_MIMIC_COPY_UPDATE if copy_update else TRADE_MIMIC,
+    )

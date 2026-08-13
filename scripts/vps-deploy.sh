@@ -28,9 +28,6 @@ echo "==> pip install -e ."
 .venv/bin/pip install -U pip
 .venv/bin/pip install -e .
 
-echo "==> restart invo-agent"
-sudo systemctl restart invo-agent
-
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
   set -a
@@ -38,6 +35,15 @@ if [[ -f "$ENV_FILE" ]]; then
   source "$ENV_FILE"
   set +a
 fi
+
+echo "==> stop invo-agent"
+sudo systemctl stop invo-agent
+
+echo "==> migrate local state"
+.venv/bin/invo-agent migrate
+
+echo "==> start invo-agent"
+sudo systemctl start invo-agent
 
 TOKEN="${HUD_TOKEN:-}"
 PORT="${HUD_PORT:-8787}"

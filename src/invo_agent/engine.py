@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from invo_agent.api.client import InvolioClient
-from invo_agent.api.models import ActionType, Notification, TradeAction
+from invo_agent.api.models import ActionType, InvestmentUpdate, Notification, TradeAction
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB
 from invo_agent.labels import trader_from_action
@@ -43,6 +43,38 @@ class CopyEngine:
             notification=notification,
             investment=investment,
             reason=reason,
+        )
+
+    def stub_close_from_copy(self, notification: Notification) -> TradeAction | None:
+        """CLOSE with ticker/side from our open_copy when the post is missing."""
+        if notification.action_type is not ActionType.CLOSE:
+            return None
+        base_id = (
+            str(notification.investment_base_id)
+            if notification.investment_base_id
+            else None
+        )
+        if not base_id:
+            return None
+        copy = self.db.get_open_copy(base_id)
+        if copy is None or not copy.ticker:
+            return None
+        side = (copy.side or "long").lower()
+        inv = InvestmentUpdate.model_validate(
+            {
+                "baseId": copy.investment_base_id,
+                "baseShortId": copy.base_short_id,
+                "ticker": copy.ticker,
+                "directionLong": side == "long",
+                "leverage": copy.leverage,
+                "owner": {"username": copy.trader} if copy.trader else None,
+            }
+        )
+        return TradeAction(
+            action=ActionType.CLOSE,
+            notification=notification,
+            investment=inv,
+            reason="stub_from_copy",
         )
 
     def remember(self, action: TradeAction) -> None:

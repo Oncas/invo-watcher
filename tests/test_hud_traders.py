@@ -3,6 +3,7 @@ from pathlib import Path
 
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB, OpenCopy, PendingIntent
+from invo_agent.migrate import migrate_state
 from invo_agent.hud import (
     PositionRow,
     _opened_at_by_coin,
@@ -130,7 +131,7 @@ def test_collect_hud_corrects_trader_stolen_by_later_close(tmp_path: Path) -> No
     )
     db.close()
 
-    collect_hud(settings, with_pnl=False, supervisor_ok=True)
+    migrate_state(settings)
     db = AgentDB(settings.db_path)
     copy = db.get_open_copy("00000000-0000-4000-8000-000000000014")
     db.close()
@@ -171,7 +172,7 @@ def test_collect_hud_corrects_trader_stolen_by_via_skip(tmp_path: Path) -> None:
     )
     db.close()
 
-    collect_hud(settings, with_pnl=False, supervisor_ok=True)
+    migrate_state(settings)
     db = AgentDB(settings.db_path)
     copy = db.get_open_copy("btc-1")
     db.close()
@@ -241,6 +242,7 @@ def test_collect_hud_pending_includes_trader(tmp_path: Path) -> None:
     db.set_pending_add_notional("dot", 12.5)
     db.close()
 
+    migrate_state(settings)
     snap = collect_hud(settings, with_pnl=False, supervisor_ok=True)
     by_coin = {row["coin"]: row for row in snap.pending}
     assert by_coin["BTC"]["kind"] == "OPEN"
@@ -305,7 +307,7 @@ def test_load_hud_file_accepts_trader(tmp_path: Path, monkeypatch) -> None:
     assert isinstance(snap.positions[0], PositionRow)
 
 
-def test_collect_hud_infers_update_tags_from_events(tmp_path: Path) -> None:
+def test_collect_hud_reads_tags_from_summary_only(tmp_path: Path) -> None:
     logs = tmp_path / "logs"
     logs.mkdir()
     (logs / "events.jsonl").write_text(
@@ -336,5 +338,9 @@ def test_collect_hud_infers_update_tags_from_events(tmp_path: Path) -> None:
     db.close()
     snap = collect_hud(settings, with_pnl=False, supervisor_ok=True)
     assert snap.recent
+    assert snap.recent[0]["tags"] == []
+    stats = migrate_state(settings)
+    assert stats["tagged"] == 1
+    snap = collect_hud(settings, with_pnl=False, supervisor_ok=True)
     assert snap.recent[0]["tags"] == ["tp"]
     assert snap.recent[0]["summary"].endswith(" · tp")

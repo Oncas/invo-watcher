@@ -53,6 +53,18 @@ class IocUnfilledError(HlTraderError):
     pass
 
 
+class SideMismatchError(HlTraderError):
+    """HL side does not match the tracked copy — do not trade or drop the row."""
+
+    pass
+
+
+class GhostCopyError(HlTraderError):
+    """Tracked copy is flat on HL; local row was cleared."""
+
+    pass
+
+
 class TurnkeyWalletAdapter:
     """Minimal wallet duck-type for hyperliquid sign_inner / LocalAccount.sign_message."""
 
@@ -223,6 +235,18 @@ class HlTrader:
         if detail is None:
             return None
         return detail["sz"], detail["is_long"]
+
+    def open_coins(self) -> set[str]:
+        """Coins with a non-zero HL position. Empty set is a successful flat book."""
+        state = self.info.user_state(self.address)
+        held: set[str] = set()
+        for item in state.get("assetPositions") or []:
+            pos = item.get("position") or {}
+            coin = pos.get("coin")
+            szi = float(pos.get("szi") or 0)
+            if coin and szi != 0:
+                held.add(str(coin).upper())
+        return held
 
     def position_detail(self, coin: str) -> dict[str, Any] | None:
         """Return sz/is_long/entry_px/leverage for coin, or None if flat."""

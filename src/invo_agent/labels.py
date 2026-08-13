@@ -4,7 +4,7 @@ import re
 
 from invo_agent.api.models import ActionType, InvestmentUpdate, TradeAction
 
-_UPDATE_TAG_ORDER = ("size", "tp", "sl", "lev")
+_UPDATE_TAG_ORDER = ("size↑", "size↓", "size", "tp", "sl", "lev")
 _UPDATE_TAG_SET = frozenset(_UPDATE_TAG_ORDER)
 
 _AT_USER = re.compile(r"@([A-Za-z0-9_.]+)")
@@ -43,23 +43,46 @@ def _numeric_changed(current: float | None, previous: object) -> bool:
     return abs(float(current) - prev) > max(1e-9, abs(prev) * 0.01)
 
 
+def size_direction_tag(inv: InvestmentUpdate | None) -> str | None:
+    """``size↑`` / ``size↓`` / ``size`` (unknown direction), or None."""
+    if inv is None:
+        return None
+    changes = inv.changes or {}
+    if changes.get("simIncrease") is True:
+        return "size↑"
+    prev = changes.get("entrySize")
+    if prev is not None and inv.entry_size is not None:
+        try:
+            curr = float(inv.entry_size)
+            old = float(prev)
+            if curr > old * 1.02:
+                return "size↑"
+            if curr < old * 0.98:
+                return "size↓"
+        except (TypeError, ValueError):
+            pass
+    try:
+        diff = abs(float(changes.get("simDifference") or 0))
+    except (TypeError, ValueError):
+        diff = 0.0
+    if diff > 1e-9:
+        if changes.get("simIncrease") is False:
+            return "size↓"
+        return "size"
+    if "entrySize" in changes and _numeric_changed(inv.entry_size, prev):
+        return "size"
+    return None
+
+
 def update_labels(inv: InvestmentUpdate | None) -> list[str]:
-    """Short tags for what an UPDATE changed: size, tp, sl, lev."""
+    """Short tags for what an UPDATE changed: size↑/size↓, tp, sl, lev."""
     if inv is None:
         return []
     changes = inv.changes or {}
     tags: list[str] = []
-
-    size = changes.get("simIncrease") is True
-    if not size and "entrySize" in changes:
-        size = _numeric_changed(inv.entry_size, changes.get("entrySize"))
-    if not size:
-        try:
-            size = abs(float(changes.get("simDifference") or 0)) > 1e-9
-        except (TypeError, ValueError):
-            size = False
-    if size:
-        tags.append("size")
+    size_tag = size_direction_tag(inv)
+    if size_tag:
+        tags.append(size_tag)
     if _change_present(changes, "priceTarget", "price_target"):
         tags.append("tp")
     if _change_present(changes, "stopLoss", "stop_loss"):
@@ -70,7 +93,7 @@ def update_labels(inv: InvestmentUpdate | None) -> list[str]:
 
 
 def format_action_summary(action: TradeAction) -> str:
-    """Trade line plus UPDATE tags, e.g. ``UPDATE ETH LONG 20x @x · size · tp``."""
+    """Trade line plus UPDATE tags, e.g. ``UPDATE ETH LONG 20x @x · size↑ · tp``."""
     base = action.summary
     if action.action is not ActionType.UPDATE:
         return base
@@ -81,7 +104,7 @@ def format_action_summary(action: TradeAction) -> str:
 
 
 def format_recent_line(action: str, summary: str, tags: list[str] | None = None) -> str:
-    """``UPDATE · size · tp: ETH LONG 20x @beta_trader`` — tags stay visible."""
+    """``UPDATE · size↑ · tp: ETH LONG 20x @beta_trader`` — tags stay visible."""
     tags = list(tags) if tags is not None else tags_from_summary(summary)
     core = summary or ""
     if core.startswith(f"{action} "):
@@ -120,20 +143,31 @@ def tags_from_action_row(action: str, summary: str | None) -> list[str]:
         or "size increase" in text
         or "queued leftover" in text
     ):
-        extra.append("size")
+        extra.append("size↑")
+    elif "size decrease" in text or "size cut" in text or "size↓" in text:
+        extra.append("size↓")
     return extra
 
 
 def merge_update_tags(*groups: list[str] | None) -> list[str]:
     seen = {tag for group in groups for tag in (group or []) if tag in _UPDATE_TAG_SET}
+    if "size↑" in seen or "size↓" in seen:
+        seen.discard("size")
     return [tag for tag in _UPDATE_TAG_ORDER if tag in seen]
 
 
 def tags_from_event(kind: str | None, update_type: str | None) -> list[str]:
     tags: list[str] = []
     if kind in {"size_increase_hl", "size_increase_skip"}:
-        tags.append("size")
-    mapped = {"increase": "size", "tp": "tp", "sl": "sl"}.get(update_type or "")
+        tags.append("size↑")
+    if kind in {"size_decrease_hl", "size_decrease_skip"}:
+        tags.append("size↓")
+    mapped = {
+        "increase": "size↑",
+        "decrease": "size↓",
+        "tp": "tp",
+        "sl": "sl",
+    }.get(update_type or "")
     if mapped:
         tags.append(mapped)
     return merge_update_tags(tags)

@@ -384,6 +384,19 @@ def reset_state_cmd(
     )
 
 
+@app.command("migrate")
+def migrate_cmd() -> None:
+    """Stamp old action_log tags and trader names to the current standard."""
+    settings = get_settings()
+    from invo_agent.migrate import migrate_state
+
+    stats = migrate_state(settings)
+    console.print(
+        f"[green]migrate[/green] tagged={stats['tagged']} "
+        f"traders={stats['traders']} meta_dropped={stats['meta_dropped']}"
+    )
+
+
 def _run_poll_loop(*, force_dry_run: bool) -> None:
     settings, session, db = _bootstrap(with_logging=True)
     if force_dry_run:

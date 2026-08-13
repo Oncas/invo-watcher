@@ -312,6 +312,33 @@ class AgentDB:
         row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return None if row is None else str(row["value"])
 
+    def delete_meta_prefix(self, prefix: str) -> int:
+        cur = self._conn.execute("DELETE FROM meta WHERE key LIKE ?", (f"{prefix}%",))
+        self._conn.commit()
+        return int(cur.rowcount)
+
+    def list_actions(self, *, limit: int = 10_000) -> list[ActionLogRow]:
+        rows = self._conn.execute(
+            """
+            SELECT id, created_at, action, summary, notification_id, dry_run
+            FROM action_log
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [
+            ActionLogRow(
+                id=row["id"],
+                created_at=row["created_at"],
+                action=row["action"],
+                summary=row["summary"],
+                notification_id=row["notification_id"],
+                dry_run=bool(row["dry_run"]),
+            )
+            for row in rows
+        ]
+
     def upsert_open_copy(
         self,
         *,

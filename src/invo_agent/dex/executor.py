@@ -14,10 +14,12 @@ from invo_agent.dex.cloid import (
     mimic_close_cloid,
     mimic_entry_cloid,
     mimic_size_increase_cloid,
+    mimic_size_reduce_cloid,
     mimic_sl_cloid,
     mimic_tp_cloid,
 )
 from invo_agent.dex.hl_trader import (
+    GhostCopyError,
     HlTrader,
     HlTraderError,
     InsufficientMarginError,
@@ -25,6 +27,7 @@ from invo_agent.dex.hl_trader import (
     NotOpenCopyError,
     PriceNotBetterError,
     SameCoinOpenError,
+    SideMismatchError,
 )
 from invo_agent.dex.pricing import (
     extract_avg_px,
@@ -186,6 +189,26 @@ class DexExecutor:
             logger.info("LIVE %s skipped (not open): %s", action.action.value, exc)
             log_event(
                 "live_skip_not_open",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=str(action.notification.id),
+            )
+            raise
+        except GhostCopyError as exc:
+            logger.info("LIVE %s ghost cleared: %s", action.action.value, exc)
+            log_event(
+                "live_ghost_clear",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=str(action.notification.id),
+            )
+            raise
+        except SideMismatchError as exc:
+            logger.warning("LIVE %s side mismatch: %s", action.action.value, exc)
+            log_event(
+                "live_skip_side_mismatch",
                 action=action.action.value,
                 summary=action.summary,
                 error=str(exc),
@@ -584,17 +607,11 @@ class DexExecutor:
 
         pos = trader.position_size(coin)
         if pos is None:
-            available = trader.available_margin()
-            if available + 1e-9 < self.settings.min_order_usd:
-                raise InsufficientMarginError(
-                    f"UPDATE {coin}: flat on HL and no free margin "
-                    f"(available=${available:.2f})"
-                )
-            console.print(
-                f"[yellow]UPDATE {coin}: tracked but flat on HL — treating as OPEN[/yellow]"
+            self._clear_ghost_copy(copy, coin=coin, reason="update_flat")
+            raise GhostCopyError(
+                f"UPDATE {coin}: ghost copy cleared (flat on HL; "
+                f"shortId={copy.base_short_id})"
             )
-            self._open(action, trader, equity)
-            return
 
         sz, is_long = pos
         if copy.side:
@@ -641,7 +658,8 @@ class DexExecutor:
 
         qty_before = sz
         size_sub: dict[str, Any] | None = None
-        if self._should_increase_size(inv):
+        direction = self._size_direction(inv)
+        if direction == "up":
             sz, size_sub = self._apply_size_increase(
                 trader,
                 inv=inv,
@@ -650,6 +668,19 @@ class DexExecutor:
                 current_sz=sz,
                 equity=equity,
             )
+        elif direction == "down":
+            sz, size_sub = self._apply_size_decrease(
+                trader,
+                inv=inv,
+                coin=coin,
+                is_long=is_long,
+                current_sz=sz,
+                equity=equity,
+            )
+            if sz <= 1e-12:
+                tags = merge_update_tags(update_labels(inv), ["size↓"])
+                self.last_update_tags = tags
+                return
 
         # Re-apply TP/SL at (possibly new) size — same as Copy on TP/SL updates.
         tpsl_placed = self._sync_tpsl(
@@ -668,8 +699,11 @@ class DexExecutor:
         submissions: list[dict[str, Any]] = []
         has_tp = inv.price_target is not None and float(inv.price_target) > 0
         # One Copy card → one primary updateType. Prefer size_increase when we added.
-        if size_sub is not None:
+        if size_sub is not None and size_sub.get("kind") == "size_increase":
             update_type = "increase"
+            submissions.append(size_sub)
+        elif size_sub is not None:
+            update_type = "entry"
             submissions.append(size_sub)
         elif tpsl_placed is not None:
             tpsl_order, tpsl_resp, tpsl_nonce = tpsl_placed
@@ -758,8 +792,10 @@ class DexExecutor:
             )
 
         tags = update_labels(inv)
-        if size_sub is not None:
-            tags = merge_update_tags(tags, ["size"])
+        if size_sub is not None and size_sub.get("kind") == "size_increase":
+            tags = merge_update_tags(tags, ["size↑"])
+        elif size_sub is not None:
+            tags = merge_update_tags(tags, ["size↓"])
         self.last_update_tags = tags
 
     def _close(self, action: TradeAction, trader: HlTrader) -> None:
@@ -801,9 +837,8 @@ class DexExecutor:
         if copy.side:
             want_long = copy.side.lower() == "long"
             if want_long != is_long:
-                # Net HL side no longer matches this copy (e.g. later opposite
-                # fills). Do not trade the wrong side; drop local tracking via
-                # remember() after handle returns.
+                # Net HL side no longer matches this copy. Do not trade and
+                # do not drop local tracking (poller skips remember()).
                 console.print(
                     f"[yellow]CLOSE {coin}: side mismatch copy={copy.side} "
                     f"hl={'long' if is_long else 'short'} — skip HL[/yellow]"
@@ -824,7 +859,10 @@ class DexExecutor:
                     base_short_id=copy.base_short_id,
                     hl_sz=hl_sz,
                 )
-                return
+                raise SideMismatchError(
+                    f"CLOSE {coin}: side mismatch copy={copy.side} "
+                    f"hl={'long' if is_long else 'short'}"
+                )
         sz = self._close_size_for_copy(copy, coin=coin, hl_sz=hl_sz)
         qty_after = max(hl_sz - sz, 0.0)
         console.print(
@@ -982,20 +1020,68 @@ class DexExecutor:
         copy = self.db.get_open_copy(str(inv.base_id))
         return bool(copy and float(copy.pending_add_notional or 0) > 0)
 
-    def _should_increase_size(self, inv: InvestmentUpdate) -> bool:
-        """True when Involio marks a position increase, or a leftover add is queued."""
-        if self._has_pending_add(inv):
-            return True
+    def _size_direction(self, inv: InvestmentUpdate) -> str | None:
+        """``up``, ``down``, or None (TP/SL/lev only)."""
         changes = inv.changes or {}
         if changes.get("simIncrease") is True:
-            return True
+            return "up"
         prev = changes.get("entrySize")
-        if prev is None or inv.entry_size is None:
-            return False
+        if prev is not None and inv.entry_size is not None:
+            try:
+                curr = float(inv.entry_size)
+                old = float(prev)
+                if curr > old * 1.02:
+                    return "up"
+                if curr < old * 0.98:
+                    return "down"
+            except (TypeError, ValueError):
+                pass
+        if self._has_pending_add(inv):
+            return "up"
+        return None
+
+    def _should_increase_size(self, inv: InvestmentUpdate) -> bool:
+        return self._size_direction(inv) == "up"
+
+    def _clear_ghost_copy(self, copy: OpenCopy, *, coin: str, reason: str) -> None:
+        if self.db is not None:
+            self.db.close_copy(copy.investment_base_id)
+        console.print(
+            f"[yellow]GHOST {coin}: cleared {copy.base_short_id or copy.investment_base_id} "
+            f"({reason})[/yellow]"
+        )
+        logger.info(
+            "ghost clear coin=%s base_id=%s shortId=%s reason=%s",
+            coin,
+            copy.investment_base_id,
+            copy.base_short_id,
+            reason,
+        )
+        log_event(
+            "ghost_clear",
+            coin=coin,
+            base_id=copy.investment_base_id,
+            base_short_id=copy.base_short_id,
+            reason=reason,
+        )
+
+    def reconcile_ghost_copies(self, trader: HlTrader) -> list[str]:
+        """Drop open_copies whose coin is flat on HL. Empty held set is OK."""
+        if self.db is None:
+            return []
         try:
-            return float(inv.entry_size) > float(prev) * 1.02
-        except (TypeError, ValueError):
-            return False
+            held = trader.open_coins()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ghost reconcile skipped (HL read failed): %s", exc)
+            return []
+        cleared: list[str] = []
+        for copy in self.db.list_open_copies():
+            coin = (copy.ticker or "").upper()
+            if not coin or coin in held:
+                continue
+            self._clear_ghost_copy(copy, coin=coin, reason="poll_flat")
+            cleared.append(coin)
+        return cleared
 
     def _stash_pending_add(
         self,
@@ -1201,6 +1287,10 @@ class DexExecutor:
                 self._stash_pending_add(
                     inv, leftover, reason="margin", entry=trader_entry
                 )
+            elif leftover > 1e-9:
+                self._stash_pending_add(
+                    inv, leftover, reason="dust", entry=trader_entry
+                )
             else:
                 self.db.set_pending_add_notional(str(inv.base_id), 0.0)
 
@@ -1229,6 +1319,116 @@ class DexExecutor:
         )
         return new_sz, {
             "kind": "size_increase",
+            "hlOrder": hl_order,
+            "nonceMs": nonce,
+            "hlResponse": hl_resp,
+        }
+
+    def _apply_size_decrease(
+        self,
+        trader: HlTrader,
+        *,
+        inv: InvestmentUpdate,
+        coin: str,
+        is_long: bool,
+        current_sz: float,
+        equity: float,
+    ) -> tuple[float, dict[str, Any] | None]:
+        """Reduce toward trader's new entrySize allocation. Returns (new_sz, submission)."""
+        if self.db is not None and inv.base_id is not None:
+            self.db.set_pending_add_notional(str(inv.base_id), 0.0)
+
+        leverage = int(inv.leverage or 1)
+        mid = trader.mid_price(coin)
+        current_notional = float(current_sz) * mid
+        # Raw trader % — do not bump to HL min (that would refuse a real cut).
+        trader_pct = self._trader_allocation_pct(inv.entry_size)
+        if trader_pct is None:
+            trader_pct = float(self.settings.position_pct)
+        lev = max(1, leverage)
+        target_notional = max(0.0, equity * trader_pct / 100.0) * lev
+        hl_min = float(self.settings.hl_min_order_usd)
+        flatten = target_notional + 1e-9 < hl_min
+        sell_notional = (
+            current_notional if flatten else max(0.0, current_notional - target_notional)
+        )
+        if not flatten and sell_notional + 1e-9 < hl_min:
+            return current_sz, None
+
+        if flatten:
+            copy = self._get_tracked_copy(inv)
+            if copy is not None and copy.size is not None and float(copy.size) > 0:
+                sell_sz = min(float(copy.size), current_sz)
+            else:
+                sell_sz = current_sz
+        else:
+            sell_sz = sell_notional / mid if mid > 0 else 0.0
+        sell_sz = trader.round_size(coin, sell_sz)
+        if sell_sz <= 0:
+            return current_sz, None
+
+        cloid = mimic_size_reduce_cloid(inv.base_short_id, copy_update=True)
+        console.print(
+            f"[cyan]LIVE SIZE DECREASE[/cyan] {coin} "
+            f"{'LONG' if is_long else 'SHORT'} -sz={sell_sz} "
+            f"(~${sell_sz * mid:.2f} notional; {current_sz} → ~{max(0.0, current_sz - sell_sz)})"
+        )
+        logger.info(
+            "SIZE DECREASE %s sell_sz=%s current=%s target_notional=%.4f flatten=%s",
+            coin,
+            sell_sz,
+            current_sz,
+            target_notional,
+            flatten,
+        )
+        hl_order, hl_resp, nonce = trader.close_position(
+            coin, sell_sz, is_long, cloid=cloid
+        )
+        self._check_hl_ok(hl_resp, "size_decrease")
+
+        new_sz = max(0.0, current_sz - sell_sz)
+        try:
+            detail = trader.position_detail(coin)
+            if detail is None:
+                new_sz = 0.0
+            elif detail.get("sz") is not None:
+                new_sz = float(detail["sz"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SIZE DECREASE fill lookup failed coin=%s: %s", coin, exc)
+
+        if self.db is not None and inv.base_id is not None:
+            if new_sz <= 1e-12:
+                self.db.close_copy(str(inv.base_id))
+                new_sz = 0.0
+            else:
+                existing = self.db.get_open_copy(str(inv.base_id))
+                entry_px = (
+                    float(existing.our_entry_px)
+                    if existing is not None and existing.our_entry_px
+                    else mid
+                )
+                self.db.set_open_copy_fill(
+                    str(inv.base_id),
+                    our_entry_px=entry_px,
+                    side="long" if is_long else "short",
+                    size=new_sz,
+                    leverage=float(leverage),
+                )
+
+        log_event(
+            "size_decrease_hl",
+            coin=coin,
+            sell_sz=sell_sz,
+            qty_before=current_sz,
+            qty_after=new_sz,
+            flatten=flatten,
+            target_notional=target_notional,
+            current_notional=current_notional,
+            cloid=cloid.to_raw() if cloid else None,
+            hl_response=hl_resp,
+        )
+        return new_sz, {
+            "kind": "close",
             "hlOrder": hl_order,
             "nonceMs": nonce,
             "hlResponse": hl_resp,

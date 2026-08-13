@@ -18,11 +18,13 @@ from invo_agent.config import Settings
 from invo_agent.db import AgentDB, OpenCopy, PendingIntent
 from invo_agent.dex.executor import DexExecutor, RecoveryResult
 from invo_agent.dex.hl_trader import (
+    GhostCopyError,
     InsufficientMarginError,
     IocUnfilledError,
     NotOpenCopyError,
     PriceNotBetterError,
     SameCoinOpenError,
+    SideMismatchError,
 )
 from invo_agent.dex.session import (
     DexSessionError,
@@ -316,6 +318,61 @@ class NotificationPoller:
             return summary
         return f"{summary} · {' · '.join(extra)}"
 
+    def _notification_age_seconds(self, notification: Notification) -> float:
+        created = notification.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        else:
+            created = created.astimezone(UTC)
+        return (datetime.now(UTC) - created).total_seconds()
+
+    def _prepare_action(self, notification: Notification) -> TradeAction | None:
+        """Enrich, stub CLOSE from open_copy, or leave unprocessed to retry."""
+        action = self.engine.enrich(notification)
+        if action.investment is not None or action.action is ActionType.IGNORE:
+            return action
+        if action.action is ActionType.CLOSE:
+            stub = self.engine.stub_close_from_copy(notification)
+            if stub is not None:
+                return stub
+        nid = str(notification.id)
+        age = self._notification_age_seconds(notification)
+        if age >= float(self.settings.pending_max_age_seconds):
+            self.db.mark_processed(nid, "ERROR_ENRICH_TIMEOUT", action.reason)
+            self.db.log_action(
+                action="ERROR_ENRICH_TIMEOUT",
+                summary=f"{action.summary}: {action.reason or 'no investment'}"[:500],
+                notification_id=nid,
+                dry_run=self.is_dry_run,
+            )
+            logger.error("enrich timeout %s: %s", action.summary, action.reason)
+            return None
+        logger.warning(
+            "enrich miss %s (will retry): %s",
+            action.summary,
+            action.reason or "no investment",
+        )
+        log_event(
+            "enrich_retry",
+            notification_id=nid,
+            action=action.action.value,
+            reason=action.reason,
+            age_seconds=age,
+        )
+        return None
+
+    def _reconcile_ghosts(self) -> None:
+        if self.is_dry_run:
+            return
+        try:
+            trader = self.executor._ensure_trader()
+            cleared = self.executor.reconcile_ghost_copies(trader)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ghost reconcile skipped: %s", exc)
+            return
+        if cleared:
+            logger.info("ghost reconcile cleared %s", cleared)
+
     def _notify_if_size_queued(self, action: TradeAction) -> bool:
         """True when an UPDATE left a size-add waiting (margin / price)."""
         if action.action is not ActionType.UPDATE or action.investment is None:
@@ -345,9 +402,7 @@ class NotificationPoller:
     def _notify_action(self, action: TradeAction) -> None:
         mode = "DRY-RUN" if self.is_dry_run else "LIVE"
         title = f"invo-agent · {action.action.value}"
-        body = action.summary
-        if action.notification.content:
-            body = f"{action.summary} — {action.notification.content}"
+        body = self._logged_summary(action)
         notify_mac(
             title,
             body,
@@ -364,6 +419,9 @@ class NotificationPoller:
         self.db.set_meta("last_unseen_count", str(unseen))
 
         actions: list[TradeAction] = []
+        if not self.is_dry_run:
+            self._ensure_dex_session()
+            self._reconcile_ghosts()
         items = sorted(resp.items, key=lambda n: n.created_at)
         for notification in items:
             nid = str(notification.id)
@@ -398,7 +456,9 @@ class NotificationPoller:
                 self.db.mark_processed(nid, "IGNORE", notification.content)
                 continue
 
-            action = self.engine.enrich(notification)
+            action = self._prepare_action(notification)
+            if action is None:
+                continue
             if not self.is_dry_run:
                 self._ensure_dex_session()
 
@@ -446,9 +506,9 @@ class NotificationPoller:
             logger.info("%s %s", action.action.value, action.summary)
             actions.append(action)
         if not self.is_dry_run:
+            self._reconcile_ghosts()
             self._expire_pending()
             self._drain_pending()
-            self._expire_pending_adds()
             self._drain_pending_adds()
         return actions
 
@@ -624,6 +684,53 @@ class NotificationPoller:
                 "invo-agent · skipped",
                 f"Already in that coin — {action.summary}",
                 subtitle="One position per coin",
+                sound=None,
+                enabled=self.settings.mac_notify,
+                sticky=False,
+            )
+            return
+
+        if isinstance(exc, GhostCopyError):
+            self.db.mark_processed(nid, "GHOST_CLEAR", str(exc)[:500])
+            self.db.log_action(
+                action="GHOST_CLEAR",
+                summary=f"{format_action_summary(action)}: {exc}"[:500],
+                notification_id=nid,
+                dry_run=self.is_dry_run,
+            )
+            logger.info("ghost clear %s: %s", action.summary, exc)
+            log_event(
+                "ghost_clear_skip",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=nid,
+            )
+            return
+
+        if isinstance(exc, SideMismatchError):
+            self.db.mark_processed(
+                nid, f"SKIP_SIDE_MISMATCH_{action.action.value}", str(exc)[:500]
+            )
+            self.db.log_action(
+                action=f"SKIP_SIDE_MISMATCH_{action.action.value}",
+                summary=f"{format_action_summary(action)}: {exc}"[:500],
+                notification_id=nid,
+                dry_run=self.is_dry_run,
+            )
+            logger.warning("skip (side mismatch) %s: %s", action.summary, exc)
+            log_event(
+                "skip_side_mismatch",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=nid,
+                will_retry=False,
+            )
+            notify_mac(
+                "invo-agent · skipped",
+                f"Side mismatch — kept tracking {action.summary}",
+                subtitle="CLOSE did not flatten",
                 sound=None,
                 enabled=self.settings.mac_notify,
                 sticky=False,
@@ -935,17 +1042,54 @@ class NotificationPoller:
             age = self._pending_age_seconds(intent)
             if age < max_age:
                 continue
+            still_open = False
+            shadow_ok = False
+            try:
+                resp = self.client.get_current_shadow_post_by_investment_base_id(
+                    intent.investment_base_id
+                )
+                inv = resp.post.update if resp.post else None
+                shadow_ok = True
+                if inv is not None and not self._investment_closed(inv):
+                    still_open = True
+                elif inv is not None and self._investment_closed(inv):
+                    self.db.delete_pending_intent(intent.investment_base_id)
+                    log_event(
+                        "pending_cancel",
+                        base_id=intent.investment_base_id,
+                        coin=intent.coin,
+                        reason="trader_closed_on_expire",
+                    )
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "pending expire shadow failed base_id=%s: %s",
+                    intent.investment_base_id,
+                    exc,
+                )
+            if still_open:
+                logger.info(
+                    "keep pending %s age=%.0fs — still open on Involio",
+                    intent.summary or intent.investment_base_id,
+                    age,
+                )
+                continue
+            if shadow_ok and not still_open:
+                # No post and not explicitly closed — treat as gone.
+                pass
             self.db.delete_pending_intent(intent.investment_base_id)
             logger.warning(
-                "expired pending %s age=%.0fs",
+                "expired pending %s age=%.0fs shadow_ok=%s",
                 intent.summary or intent.investment_base_id,
                 age,
+                shadow_ok,
             )
             log_event(
                 "pending_expire",
                 base_id=intent.investment_base_id,
                 coin=intent.coin,
                 age_seconds=age,
+                shadow_ok=shadow_ok,
             )
             notify_mac(
                 "invo-agent · queue",
@@ -1048,34 +1192,8 @@ class NotificationPoller:
         return (datetime.now(UTC) - created.astimezone(UTC)).total_seconds()
 
     def _expire_pending_adds(self) -> None:
-        max_age = float(self.settings.pending_max_age_seconds)
-        for copy in self.db.list_open_copies():
-            if float(copy.pending_add_notional or 0) <= 0:
-                continue
-            age = self._pending_add_age_seconds(copy)
-            if age < max_age:
-                continue
-            self.db.set_pending_add_notional(copy.investment_base_id, 0.0)
-            coin = (copy.ticker or "?").upper()
-            logger.warning(
-                "expired pending size-add %s %s age=%.0fs",
-                coin,
-                copy.base_short_id or copy.investment_base_id,
-                age,
-            )
-            log_event(
-                "pending_add_expire",
-                base_id=copy.investment_base_id,
-                coin=coin,
-                age_seconds=age,
-            )
-            notify_mac(
-                "invo-agent · queue",
-                f"Dropped stale size-add {coin} after {age / 3600:.1f}h",
-                sound=None,
-                enabled=self.settings.mac_notify,
-                sticky=False,
-            )
+        """Size-adds stay queued while the copy is live. Kept as a no-op."""
+        return
 
     def _drain_pending_adds(self) -> None:
         waiting = [

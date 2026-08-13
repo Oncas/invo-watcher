@@ -166,7 +166,7 @@ def test_expire_pending_adds(tmp_path) -> None:
     poller._expire_pending_adds()
     copy = db.get_open_copy("ada")
     assert copy is not None
-    assert copy.pending_add_notional == 0.0
+    assert copy.pending_add_notional == 25.0
     db.close()
 
 
