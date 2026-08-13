@@ -69,16 +69,26 @@ def pending_last_tried_age(pending: list[dict] | None) -> float | None:
 
 
 def format_age(seconds: float | None) -> str:
+    """Human age like ``4s``, ``1m 30s``, ``1h 30m`` — no decimal units."""
     if seconds is None:
         return "?"
-    seconds = max(0.0, float(seconds))
-    if seconds < 60:
-        return f"{seconds:.0f}s"
-    if seconds < 3600:
-        mins = seconds / 60.0
-        return f"{mins:.0f}m" if mins >= 10 else f"{mins:.1f}m"
-    hours = seconds / 3600.0
-    return f"{hours:.0f}h" if hours >= 10 else f"{hours:.1f}h"
+    total = int(round(max(0.0, float(seconds))))
+    if total < 60:
+        return f"{total}s"
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if mins:
+        parts.append(f"{mins}m")
+    # Seconds only under an hour so 90s → 1m 30s and 5400s → 1h 30m.
+    if not days and not hours and secs:
+        parts.append(f"{secs}s")
+    return " ".join(parts) if parts else "0s"
 
 
 def _age_seconds(raw: str | None, now: datetime) -> float | None:

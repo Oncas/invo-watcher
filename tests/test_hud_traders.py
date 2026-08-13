@@ -21,8 +21,10 @@ def test_pending_last_tried_age() -> None:
 def test_format_age() -> None:
     assert format_age(None) == "?"
     assert format_age(4) == "4s"
-    assert format_age(90) == "1.5m"
+    assert format_age(90) == "1m 30s"
     assert format_age(720) == "12m"
+    assert format_age(5400) == "1h 30m"
+    assert format_age(3600) == "1h"
 
 
 def test_traders_by_coin() -> None:

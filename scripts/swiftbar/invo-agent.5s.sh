@@ -36,6 +36,7 @@ from invo_agent.hud import (
     hud_file_age_seconds,
     hud_path,
     load_hud_file,
+    pending_last_tried_age,
 )
 
 FRESH_SECONDS = 5.0
@@ -86,15 +87,19 @@ else:
     for p in snap.positions:
         pnl_color = "#30D158" if p.unrealized_pnl >= 0 else "#FF453A"
         trader = getattr(p, "trader", None)
-        trader_s = f"  @{trader}" if trader else ""
+        trader_s = f"  @{trader}" if trader else "  (untracked)"
         line = (
             f"{p.coin} {p.side} {p.leverage}x{trader_s}  "
             f"{format_pnl(p.unrealized_pnl)} ({format_roe(p.return_on_equity)})"
         )
         print(f"{line} | color={pnl_color}")
 print("---")
-print("Queued opens")
 pending = getattr(snap, "pending", None) or []
+tried = pending_last_tried_age(pending)
+q_header = "Queued opens"
+if tried is not None:
+    q_header += f" · tried {format_age(tried)} ago"
+print(q_header)
 if not pending:
     print("None")
 else:
@@ -105,15 +110,9 @@ else:
         trader = item.get("trader")
         lev = item.get("leverage")
         age_s = format_age(item.get("age_s"))
-        tried = item.get("tried_age_s")
-        tried_s = (
-            f"tried {format_age(tried)} ago"
-            if isinstance(tried, (int, float))
-            else "tried —"
-        )
         lev_s = f" {int(lev)}x" if isinstance(lev, (int, float)) else ""
         trader_s = f"  @{trader}" if trader else ""
-        print(f"{coin} {side}{lev_s}{trader_s}  · {reason} · queued {age_s} · {tried_s}")
+        print(f"{coin} {side}{lev_s}{trader_s}  · {reason} · queued {age_s}")
 if snap.pnl_updated_at:
     ts = (
         snap.pnl_updated_at[11:19]
