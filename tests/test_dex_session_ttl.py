@@ -8,6 +8,7 @@ from invo_agent.dex.session import (
     refresh_failed_because_key_dead,
     session_should_proactive_renew,
     session_ttl_remaining_seconds,
+    turnkey_api_key_name,
 )
 from invo_agent.dex.turnkey_client import TurnkeyError
 from invo_agent.dex.turnkey_crypto import generate_p256_keypair
@@ -76,6 +77,13 @@ def test_refresh_failed_because_key_dead() -> None:
     )
     assert not refresh_failed_because_key_dead(TurnkeyError("timeout", status_code=503))
     assert not refresh_failed_because_key_dead(RuntimeError("connection reset"))
+
+
+def test_turnkey_api_key_name_is_printable_ascii() -> None:
+    name = turnkey_api_key_name("Chrome on Mac · agent", "0x" + "ab" * 33)
+    assert "·" not in name
+    assert all(32 <= ord(ch) <= 126 for ch in name)
+    assert name.endswith("abababab")
 
 
 def test_otp_target_key_is_uncompressed_130() -> None:

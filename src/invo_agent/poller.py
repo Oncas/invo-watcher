@@ -29,6 +29,7 @@ from invo_agent.dex.session import (
     establish_dex_session,
     refresh_dex_session,
     refresh_failed_because_key_dead,
+    session_is_expired,
     session_should_proactive_renew,
     session_ttl_remaining_seconds,
 )
@@ -727,7 +728,11 @@ class NotificationPoller:
         except Exception as refresh_exc:  # noqa: BLE001
             logger.info("DEX API-key refresh failed: %s", refresh_exc)
             log_event("dex_refresh", ok=False, error=str(refresh_exc))
-            if not refresh_failed_because_key_dead(refresh_exc):
+            current = store.load()
+            key_dead = refresh_failed_because_key_dead(refresh_exc) or (
+                current is None or session_is_expired(current)
+            )
+            if not key_dead:
                 self._dex_recover_after = now + DEX_RECOVER_COOLDOWN_SECONDS
                 console.print(f"[red]DEX refresh failed:[/red] {refresh_exc}")
                 return False

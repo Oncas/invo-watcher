@@ -81,8 +81,16 @@ def start_dex_otp(client: InvolioClient) -> tuple[str, int]:
 DEFAULT_DEX_EXPIRATION_SECONDS = 30 * 24 * 60 * 60
 # Turnkey default when Involio does not forward expirationSeconds.
 TURNKEY_DEFAULT_EXPIRATION_SECONDS = 15 * 60
-# Browser-ish label (web uses something like "<user> · <last8 of pubkey>").
+# Browser-ish label. Turnkey apiKeyName allows only printable ASCII (no "·").
 DEFAULT_DEX_DEVICE_LABEL = "Chrome on Mac"
+
+
+def turnkey_api_key_name(label: str, public_key_hex: str) -> str:
+    """Build a Turnkey apiKeyName: alphanumeric + printable ASCII only."""
+    suffix = public_key_hex.removeprefix("0x").removeprefix("0X")[-8:]
+    raw = f"{label} {suffix}".strip()
+    cleaned = "".join(ch for ch in raw if 32 <= ord(ch) <= 126)
+    return (cleaned or "invo-agent")[:80]
 
 
 def complete_dex_otp_login(
@@ -364,7 +372,7 @@ def refresh_dex_session(
 
         keypair = generate_p256_keypair()
         target_pub = keypair.public_key_otp_hex.removeprefix("0x").removeprefix("0X")
-        label = f"{DEFAULT_DEX_DEVICE_LABEL} · {target_pub[-8:]}"
+        label = turnkey_api_key_name(DEFAULT_DEX_DEVICE_LABEL, target_pub)
         minted = signer.create_read_write_session(
             target_public_key=target_pub,
             api_key_name=label,
