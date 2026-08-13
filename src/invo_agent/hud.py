@@ -10,7 +10,7 @@ from invo_agent import service as launchd_service
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB, OpenCopy
-from invo_agent.labels import trader_from_summary
+from invo_agent.labels import tags_from_summary, trader_from_summary
 
 # How often to refresh Hyperliquid mark/PnL (network call).
 PNL_CACHE_SECONDS = 5.0
@@ -493,6 +493,7 @@ def collect_hud(
             "at": r.created_at,
             "action": r.action,
             "summary": r.summary or "",
+            "tags": tags_from_summary(r.summary),
         }
         for r in recent_rows
     ]

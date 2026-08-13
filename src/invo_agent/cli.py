@@ -23,6 +23,7 @@ from invo_agent.dex.session import (
     session_ttl_remaining_seconds,
 )
 from invo_agent.hud import format_age, pending_kind, pending_last_tried_age
+from invo_agent.labels import tags_from_summary
 from invo_agent.logging_setup import setup_logging
 from invo_agent.notify import ensure_alerter, find_alerter, notify_mac
 from invo_agent.poller import CATCHUP_META, NotificationPoller
@@ -228,9 +229,16 @@ def status_cmd() -> None:
         lt = Table(title="Recent actions")
         lt.add_column("When")
         lt.add_column("Action")
+        lt.add_column("What")
         lt.add_column("Summary")
         for row in recent:
-            lt.add_row(row.created_at, row.action, row.summary or "")
+            tags = tags_from_summary(row.summary)
+            lt.add_row(
+                row.created_at,
+                row.action,
+                " · ".join(tags) if tags else "",
+                row.summary or "",
+            )
         console.print(lt)
 
     db.close()
@@ -734,11 +742,14 @@ def watch_cmd(
                 table = Table(title="Recent actions")
                 table.add_column("When")
                 table.add_column("Action")
+                table.add_column("What")
                 table.add_column("Summary")
                 for r in snap.recent:
+                    tags = r.get("tags") or tags_from_summary(r.get("summary"))
                     table.add_row(
                         r["at"][11:19] if len(r["at"]) > 19 else r["at"],
                         r["action"],
+                        " · ".join(tags) if tags else "",
                         r["summary"][:70],
                     )
                 console.print(table)

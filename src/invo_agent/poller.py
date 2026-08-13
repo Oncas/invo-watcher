@@ -36,7 +36,7 @@ from invo_agent.dex.session import (
 )
 from invo_agent.engine import CopyEngine
 from invo_agent.events import log_event
-from invo_agent.labels import trader_from_action
+from invo_agent.labels import format_action_summary, trader_from_action
 from invo_agent.notify import notify_mac
 
 console = Console()
@@ -314,7 +314,7 @@ class NotificationPoller:
         reason = copy.pending_add_reason or "size"
         self.db.log_action(
             action="QUEUED_SIZE",
-            summary=f"{action.summary} ({reason} +${copy.pending_add_notional:.2f})",
+            summary=f"{format_action_summary(action)} ({reason} +${copy.pending_add_notional:.2f})",
             notification_id=str(action.notification.id),
             dry_run=self.is_dry_run,
         )
@@ -394,10 +394,10 @@ class NotificationPoller:
                 action.action is ActionType.UPDATE
                 and self._refresh_pending_from_update(action)
             ):
-                self.db.mark_processed(nid, "QUEUED_UPDATE", action.summary)
+                self.db.mark_processed(nid, "QUEUED_UPDATE", format_action_summary(action))
                 self.db.log_action(
                     action="QUEUED_UPDATE",
-                    summary=action.summary,
+                    summary=format_action_summary(action),
                     notification_id=nid,
                     dry_run=self.is_dry_run,
                 )
@@ -423,7 +423,7 @@ class NotificationPoller:
             self.engine.remember(action)
             self.db.log_action(
                 action=action.action.value,
-                summary=action.summary,
+                summary=format_action_summary(action),
                 notification_id=nid,
                 dry_run=self.is_dry_run,
             )
@@ -564,7 +564,7 @@ class NotificationPoller:
             )
             self.db.log_action(
                 action=f"SKIP_NO_MARGIN_{action.action.value}",
-                summary=f"{action.summary}: {exc}"[:500],
+                summary=f"{format_action_summary(action)}: {exc}"[:500],
                 notification_id=nid,
                 dry_run=self.is_dry_run,
             )
@@ -593,7 +593,7 @@ class NotificationPoller:
             )
             self.db.log_action(
                 action=f"SKIP_SAME_COIN_{action.action.value}",
-                summary=f"{action.summary}: {exc}"[:500],
+                summary=f"{format_action_summary(action)}: {exc}"[:500],
                 notification_id=nid,
                 dry_run=self.is_dry_run,
             )
@@ -622,7 +622,7 @@ class NotificationPoller:
             )
             self.db.log_action(
                 action=f"SKIP_NOT_OPEN_{action.action.value}",
-                summary=f"{action.summary}: {exc}"[:500],
+                summary=f"{format_action_summary(action)}: {exc}"[:500],
                 notification_id=nid,
                 dry_run=self.is_dry_run,
             )
@@ -641,7 +641,7 @@ class NotificationPoller:
         self.db.mark_processed(nid, f"ERROR_{action.action.value}", str(exc)[:500])
         self.db.log_action(
             action=f"ERROR_{action.action.value}",
-            summary=f"{action.summary}: {exc}"[:500],
+            summary=f"{format_action_summary(action)}: {exc}"[:500],
             notification_id=nid,
             dry_run=self.is_dry_run,
         )
@@ -1127,7 +1127,7 @@ class NotificationPoller:
                 continue
             self.db.log_action(
                 action="UPDATE",
-                summary=action.summary,
+                summary=format_action_summary(action),
                 notification_id=copy.last_notification_id,
                 dry_run=False,
             )

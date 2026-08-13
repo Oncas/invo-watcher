@@ -28,6 +28,7 @@ from pathlib import Path
 cli = sys.argv[1]
 
 from invo_agent.config import get_settings
+from invo_agent.labels import format_recent_line
 from invo_agent.hud import (
     format_age,
     format_pnl,
@@ -133,8 +134,12 @@ if not snap.recent:
     print("None yet")
 else:
     for r in snap.recent[:4]:
-        summary = (r.get("summary") or r.get("action") or "")[:56]
-        print(f"{r['action']}: {summary}".replace("|", "/"))
+        line = format_recent_line(
+            str(r.get("action") or ""),
+            str(r.get("summary") or ""),
+            r.get("tags"),
+        )
+        print(line.replace("|", "/"))
 print("---")
 print(f"Status | bash={cli} param1=status terminal=true")
 print(f"Watch | bash={cli} param1=watch terminal=true")

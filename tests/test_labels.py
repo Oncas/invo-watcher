@@ -3,9 +3,13 @@ from uuid import uuid4
 
 from invo_agent.api.models import ActionType, InvestmentUpdate, Notification, TradeAction
 from invo_agent.labels import (
+    format_action_summary,
+    format_recent_line,
     own_copy_from_summary,
+    tags_from_summary,
     trader_from_action,
     trader_from_summary,
+    update_labels,
 )
 
 
@@ -50,6 +54,65 @@ def test_trader_from_action_prefers_owner() -> None:
     action = TradeAction(action=ActionType.OPEN, notification=notif, investment=inv)
     assert trader_from_action(action) == "beta_trader"
     assert "@beta_trader" in action.summary
+
+
+def test_update_labels_from_changes() -> None:
+    size_down = InvestmentUpdate.model_validate(
+        {
+            "ticker": "ETH",
+            "entrySize": 1.0,
+            "changes": {
+                "entrySize": 2.0,
+                "simIncrease": False,
+                "simDifference": 10.2,
+            },
+        }
+    )
+    assert update_labels(size_down) == ["size"]
+    tp_sl = InvestmentUpdate.model_validate(
+        {
+            "ticker": "ADA",
+            "priceTarget": 0.2,
+            "stopLoss": 0.15,
+            "changes": {"priceTarget": 0.18, "stopLoss": None},
+        }
+    )
+    assert update_labels(tp_sl) == ["tp", "sl"]
+    lev = InvestmentUpdate.model_validate(
+        {"ticker": "BTC", "leverage": 40, "changes": {"leverage": 30}}
+    )
+    assert update_labels(lev) == ["lev"]
+    assert update_labels(None) == []
+
+
+def test_format_recent_line_keeps_tags_visible() -> None:
+    notif = Notification.model_validate(
+        {
+            "id": str(uuid4()),
+            "content": "x",
+            "notificationType": "user_updated_investment",
+            "createdAt": datetime.now(UTC).isoformat(),
+            "notifier": {"username": "beta_trader"},
+        }
+    )
+    inv = InvestmentUpdate.model_validate(
+        {
+            "ticker": "ETH",
+            "directionLong": True,
+            "leverage": 20,
+            "baseShortId": "ShortIdG07",
+            "owner": {"username": "beta_trader"},
+            "entrySize": 1.0,
+            "changes": {"simIncrease": True, "entrySize": 0.4, "priceTarget": 2000},
+        }
+    )
+    action = TradeAction(action=ActionType.UPDATE, notification=notif, investment=inv)
+    summary = format_action_summary(action)
+    assert summary.endswith(" · size · tp")
+    assert tags_from_summary(summary) == ["size", "tp"]
+    line = format_recent_line(action.action.value, summary)
+    assert line.startswith("UPDATE · size · tp:")
+    assert "ETH LONG 20x @beta_trader" in line
 
 
 def test_trader_from_action_falls_back_to_notifier() -> None:
