@@ -1353,6 +1353,7 @@ class DexExecutor:
             side="long" if is_long else "short",
             size=fill_sz,
             leverage=float(leverage),
+            trader=inv.owner.username if inv.owner else None,
         )
         log_event(
             "open_fill_persisted",

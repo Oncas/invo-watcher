@@ -16,6 +16,7 @@ from invo_agent.auth.email_otp import login_with_otp
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB, OpenCopy, PendingIntent
+from invo_agent.labels import trader_from_action
 from invo_agent.dex.executor import DexExecutor, RecoveryResult
 from invo_agent.dex.hl_trader import (
     InsufficientMarginError,
@@ -759,6 +760,7 @@ class NotificationPoller:
                 else None
             ),
             summary=action.summary,
+            trader=trader_from_action(action),
         )
 
     def _refresh_pending_from_update(self, action: TradeAction) -> bool:
@@ -875,6 +877,10 @@ class NotificationPoller:
             inv = resp.post.update if resp.post else None
             if inv is None:
                 continue
+            owner = inv.owner.username if inv.owner and inv.owner.username else None
+            if owner and intent.trader != owner:
+                intent.trader = owner
+                self.db.upsert_pending_intent(intent)
             if self._investment_closed(inv):
                 self.db.delete_pending_intent(intent.investment_base_id)
                 log_event(
@@ -973,6 +979,7 @@ class NotificationPoller:
                 "notificationType": "user_added_investment",
                 "createdAt": created.isoformat(),
                 "investmentBaseId": intent.investment_base_id,
+                "notifier": {"username": intent.trader} if intent.trader else None,
             }
         )
         return TradeAction(

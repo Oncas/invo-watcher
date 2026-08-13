@@ -145,7 +145,9 @@ class TradeAction(FlexibleModel):
             side = "LONG" if inv.direction_long else "SHORT"
         lev = f"{inv.leverage}x" if inv and inv.leverage is not None else "?"
         user = None
-        if self.notification.notifier and self.notification.notifier.username:
+        if inv and inv.owner and inv.owner.username:
+            user = inv.owner.username
+        elif self.notification.notifier and self.notification.notifier.username:
             user = self.notification.notifier.username
         bits = [self.action.value, ticker]
         if side:

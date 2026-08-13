@@ -84,24 +84,30 @@ if not snap.positions:
 else:
     for p in snap.positions:
         pnl_color = "#30D158" if p.unrealized_pnl >= 0 else "#FF453A"
+        trader = getattr(p, "trader", None)
+        trader_s = f"  @{trader}" if trader else ""
         line = (
-            f"{p.coin} {p.side} {p.leverage}x  "
+            f"{p.coin} {p.side} {p.leverage}x{trader_s}  "
             f"{format_pnl(p.unrealized_pnl)} ({format_roe(p.return_on_equity)})"
         )
         print(f"{line} | color={pnl_color}")
+print("---")
+print("Queued opens")
 pending = getattr(snap, "pending", None) or []
-if pending:
-    print("---")
-    print("Queued opens")
+if not pending:
+    print("None")
+else:
     for item in pending:
         coin = item.get("coin") or "?"
         side = (item.get("side") or "").upper()
         reason = item.get("reason") or "?"
-        entry = item.get("trader_entry")
+        trader = item.get("trader")
+        lev = item.get("leverage")
         age = item.get("age_s")
         age_s = f"{age:.0f}s" if isinstance(age, (int, float)) else "?"
-        entry_s = f" @{entry:g}" if isinstance(entry, (int, float)) else ""
-        print(f"{coin} {side}{entry_s} · {reason} · {age_s}")
+        lev_s = f" {int(lev)}x" if isinstance(lev, (int, float)) else ""
+        trader_s = f"  @{trader}" if trader else ""
+        print(f"{coin} {side}{lev_s}{trader_s}  · {reason} · {age_s}")
 if snap.pnl_updated_at:
     ts = (
         snap.pnl_updated_at[11:19]

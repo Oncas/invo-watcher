@@ -151,6 +151,7 @@ def status_cmd() -> None:
     if copies:
         ct = Table(title="Open copies (tracked)")
         ct.add_column("Ticker")
+        ct.add_column("Trader")
         ct.add_column("Side")
         ct.add_column("Entry")
         ct.add_column("Recovery")
@@ -162,6 +163,7 @@ def status_cmd() -> None:
                 recovery = f"TP={c.recovery_tp} SL={c.recovery_sl}"
             ct.add_row(
                 c.ticker or "?",
+                f"@{c.trader}" if c.trader else "?",
                 c.side or "?",
                 f"{c.our_entry_px:g}" if c.our_entry_px is not None else "?",
                 recovery,
@@ -176,6 +178,7 @@ def status_cmd() -> None:
     if pending:
         pt = Table(title="Queued opens (entry-or-better / margin / coin)")
         pt.add_column("Coin")
+        pt.add_column("Trader")
         pt.add_column("Side")
         pt.add_column("Trader entry")
         pt.add_column("Reason")
@@ -192,6 +195,7 @@ def status_cmd() -> None:
                 age = "?"
             pt.add_row(
                 intent.coin,
+                f"@{intent.trader}" if intent.trader else "?",
                 intent.side,
                 f"{intent.trader_entry:g}" if intent.trader_entry is not None else "?",
                 intent.reason,

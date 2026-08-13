@@ -9,7 +9,8 @@ from pathlib import Path
 from invo_agent import service as launchd_service
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings
-from invo_agent.db import AgentDB
+from invo_agent.db import AgentDB, OpenCopy
+from invo_agent.labels import trader_from_summary
 
 # How often to refresh Hyperliquid mark/PnL (network call).
 PNL_CACHE_SECONDS = 5.0
@@ -25,6 +26,7 @@ class PositionRow:
     position_value: float
     unrealized_pnl: float
     return_on_equity: float  # fraction, e.g. -0.029
+    trader: str | None = None
 
 
 @dataclass
@@ -295,6 +297,34 @@ def _fetch_hl_pnl(settings: Settings) -> dict:
     return out
 
 
+def _traders_by_coin(copies: list[OpenCopy]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for copy in copies:
+        if copy.ticker and copy.trader:
+            out[copy.ticker.upper()] = copy.trader
+    return out
+
+
+def _backfill_trader_names(db: AgentDB, copies: list[OpenCopy]) -> None:
+    for copy in copies:
+        if copy.trader:
+            continue
+        name = db.lookup_trader_from_logs(
+            ticker=copy.ticker, short_id=copy.base_short_id
+        )
+        if name:
+            db.set_open_copy_trader(copy.investment_base_id, name)
+    for intent in db.list_pending_intents():
+        if intent.trader:
+            continue
+        name = trader_from_summary(intent.summary)
+        if not name and intent.base_short_id:
+            name = db.lookup_trader_from_logs(short_id=intent.base_short_id)
+        if name:
+            intent.trader = name
+            db.upsert_pending_intent(intent)
+
+
 def collect_hud(
     settings: Settings,
     *,
@@ -332,7 +362,11 @@ def collect_hud(
         for r in recent_rows
     ]
     last = recent[0] if recent else None
-    open_copies = len(db.list_open_copies())
+    copies = db.list_open_copies()
+    _backfill_trader_names(db, copies)
+    copies = db.list_open_copies()
+    open_copies = len(copies)
+    trader_by_coin = _traders_by_coin(copies)
     now_hud = datetime.now(UTC)
     pending_rows: list[dict] = []
     for intent in db.list_pending_intents():
@@ -347,7 +381,9 @@ def collect_hud(
             {
                 "coin": intent.coin,
                 "side": intent.side,
+                "leverage": intent.leverage,
                 "trader_entry": intent.trader_entry,
+                "trader": intent.trader or trader_from_summary(intent.summary),
                 "reason": intent.reason,
                 "age_s": age_s,
                 "summary": intent.summary,
@@ -371,8 +407,17 @@ def collect_hud(
             pnl_updated_at = datetime.fromtimestamp(
                 float(pnl["fetched_at"]), tz=UTC
             ).isoformat()
+        pos_fields = {f.name for f in fields(PositionRow)}
         for row in pnl.get("positions") or []:
-            positions.append(PositionRow(**row))
+            if not isinstance(row, dict):
+                continue
+            payload = {k: v for k, v in row.items() if k in pos_fields}
+            coin = str(payload.get("coin") or "").upper()
+            payload["trader"] = trader_by_coin.get(coin)
+            try:
+                positions.append(PositionRow(**payload))
+            except TypeError:
+                continue
 
     return HudSnapshot(
         mode=mode,
@@ -406,11 +451,12 @@ def load_hud_file(settings: Settings) -> HudSnapshot | None:
     allowed = {f.name for f in fields(HudSnapshot)}
     payload = {k: v for k, v in data.items() if k in allowed}
     rows = []
+    pos_fields = {f.name for f in fields(PositionRow)}
     for row in payload.get("positions") or []:
         if not isinstance(row, dict):
             continue
         try:
-            rows.append(PositionRow(**row))
+            rows.append(PositionRow(**{k: v for k, v in row.items() if k in pos_fields}))
         except TypeError:
             continue
     payload["positions"] = rows

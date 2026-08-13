@@ -4,6 +4,7 @@ from invo_agent.api.client import InvolioClient
 from invo_agent.api.models import ActionType, Notification, TradeAction
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB
+from invo_agent.labels import trader_from_action
 
 
 class CopyEngine:
@@ -69,6 +70,7 @@ class CopyEngine:
                 ticker=(inv.ticker or inv.name) if inv else None,
                 portfolio_id=str(notif.portfolio_id) if notif.portfolio_id else None,
                 notification_id=str(notif.id),
+                trader=trader_from_action(action),
             )
             return
 
@@ -91,4 +93,5 @@ class CopyEngine:
                 if notif.portfolio_id
                 else existing.portfolio_id,
                 notification_id=str(notif.id),
+                trader=trader_from_action(action),
             )

@@ -60,3 +60,73 @@ def test_pending_add_notional_survives_upsert(tmp_path: Path) -> None:
     assert copy is not None
     assert copy.pending_add_notional == 8.5
     db.close()
+
+
+def test_trader_survives_upsert(tmp_path: Path) -> None:
+    db = AgentDB(tmp_path / "agent.db")
+    db.upsert_open_copy(
+        investment_base_id="eth",
+        base_short_id="DN14",
+        ticker="ETH",
+        portfolio_id=None,
+        notification_id="n1",
+        trader="beta_trader",
+    )
+    db.upsert_open_copy(
+        investment_base_id="eth",
+        base_short_id="DN14",
+        ticker="ETH",
+        portfolio_id=None,
+        notification_id="n2",
+    )
+    copy = db.get_open_copy("eth")
+    assert copy is not None
+    assert copy.trader == "beta_trader"
+
+    now = "2026-08-13T12:00:00+00:00"
+    db.upsert_pending_intent(
+        PendingIntent(
+            investment_base_id="btc",
+            coin="BTC",
+            side="long",
+            reason="same_coin",
+            created_at=now,
+            updated_at=now,
+            trader="gamma_trader",
+            summary="OPEN BTC LONG 40x ShortIdJ10",
+        )
+    )
+    db.upsert_pending_intent(
+        PendingIntent(
+            investment_base_id="btc",
+            coin="BTC",
+            side="long",
+            reason="same_coin",
+            created_at=now,
+            updated_at=now,
+            summary="OPEN BTC LONG 40x ShortIdJ10",
+        )
+    )
+    intent = db.get_pending_intent("btc")
+    assert intent is not None
+    assert intent.trader == "gamma_trader"
+    db.close()
+
+
+def test_lookup_trader_from_logs_prefers_short_id(tmp_path: Path) -> None:
+    db = AgentDB(tmp_path / "agent.db")
+    db.log_action(
+        action="OPEN",
+        summary="OPEN BTC LONG 30x @wrong_trader oldShort",
+        notification_id="n0",
+        dry_run=False,
+    )
+    db.log_action(
+        action="OPEN",
+        summary="OPEN ETH LONG 20x @beta_trader ShortIdN14",
+        notification_id="n1",
+        dry_run=False,
+    )
+    assert db.lookup_trader_from_logs(short_id="ShortIdN14") == "beta_trader"
+    assert db.lookup_trader_from_logs(ticker="ETH") == "beta_trader"
+    db.close()

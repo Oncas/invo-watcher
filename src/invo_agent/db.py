@@ -23,6 +23,7 @@ class OpenCopy:
     recovery_sl: float | None = None
     trader_closing_px: float | None = None
     pending_add_notional: float = 0.0
+    trader: str | None = None
 
 
 @dataclass
@@ -43,6 +44,7 @@ class PendingIntent:
     entry_size: float | None = None
     portfolio_id: str | None = None
     summary: str | None = None
+    trader: str | None = None
 
 
 @dataclass
@@ -65,6 +67,11 @@ _OPEN_COPY_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("recovery_sl", "REAL"),
     ("trader_closing_px", "REAL"),
     ("pending_add_notional", "REAL NOT NULL DEFAULT 0"),
+    ("trader", "TEXT"),
+)
+
+_PENDING_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("trader", "TEXT"),
 )
 
 
@@ -128,7 +135,8 @@ class AgentDB:
                 sl REAL,
                 entry_size REAL,
                 portfolio_id TEXT,
-                summary TEXT
+                summary TEXT,
+                trader TEXT
             );
             """
         )
@@ -139,6 +147,15 @@ class AgentDB:
         for name, col_type in _OPEN_COPY_EXTRA_COLUMNS:
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE open_copies ADD COLUMN {name} {col_type}")
+        pending_existing = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(pending_intents)").fetchall()
+        }
+        for name, col_type in _PENDING_EXTRA_COLUMNS:
+            if name not in pending_existing:
+                self._conn.execute(
+                    f"ALTER TABLE pending_intents ADD COLUMN {name} {col_type}"
+                )
         self._conn.commit()
 
     def is_processed(self, notification_id: str) -> bool:
@@ -272,6 +289,7 @@ class AgentDB:
         side: str | None = None,
         size: float | None = None,
         leverage: float | None = None,
+        trader: str | None = None,
     ) -> None:
         existing = self._conn.execute(
             "SELECT * FROM open_copies WHERE investment_base_id = ?",
@@ -293,8 +311,8 @@ class AgentDB:
                 opened_at, last_notification_id,
                 our_entry_px, side, size, leverage,
                 recovery_pending, recovery_tp, recovery_sl, trader_closing_px,
-                pending_add_notional
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                pending_add_notional, trader
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 investment_base_id,
@@ -316,6 +334,7 @@ class AgentDB:
                 existing["recovery_sl"] if existing else None,
                 existing["trader_closing_px"] if existing else None,
                 float(existing["pending_add_notional"] or 0) if existing else 0.0,
+                _keep(trader, "trader"),
             ),
         )
         self._conn.commit()
@@ -419,7 +438,41 @@ class AgentDB:
             pending_add_notional=float(row["pending_add_notional"] or 0)
             if "pending_add_notional" in keys
             else 0.0,
+            trader=row["trader"] if "trader" in keys else None,
         )
+
+    def set_open_copy_trader(self, investment_base_id: str, trader: str) -> None:
+        self._conn.execute(
+            "UPDATE open_copies SET trader = ? WHERE investment_base_id = ?",
+            (trader, investment_base_id),
+        )
+        self._conn.commit()
+
+    def lookup_trader_from_logs(
+        self, *, ticker: str | None = None, short_id: str | None = None
+    ) -> str | None:
+        from invo_agent.labels import trader_from_summary
+
+        rows = self._conn.execute(
+            """
+            SELECT summary FROM action_log
+            WHERE summary LIKE '%@%'
+            ORDER BY id DESC
+            LIMIT 300
+            """
+        ).fetchall()
+        ticker_hit: str | None = None
+        ticker_u = ticker.upper() if ticker else None
+        for row in rows:
+            summary = row["summary"] or ""
+            name = trader_from_summary(summary)
+            if not name:
+                continue
+            if short_id and short_id in summary:
+                return name
+            if ticker_u and ticker_u in summary.upper() and ticker_hit is None:
+                ticker_hit = name
+        return ticker_hit
 
     def set_pending_add_notional(self, investment_base_id: str, notional: float) -> None:
         self._conn.execute(
@@ -441,8 +494,8 @@ class AgentDB:
             INSERT OR REPLACE INTO pending_intents (
                 investment_base_id, coin, side, reason, created_at, updated_at,
                 base_short_id, notification_id, investment_id, leverage,
-                trader_entry, tp, sl, entry_size, portfolio_id, summary
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                trader_entry, tp, sl, entry_size, portfolio_id, summary, trader
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 intent.investment_base_id,
@@ -461,6 +514,7 @@ class AgentDB:
                 intent.entry_size,
                 intent.portfolio_id,
                 intent.summary,
+                intent.trader or (existing.trader if existing else None),
             ),
         )
         self._conn.commit()
@@ -536,6 +590,7 @@ class AgentDB:
             entry_size=row["entry_size"],
             portfolio_id=row["portfolio_id"],
             summary=row["summary"],
+            trader=row["trader"] if "trader" in row.keys() else None,
         )
 
     def processed_count(self) -> int:
