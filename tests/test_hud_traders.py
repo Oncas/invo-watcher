@@ -8,7 +8,14 @@ from invo_agent.hud import (
     collect_hud,
     format_age,
     load_hud_file,
+    pending_last_tried_age,
 )
+
+
+def test_pending_last_tried_age() -> None:
+    assert pending_last_tried_age([]) is None
+    assert pending_last_tried_age([{"tried_age_s": 8}, {"tried_age_s": 2}]) == 2
+    assert pending_last_tried_age([{"tried_age_s": None}]) is None
 
 
 def test_format_age() -> None:

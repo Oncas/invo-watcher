@@ -58,6 +58,16 @@ def _pnl_cache_path(settings: Settings) -> Path:
     return settings.session_path.expanduser().parent / "pnl-cache.json"
 
 
+def pending_last_tried_age(pending: list[dict] | None) -> float | None:
+    """Most recent drain attempt across the queue (they are tried together)."""
+    ages = [
+        item.get("tried_age_s")
+        for item in pending or []
+        if isinstance(item.get("tried_age_s"), (int, float))
+    ]
+    return min(ages) if ages else None
+
+
 def format_age(seconds: float | None) -> str:
     if seconds is None:
         return "?"
