@@ -36,14 +36,15 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-echo "==> stop invo-agent"
-sudo systemctl stop invo-agent
-
 echo "==> migrate local state"
 .venv/bin/invo-agent migrate
 
-echo "==> start invo-agent"
-sudo systemctl start invo-agent
+# invo sudoers allow restart only (not stop/start). Drop the 5s PnL
+# cache so the recycled process cannot serve a pre-restart baseline.
+rm -f /var/lib/invo-agent/pnl-cache.json
+
+echo "==> restart invo-agent"
+sudo systemctl restart invo-agent
 
 TOKEN="${HUD_TOKEN:-}"
 PORT="${HUD_PORT:-8787}"

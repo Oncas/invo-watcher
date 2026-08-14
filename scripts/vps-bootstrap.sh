@@ -64,7 +64,7 @@ systemctl daemon-reload
 systemctl enable invo-agent
 
 cat >/etc/sudoers.d/invo-agent <<'EOF'
-invo ALL=(root) NOPASSWD: /bin/systemctl restart invo-agent, /bin/systemctl --no-pager --full status invo-agent
+invo ALL=(root) NOPASSWD: /bin/systemctl restart invo-agent, /bin/systemctl stop invo-agent, /bin/systemctl start invo-agent, /bin/systemctl --no-pager --full status invo-agent
 EOF
 chmod 440 /etc/sudoers.d/invo-agent
 
