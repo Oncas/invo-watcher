@@ -125,5 +125,6 @@ def migrate_state(settings: Settings) -> dict[str, int]:
             tagged += 1
     traders = backfill_trader_names(db)
     dropped = db.delete_meta_prefix("update_tags:")
+    dropped += db.delete_meta_prefix("pnl_baseline")
     db.close()
     return {"tagged": tagged, "traders": traders, "meta_dropped": dropped}

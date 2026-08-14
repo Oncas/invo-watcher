@@ -154,90 +154,34 @@ def _account_value_samples(portfolio: object) -> list[tuple[int, float]]:
     return samples
 
 
-# Involio AccountHeaderCubit / PnlService (main.dart.js).
-# Prints are hours apart. The site pins a baseline in the open tab and only
-# tries to roll it every 15 minutes (timer 9e8 µs). A background tab can sit
-# on an old print for hours — recomputing every HUD refresh is why we drifted.
-_PNL_BASELINE_META = "pnl_baseline"
-_PNL_ROLLOVER_SECONDS = 900.0
-_PNL_BASELINE_MAX_LAG_MS = 21_600_000  # 6h; older candidate → keep pin
+# Involio PnlService.getBaselineAtWindowStart (main.dart.js): first perp
+# print at or after T−24h. The 6h lag (216e5 ms) is a staleness gate that
+# *hides* PnL when only an older fallback exists — it is not a picker.
+_PNL_BASELINE_MAX_LAG_MS = 21_600_000
 
 
 def _baseline_at_window_start(
     samples: list[tuple[int, float]], window_start_ms: int
 ) -> tuple[int, float] | None:
-    """Baseline print for Involio's wallet 24h header.
-
-    The open site stays on the last print that is at least 6h before T−24h
-    (about 30h old). First-after-T−24h matches a brand-new page load, not the
-    header they actually show.
-    """
-    cutoff = window_start_ms - _PNL_BASELINE_MAX_LAG_MS
-    last_before_cutoff: tuple[int, float] | None = None
-    last_before_window: tuple[int, float] | None = None
-    first_after_window: tuple[int, float] | None = None
+    """First Hyperliquid print at or after T−24h; else the last print before it."""
+    last_before: tuple[int, float] | None = None
     for row in samples:
-        if row[0] <= cutoff:
-            last_before_cutoff = row
-        if row[0] < window_start_ms:
-            last_before_window = row
-        elif first_after_window is None:
-            first_after_window = row
-    return last_before_cutoff or last_before_window or first_after_window
+        if row[0] >= window_start_ms:
+            return row
+        last_before = row
+    return last_before
 
 
-def _load_pinned_baseline(db: AgentDB | None) -> tuple[int, float, float] | None:
-    if db is None:
-        return None
-    raw = db.get_meta(_PNL_BASELINE_META)
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-        return int(data["ts"]), float(data["equity"]), float(data["pinned_at"])
-    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
-        return None
-
-
-def _save_pinned_baseline(
-    db: AgentDB | None, ts: int, equity: float, *, now: float | None = None
-) -> None:
-    if db is None:
-        return
-    db.set_meta(
-        _PNL_BASELINE_META,
-        json.dumps(
-            {
-                "ts": ts,
-                "equity": equity,
-                "pinned_at": time.time() if now is None else now,
-            }
-        ),
-    )
-
-
-def _resolve_pinned_baseline(
-    samples: list[tuple[int, float]],
-    window_start_ms: int,
-    *,
-    db: AgentDB | None,
-    now: float | None = None,
+def _usable_baseline(
+    samples: list[tuple[int, float]], window_start_ms: int
 ) -> tuple[int, float] | None:
-    """Pin like AccountHeaderCubit: keep the sample until a valid 15m rollover."""
-    candidate = _baseline_at_window_start(samples, window_start_ms)
-    pinned = _load_pinned_baseline(db)
-    now = time.time() if now is None else now
-    if pinned is None:
-        chosen = candidate
-    else:
-        pin_ts, pin_eq, pinned_at = pinned
-        chosen = (pin_ts, pin_eq)
-        due = (now - pinned_at) >= _PNL_ROLLOVER_SECONDS
-        if due and candidate is not None:
-            chosen = candidate
-    if chosen is not None and (pinned is None or chosen[0] != pinned[0]):
-        _save_pinned_baseline(db, chosen[0], chosen[1], now=now)
-    return chosen
+    """Same as getBaselineAtWindowStart, then drop a fallback older than 6h."""
+    baseline = _baseline_at_window_start(samples, window_start_ms)
+    if baseline is None:
+        return None
+    if baseline[0] < window_start_ms - _PNL_BASELINE_MAX_LAG_MS:
+        return None
+    return baseline
 
 
 def _ledger_flow_usd(delta: dict, address: str) -> tuple[float, float]:
@@ -298,8 +242,6 @@ def _involio_rolling_24h_pnl(
     trader: object,
     address: str,
     equity: float,
-    *,
-    db: AgentDB | None = None,
 ) -> tuple[float, float] | None:
     """Match Involio AccountHeader rolling-24h PnL.
 
@@ -313,7 +255,7 @@ def _involio_rolling_24h_pnl(
         return None
     samples = _account_value_samples(portfolio)
     window_start_ms = int(time.time() * 1000) - 86_400_000
-    baseline = _resolve_pinned_baseline(samples, window_start_ms, db=db)
+    baseline = _usable_baseline(samples, window_start_ms)
     if baseline is None:
         return None
     baseline_ms, baseline_equity = baseline
@@ -402,13 +344,7 @@ def _fetch_hl_pnl(settings: Settings) -> dict:
                 }
             )
         out["positions"] = rows
-        db = AgentDB(settings.db_path)
-        try:
-            rolling = _involio_rolling_24h_pnl(
-                trader, data.master_address, equity, db=db
-            )
-        finally:
-            db.close()
+        rolling = _involio_rolling_24h_pnl(trader, data.master_address, equity)
         if rolling is not None:
             out["pnl_24h"], out["pnl_24h_pct"] = rolling
         trader.close()
