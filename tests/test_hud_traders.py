@@ -33,40 +33,24 @@ def test_pending_last_tried_age() -> None:
 def test_format_pending_reason() -> None:
     assert format_pending_reason(kind="OPEN", reason="same_coin") == "same_coin"
     assert format_pending_reason(kind="OPEN", reason="margin") == "margin"
-    assert format_pending_reason(kind="OPEN", reason="price") == "entry-or-better"
+    assert format_pending_reason(kind="OPEN", reason="price") == "price"
     assert (
         format_pending_reason(
             kind="OPEN", reason="price", side="short", trader_entry=0.5
         )
-        == "entry-or-better ≥ 0.5"
+        == "price"
     )
-    assert (
-        format_pending_reason(
-            kind="OPEN", reason="price", side="long", trader_entry=1881.0
-        )
-        == "entry-or-better ≤ 1881"
+    assert format_pending_reason(kind="UPDATE", reason="size", amount=0.98) == (
+        "size↑ · size"
     )
-    assert (
-        format_pending_reason(kind="UPDATE", reason="size", amount=0.98)
-        == "size↑ +$0.98 · under min"
+    assert format_pending_reason(kind="UPDATE", reason="dust", amount=1.01) == (
+        "size↑ · dust"
     )
-    assert (
-        format_pending_reason(kind="UPDATE", reason="dust", amount=1.01)
-        == "size↑ +$1.01 · under min"
+    assert format_pending_reason(kind="UPDATE", reason="margin", amount=12.5) == (
+        "size↑ · margin"
     )
-    assert (
-        format_pending_reason(kind="UPDATE", reason="margin", amount=12.5)
-        == "size↑ +$12.50 · margin"
-    )
-    assert (
-        format_pending_reason(
-            kind="UPDATE",
-            reason="price",
-            side="short",
-            trader_entry=0.055,
-            amount=12.0,
-        )
-        == "size↑ +$12.00 · entry-or-better ≥ 0.055"
+    assert format_pending_reason(kind="UPDATE", reason="price", amount=12.0) == (
+        "size↑ · price"
     )
 
 
@@ -308,11 +292,11 @@ def test_collect_hud_pending_includes_trader(tmp_path: Path) -> None:
     assert by_coin["SOL"]["kind"] == "OPEN"
     assert by_coin["XRP"]["kind"] == "OPEN"
     assert by_coin["XRP"]["wait"] == "price"
-    assert by_coin["XRP"]["reason"] == "entry-or-better ≥ 0.5"
+    assert by_coin["XRP"]["reason"] == "price"
     assert by_coin["DOT"]["kind"] == "UPDATE"
     assert by_coin["DOT"]["wait"] == "size"
     assert by_coin["DOT"]["amount"] == 12.5
-    assert by_coin["DOT"]["reason"] == "size↑ +$12.50 · under min"
+    assert by_coin["DOT"]["reason"] == "size↑ · size"
 
     db = AgentDB(settings.db_path)
     copy = db.get_open_copy("eth")

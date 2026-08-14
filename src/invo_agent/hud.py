@@ -70,30 +70,6 @@ def pending_kind(summary: str | None = None, *, kind: str | None = None) -> str:
     return "OPEN"
 
 
-_PENDING_WAIT = {
-    "price": "entry-or-better",
-    "margin": "margin",
-    "same_coin": "same_coin",
-    "size": "under min",
-    "dust": "under min",
-    "below_hl_min": "under min",
-}
-
-
-def _fmt_px(px: float) -> str:
-    if abs(px) >= 1:
-        return f"{px:.4f}".rstrip("0").rstrip(".")
-    return f"{px:.6f}".rstrip("0").rstrip(".")
-
-
-def _pending_price_bound(side: str | None, trader_entry: float | None) -> str:
-    if trader_entry is None:
-        return ""
-    is_short = (side or "").lower().startswith("s")
-    op = "≥" if is_short else "≤"
-    return f" {op} {_fmt_px(float(trader_entry))}"
-
-
 def format_pending_reason(
     *,
     kind: str | None = None,
@@ -102,16 +78,11 @@ def format_pending_reason(
     trader_entry: float | None = None,
     amount: float | None = None,
 ) -> str:
-    """Queue label: wait reason, plus size↑ on leftover adds."""
-    raw = (reason or "").strip() or "?"
-    wait = _PENDING_WAIT.get(raw, raw)
-    if raw == "price":
-        wait = f"entry-or-better{_pending_price_bound(side, trader_entry)}"
+    """Queue label: original wait reason, plus size↑ on leftover adds."""
+    _ = (side, trader_entry, amount)
+    wait = (reason or "").strip() or "?"
     if pending_kind(kind=kind) == "UPDATE":
-        amt = ""
-        if isinstance(amount, (int, float)) and amount > 0:
-            amt = f" +${float(amount):.2f}"
-        return f"size↑{amt} · {wait}"
+        return f"size↑ · {wait}"
     return wait
 
 
