@@ -170,11 +170,14 @@ class AgentDB:
         self._conn.commit()
 
     def is_processed(self, notification_id: str) -> bool:
+        return self.processed_action(notification_id) is not None
+
+    def processed_action(self, notification_id: str) -> str | None:
         row = self._conn.execute(
-            "SELECT 1 FROM processed_notifications WHERE notification_id = ?",
+            "SELECT action FROM processed_notifications WHERE notification_id = ?",
             (notification_id,),
         ).fetchone()
-        return row is not None
+        return None if row is None else str(row["action"])
 
     def mark_processed(self, notification_id: str, action: str, summary: str | None = None) -> None:
         self._conn.execute(

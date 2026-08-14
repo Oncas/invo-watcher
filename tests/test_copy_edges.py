@@ -442,3 +442,41 @@ def test_recent_line_size_up_vs_down() -> None:
     assert format_recent_line(
         "UPDATE", "UPDATE ETH LONG 20x @beta_trader DG07 · size↓", ["size↓"]
     ).startswith("UPDATE · size↓:")
+
+
+def test_catchup_leaves_update_on_open_copy(tmp_path) -> None:
+    db = AgentDB(tmp_path / "agent.db")
+    settings = Settings()
+    base_id = str(uuid4())
+    nid = str(uuid4())
+    db.upsert_open_copy(
+        investment_base_id=base_id,
+        base_short_id="ShortIdL12",
+        ticker="2Z",
+        portfolio_id=None,
+        notification_id=nid,
+        trader="zeta_trader",
+    )
+    db.mark_processed(nid, "CATCHUP_UPDATE", "zeta_trader updated 2Z")
+    notif = Notification.model_validate(
+        {
+            "id": nid,
+            "content": "zeta_trader updated their investment in 2Z",
+            "notificationType": "user_updated_investment",
+            "createdAt": datetime.now(UTC).isoformat(),
+            "investmentBaseId": base_id,
+        }
+    )
+    client = SimpleNamespace(
+        get_notifications=lambda page=1, size=None: SimpleNamespace(items=[notif])
+    )
+    poller = NotificationPoller(
+        client=client,
+        db=db,
+        settings=settings,
+        session_store=SimpleNamespace(),
+    )  # type: ignore[arg-type]
+    assert poller._tracked_followup(notif) is True
+    poller.catch_up(pages=1)
+    assert db.is_processed(nid) is False
+    db.close()

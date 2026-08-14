@@ -88,11 +88,29 @@ class NotificationPoller:
     def needs_catchup(self) -> bool:
         return self.db.get_meta(CATCHUP_META) is None
 
+    def _tracked_followup(self, notification: Notification) -> bool:
+        """True when this UPDATE/CLOSE belongs to a copy we already hold or queued."""
+        if notification.action_type not in {ActionType.UPDATE, ActionType.CLOSE}:
+            return False
+        base_id = (
+            str(notification.investment_base_id)
+            if notification.investment_base_id
+            else None
+        )
+        if not base_id:
+            return False
+        if self.db.get_open_copy(base_id) is not None:
+            return True
+        return self.db.get_pending_intent(base_id) is not None
+
     def catch_up(self, *, pages: int = 3) -> int:
         """Mark notifications already in the feed as seen — do not execute them.
 
         Called on every process start so downtime gaps are not replayed as live
         trades (e.g. a 6‑minute‑old OPEN sitting in the inbox).
+
+        UPDATE/CLOSE for a copy we already track is left unprocessed so the
+        first poll can queue a size-add or flatten — catch-up must not eat those.
         """
         marked = 0
         for page in range(1, pages + 1):
@@ -101,6 +119,13 @@ class NotificationPoller:
                 break
             for notification in resp.items:
                 nid = str(notification.id)
+                if self._tracked_followup(notification):
+                    prior = self.db.processed_action(nid)
+                    if prior and (
+                        prior.startswith("CATCHUP_") or prior == "STARTUP_SKIP"
+                    ):
+                        self.db.unmark_processed(nid)
+                    continue
                 if self.db.is_processed(nid):
                     continue
                 action = (
@@ -435,7 +460,9 @@ class NotificationPoller:
                     created = created.replace(tzinfo=UTC)
                 else:
                     created = created.astimezone(UTC)
-                if created <= self._watch_started_at:
+                if created <= self._watch_started_at and not self._tracked_followup(
+                    notification
+                ):
                     self.db.mark_processed(
                         nid, "STARTUP_SKIP", notification.content
                     )
