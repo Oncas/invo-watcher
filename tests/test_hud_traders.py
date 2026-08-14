@@ -41,10 +41,10 @@ def test_format_pending_reason() -> None:
         == "price"
     )
     assert format_pending_reason(kind="UPDATE", reason="size", amount=0.98) == (
-        "size↑ · size"
+        "size↑ · under min"
     )
     assert format_pending_reason(kind="UPDATE", reason="dust", amount=1.01) == (
-        "size↑ · dust"
+        "size↑ · under min"
     )
     assert format_pending_reason(kind="UPDATE", reason="margin", amount=12.5) == (
         "size↑ · margin"
@@ -296,7 +296,7 @@ def test_collect_hud_pending_includes_trader(tmp_path: Path) -> None:
     assert by_coin["DOT"]["kind"] == "UPDATE"
     assert by_coin["DOT"]["wait"] == "size"
     assert by_coin["DOT"]["amount"] == 12.5
-    assert by_coin["DOT"]["reason"] == "size↑ · size"
+    assert by_coin["DOT"]["reason"] == "size↑ · under min"
 
     db = AgentDB(settings.db_path)
     copy = db.get_open_copy("eth")

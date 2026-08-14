@@ -70,6 +70,9 @@ def pending_kind(summary: str | None = None, *, kind: str | None = None) -> str:
     return "OPEN"
 
 
+_BELOW_MIN_REASONS = frozenset({"size", "dust", "below_hl_min"})
+
+
 def format_pending_reason(
     *,
     kind: str | None = None,
@@ -78,9 +81,11 @@ def format_pending_reason(
     trader_entry: float | None = None,
     amount: float | None = None,
 ) -> str:
-    """Queue label: original wait reason, plus size↑ on leftover adds."""
+    """Queue label: wait reason, plus size↑ on leftover adds."""
     _ = (side, trader_entry, amount)
     wait = (reason or "").strip() or "?"
+    if wait in _BELOW_MIN_REASONS:
+        wait = "under min"
     if pending_kind(kind=kind) == "UPDATE":
         return f"size↑ · {wait}"
     return wait
