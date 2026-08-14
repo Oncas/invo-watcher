@@ -38,7 +38,7 @@ from invo_agent.dex.pricing import (
 from invo_agent.dex.recovery import RecoveryDecision, decide_missed_close
 from invo_agent.dex.session import DexSessionError, DexSessionStore, load_signer
 from invo_agent.dex.turnkey_crypto import new_client_tx_id
-from invo_agent.events import log_event
+from invo_agent.events import log_event, log_event_throttled
 from invo_agent.labels import merge_update_tags, update_labels
 
 console = Console()
@@ -142,8 +142,9 @@ class DexExecutor:
             self.settings.position_pct,
             action.summary,
         )
-        log_event(
+        log_event_throttled(
             "live_handle",
+            key=str(action.notification.id),
             action=action.action.value,
             summary=action.summary,
             equity=equity,
@@ -167,8 +168,9 @@ class DexExecutor:
                 console.print(f"[yellow]Unhandled action {action.action}[/yellow]")
         except InsufficientMarginError as exc:
             logger.warning("LIVE %s skipped (margin): %s", action.action.value, exc)
-            log_event(
+            log_event_throttled(
                 "live_skip_margin",
+                key=str(action.notification.id),
                 action=action.action.value,
                 summary=action.summary,
                 error=str(exc),
@@ -177,8 +179,9 @@ class DexExecutor:
             raise
         except SameCoinOpenError as exc:
             logger.warning("LIVE %s skipped (same coin): %s", action.action.value, exc)
-            log_event(
+            log_event_throttled(
                 "live_skip_same_coin",
+                key=str(action.notification.id),
                 action=action.action.value,
                 summary=action.summary,
                 error=str(exc),
@@ -217,8 +220,9 @@ class DexExecutor:
             raise
         except PriceNotBetterError as exc:
             logger.info("LIVE %s queued (price): %s", action.action.value, exc)
-            log_event(
+            log_event_throttled(
                 "live_queue_price",
+                key=str(action.notification.id),
                 action=action.action.value,
                 summary=action.summary,
                 error=str(exc),
@@ -1156,8 +1160,9 @@ class DexExecutor:
                 f"[dim]UPDATE {coin}: size increase too small "
                 f"(need=${need:.2f} < HL min ${hl_min:g}) — queued ${accumulated:.2f}[/dim]"
             )
-            log_event(
+            log_event_throttled(
                 "size_increase_skip",
+                key=f"{coin}:below_hl_min",
                 coin=coin,
                 reason="below_hl_min",
                 current_notional=current_notional,
@@ -1175,8 +1180,9 @@ class DexExecutor:
                 f"[yellow]UPDATE {coin}: size increase queued "
                 f"(no free margin; available=${available:.2f}; +${need:.2f})[/yellow]"
             )
-            log_event(
+            log_event_throttled(
                 "size_increase_skip",
+                key=f"{coin}:no_margin",
                 coin=coin,
                 reason="no_margin",
                 current_notional=current_notional,
@@ -1202,8 +1208,9 @@ class DexExecutor:
                 f"[dim]UPDATE {coin}: size increase waiting for entry-or-better "
                 f"(mid={mid} trader={trader_entry}) — queued ${need:.2f}[/dim]"
             )
-            log_event(
+            log_event_throttled(
                 "size_increase_skip",
+                key=f"{coin}:price_worse",
                 coin=coin,
                 reason="price_worse",
                 mid=mid,
@@ -1243,8 +1250,9 @@ class DexExecutor:
             self._check_hl_ok(hl_resp, "size_increase")
         except IocUnfilledError:
             self._stash_pending_add(inv, need, reason="price", entry=trader_entry)
-            log_event(
+            log_event_throttled(
                 "size_increase_skip",
+                key=f"{coin}:ioc_unfilled",
                 coin=coin,
                 reason="ioc_unfilled",
                 pending_add_notional=need,
@@ -1253,8 +1261,9 @@ class DexExecutor:
         except HlTraderError as exc:
             if "insufficient margin" in str(exc).lower():
                 self._stash_pending_add(inv, need, reason="margin", entry=trader_entry)
-                log_event(
+                log_event_throttled(
                     "size_increase_skip",
+                    key=f"{coin}:no_margin",
                     coin=coin,
                     reason="no_margin",
                     error=str(exc),
@@ -2059,7 +2068,6 @@ class DexExecutor:
             return
         try:
             self.client.dex_post("/dex/mimic/seen", {"baseShortId": base_short_id})
-            log_event("mimic_seen", base_short_id=base_short_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("mimic/seen failed baseShortId=%s: %s", base_short_id, exc)
 

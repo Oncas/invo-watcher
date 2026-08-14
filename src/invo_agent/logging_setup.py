@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import shutil
+from datetime import UTC, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from invo_agent.events import configure_events
+
+# Live files stay small; dated history is deleted after this many days.
+LOG_RETAIN_DAYS = 7
+LOG_EVENTS_CAP_BYTES = 8_000_000
+LOG_MIN_FREE_MB = 400
 
 
 class _FlushFileHandler(logging.FileHandler):
@@ -21,7 +27,7 @@ def setup_logging(log_dir: Path, *, level: str = "INFO") -> Path:
 
     Writes to:
       - log_dir/agent.log              (rotating, long-lived)
-      - log_dir/history/YYYY-MM-DD.log (append-only daily archive; never truncated)
+      - log_dir/history/YYYY-MM-DD.log (daily archive; pruned after 7 days)
     Events go to events.jsonl + history/YYYY-MM-DD.events.jsonl
     """
     log_dir = log_dir.expanduser()
@@ -49,8 +55,8 @@ def setup_logging(log_dir: Path, *, level: str = "INFO") -> Path:
     # Rolling working copy (append; never truncate on restart).
     file_handler = RotatingFileHandler(
         log_path,
-        maxBytes=10_000_000,
-        backupCount=20,
+        maxBytes=5_000_000,
+        backupCount=3,
         encoding="utf-8",
     )
     file_handler.setFormatter(fmt)
@@ -76,3 +82,101 @@ def setup_logging(log_dir: Path, *, level: str = "INFO") -> Path:
         level.upper(),
     )
     return log_path
+
+
+def _tail_file(path: Path, cap_bytes: int) -> bool:
+    """Keep the last ``cap_bytes`` of an append-only file. Returns True if trimmed."""
+    if not path.is_file():
+        return False
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= cap_bytes:
+        return False
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+    keep = data[-cap_bytes:]
+    nl = keep.find(b"\n")
+    if nl >= 0:
+        keep = keep[nl + 1 :]
+    path.write_bytes(keep)
+    return True
+
+
+def prune_logs(
+    log_dir: Path,
+    *,
+    retain_days: int = LOG_RETAIN_DAYS,
+    events_cap_bytes: int = LOG_EVENTS_CAP_BYTES,
+    min_free_mb: int = LOG_MIN_FREE_MB,
+) -> dict[str, int]:
+    """Drop old history and cap events.jsonl. Emergency-trim if the disk is low."""
+    log_dir = log_dir.expanduser()
+    history = log_dir / "history"
+    deleted = 0
+    trimmed = 0
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, int(retain_days)))
+    if history.is_dir():
+        for path in history.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+            except OSError:
+                continue
+            if mtime >= cutoff:
+                continue
+            try:
+                path.unlink()
+                deleted += 1
+            except OSError:
+                continue
+    for backup in log_dir.glob("agent.log.*"):
+        if backup.is_file() and backup.suffix.lstrip(".").isdigit():
+            try:
+                idx = int(backup.suffix.lstrip("."))
+            except ValueError:
+                continue
+            if idx > 3:
+                try:
+                    backup.unlink()
+                    deleted += 1
+                except OSError:
+                    continue
+    if _tail_file(log_dir / "events.jsonl", events_cap_bytes):
+        trimmed += 1
+
+    try:
+        free_mb = shutil.disk_usage(log_dir).free / (1024 * 1024)
+    except OSError:
+        free_mb = float(min_free_mb)
+    if free_mb < min_free_mb and history.is_dir():
+        aged = sorted(
+            (p for p in history.iterdir() if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+        )
+        for path in aged:
+            try:
+                path.unlink()
+                deleted += 1
+            except OSError:
+                continue
+            try:
+                free_mb = shutil.disk_usage(log_dir).free / (1024 * 1024)
+            except OSError:
+                break
+            if free_mb >= min_free_mb:
+                break
+        if _tail_file(log_dir / "events.jsonl", min(1_000_000, events_cap_bytes)):
+            trimmed += 1
+        for backup in log_dir.glob("agent.log.*"):
+            if backup.is_file():
+                try:
+                    backup.unlink()
+                    deleted += 1
+                except OSError:
+                    continue
+    return {"deleted": deleted, "trimmed": trimmed}

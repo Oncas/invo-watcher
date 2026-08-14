@@ -404,7 +404,9 @@ def migrate_cmd() -> None:
     stats = migrate_state(settings)
     console.print(
         f"[green]migrate[/green] tagged={stats['tagged']} "
-        f"traders={stats['traders']} meta_dropped={stats['meta_dropped']}"
+        f"traders={stats['traders']} meta_dropped={stats['meta_dropped']} "
+        f"logs_deleted={stats.get('logs_deleted', 0)} "
+        f"logs_trimmed={stats.get('logs_trimmed', 0)}"
     )
 
 

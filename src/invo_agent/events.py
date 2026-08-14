@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,8 @@ from typing import Any
 _lock = threading.Lock()
 _path: Path | None = None
 _daily_path: Path | None = None
+_throttle: dict[str, float] = {}
+_THROTTLE_S = 900.0
 
 
 def configure_events(log_dir: Path, *, daily_path: Path | None = None) -> Path:
@@ -33,6 +36,10 @@ def events_path() -> Path | None:
     return _path
 
 
+def reset_event_throttle() -> None:
+    _throttle.clear()
+
+
 def log_event(kind: str, **fields: Any) -> None:
     """Append one structured event for overnight debugging."""
     if _path is None:
@@ -50,3 +57,21 @@ def log_event(kind: str, **fields: Any) -> None:
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(line)
                 fh.flush()
+
+
+def log_event_throttled(
+    kind: str,
+    *,
+    key: str,
+    every_s: float = _THROTTLE_S,
+    **fields: Any,
+) -> bool:
+    """Same as log_event, but at most once per key every ``every_s`` seconds."""
+    token = f"{kind}:{key}"
+    now = time.monotonic()
+    prev = _throttle.get(token)
+    if prev is not None and now - prev < every_s:
+        return False
+    _throttle[token] = now
+    log_event(kind, **fields)
+    return True

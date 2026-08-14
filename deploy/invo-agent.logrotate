@@ -2,7 +2,8 @@
 /var/lib/invo-agent/logs/events.jsonl
 {
     daily
-    rotate 14
+    size 5M
+    rotate 5
     missingok
     notifempty
     compress
@@ -14,7 +15,8 @@
 /home/invo/.invo-agent/logs/events.jsonl
 {
     daily
-    rotate 14
+    size 5M
+    rotate 5
     missingok
     notifempty
     compress

@@ -127,4 +127,13 @@ def migrate_state(settings: Settings) -> dict[str, int]:
     dropped = db.delete_meta_prefix("update_tags:")
     dropped += db.delete_meta_prefix("pnl_baseline")
     db.close()
-    return {"tagged": tagged, "traders": traders, "meta_dropped": dropped}
+    from invo_agent.logging_setup import prune_logs
+
+    pruned = prune_logs(settings.log_dir)
+    return {
+        "tagged": tagged,
+        "traders": traders,
+        "meta_dropped": dropped,
+        "logs_deleted": pruned.get("deleted", 0),
+        "logs_trimmed": pruned.get("trimmed", 0),
+    }

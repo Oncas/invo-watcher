@@ -37,7 +37,8 @@ from invo_agent.dex.session import (
     session_ttl_remaining_seconds,
 )
 from invo_agent.engine import CopyEngine
-from invo_agent.events import log_event
+from invo_agent.events import log_event, log_event_throttled
+from invo_agent.logging_setup import prune_logs
 from invo_agent.labels import (
     format_action_summary,
     merge_update_tags,
@@ -80,6 +81,7 @@ class NotificationPoller:
         self._dex_recover_after: float = 0.0
         self._dex_dead_notified = False
         self._transient_failures = 0
+        self._last_log_prune = 0.0
 
     @property
     def is_dry_run(self) -> bool:
@@ -1346,8 +1348,9 @@ class NotificationPoller:
         else:
             intent.reason = reason
             self.db.upsert_pending_intent(intent)
-        log_event(
+        log_event_throttled(
             "pending_still_waiting",
+            key=f"{intent.investment_base_id}:{reason}",
             base_id=intent.investment_base_id,
             coin=intent.coin,
             reason=reason,
@@ -1442,6 +1445,23 @@ class NotificationPoller:
             )
             return False
 
+    def _maybe_prune_logs(self) -> None:
+        now = time.monotonic()
+        if self._last_log_prune and now - self._last_log_prune < 3600:
+            return
+        self._last_log_prune = now
+        try:
+            stats = prune_logs(self.settings.log_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("log prune failed: %s", exc)
+            return
+        if stats.get("deleted") or stats.get("trimmed"):
+            logger.info(
+                "log prune deleted=%s trimmed=%s",
+                stats.get("deleted"),
+                stats.get("trimmed"),
+            )
+
     def run_forever(self, *, stop_fn: Callable[[], bool] | None = None) -> None:
         mode = "LIVE" if self.settings.live and not self.settings.dry_run else "DRY-RUN"
         allow = ", ".join(sorted(self.settings.portfolio_ids)[:2]) or "all"
@@ -1476,6 +1496,7 @@ class NotificationPoller:
             try:
                 actions = self.poll_once()
                 self._maybe_proactive_dex_renew()
+                self._maybe_prune_logs()
                 self._transient_failures = 0
                 if actions:
                     self._idle_polls = 0
