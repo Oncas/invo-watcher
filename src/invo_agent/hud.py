@@ -70,6 +70,51 @@ def pending_kind(summary: str | None = None, *, kind: str | None = None) -> str:
     return "OPEN"
 
 
+_PENDING_WAIT = {
+    "price": "entry-or-better",
+    "margin": "margin",
+    "same_coin": "same_coin",
+    "size": "under min",
+    "dust": "under min",
+    "below_hl_min": "under min",
+}
+
+
+def _fmt_px(px: float) -> str:
+    if abs(px) >= 1:
+        return f"{px:.4f}".rstrip("0").rstrip(".")
+    return f"{px:.6f}".rstrip("0").rstrip(".")
+
+
+def _pending_price_bound(side: str | None, trader_entry: float | None) -> str:
+    if trader_entry is None:
+        return ""
+    is_short = (side or "").lower().startswith("s")
+    op = "≥" if is_short else "≤"
+    return f" {op} {_fmt_px(float(trader_entry))}"
+
+
+def format_pending_reason(
+    *,
+    kind: str | None = None,
+    reason: str | None = None,
+    side: str | None = None,
+    trader_entry: float | None = None,
+    amount: float | None = None,
+) -> str:
+    """Queue label: wait reason, plus size↑ on leftover adds."""
+    raw = (reason or "").strip() or "?"
+    wait = _PENDING_WAIT.get(raw, raw)
+    if raw == "price":
+        wait = f"entry-or-better{_pending_price_bound(side, trader_entry)}"
+    if pending_kind(kind=kind) == "UPDATE":
+        amt = ""
+        if isinstance(amount, (int, float)) and amount > 0:
+            amt = f" +${float(amount):.2f}"
+        return f"size↑{amt} · {wait}"
+    return wait
+
+
 def pending_last_tried_age(pending: list[dict] | None) -> float | None:
     """Most recent drain attempt across the queue (they are tried together)."""
     ages = [
@@ -477,6 +522,7 @@ def collect_hud(
     now_hud = datetime.now(UTC)
     pending_rows: list[dict] = []
     for intent in db.list_pending_intents():
+        wait = intent.reason
         pending_rows.append(
             {
                 "coin": intent.coin,
@@ -485,7 +531,13 @@ def collect_hud(
                 "trader_entry": intent.trader_entry,
                 "trader": intent.trader or trader_from_summary(intent.summary),
                 "kind": "OPEN",
-                "reason": intent.reason,
+                "wait": wait,
+                "reason": format_pending_reason(
+                    kind="OPEN",
+                    reason=wait,
+                    side=intent.side,
+                    trader_entry=intent.trader_entry,
+                ),
                 "age_s": _age_seconds(intent.created_at, now_hud),
                 "last_tried_at": intent.last_tried_at,
                 "tried_age_s": _age_seconds(intent.last_tried_at, now_hud),
@@ -496,19 +548,29 @@ def collect_hud(
         add = float(copy.pending_add_notional or 0)
         if add <= 0 or not copy.ticker:
             continue
+        wait = copy.pending_add_reason or "size"
+        entry = copy.pending_add_entry or copy.our_entry_px
         pending_rows.append(
             {
                 "coin": copy.ticker.upper(),
                 "side": copy.side or "",
                 "leverage": copy.leverage,
-                "trader_entry": copy.pending_add_entry or copy.our_entry_px,
+                "trader_entry": entry,
                 "trader": copy.trader,
                 "kind": "UPDATE",
-                "reason": copy.pending_add_reason or "size",
+                "wait": wait,
+                "amount": add,
+                "reason": format_pending_reason(
+                    kind="UPDATE",
+                    reason=wait,
+                    side=copy.side,
+                    trader_entry=entry,
+                    amount=add,
+                ),
                 "age_s": _age_seconds(copy.pending_add_at or copy.opened_at, now_hud),
                 "last_tried_at": copy.pending_add_tried_at,
                 "tried_age_s": _age_seconds(copy.pending_add_tried_at, now_hud),
-                "summary": f"UPDATE {copy.ticker.upper()} size +${add:.2f}",
+                "summary": f"UPDATE {copy.ticker.upper()} size↑ +${add:.2f}",
             }
         )
     db.close()

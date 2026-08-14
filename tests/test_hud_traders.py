@@ -10,6 +10,7 @@ from invo_agent.hud import (
     _traders_by_coin,
     collect_hud,
     format_age,
+    format_pending_reason,
     load_hud_file,
     pending_kind,
     pending_last_tried_age,
@@ -27,6 +28,46 @@ def test_pending_last_tried_age() -> None:
     assert pending_last_tried_age([]) is None
     assert pending_last_tried_age([{"tried_age_s": 8}, {"tried_age_s": 2}]) == 2
     assert pending_last_tried_age([{"tried_age_s": None}]) is None
+
+
+def test_format_pending_reason() -> None:
+    assert format_pending_reason(kind="OPEN", reason="same_coin") == "same_coin"
+    assert format_pending_reason(kind="OPEN", reason="margin") == "margin"
+    assert format_pending_reason(kind="OPEN", reason="price") == "entry-or-better"
+    assert (
+        format_pending_reason(
+            kind="OPEN", reason="price", side="short", trader_entry=0.5
+        )
+        == "entry-or-better ≥ 0.5"
+    )
+    assert (
+        format_pending_reason(
+            kind="OPEN", reason="price", side="long", trader_entry=1881.0
+        )
+        == "entry-or-better ≤ 1881"
+    )
+    assert (
+        format_pending_reason(kind="UPDATE", reason="size", amount=0.98)
+        == "size↑ +$0.98 · under min"
+    )
+    assert (
+        format_pending_reason(kind="UPDATE", reason="dust", amount=1.01)
+        == "size↑ +$1.01 · under min"
+    )
+    assert (
+        format_pending_reason(kind="UPDATE", reason="margin", amount=12.5)
+        == "size↑ +$12.50 · margin"
+    )
+    assert (
+        format_pending_reason(
+            kind="UPDATE",
+            reason="price",
+            side="short",
+            trader_entry=0.055,
+            amount=12.0,
+        )
+        == "size↑ +$12.00 · entry-or-better ≥ 0.055"
+    )
 
 
 def test_format_age() -> None:
@@ -229,6 +270,20 @@ def test_collect_hud_pending_includes_trader(tmp_path: Path) -> None:
             summary="UPDATE SOL LONG 20x @beta_trader ShortIdC03",
         )
     )
+    db.upsert_pending_intent(
+        PendingIntent(
+            investment_base_id="xrp",
+            coin="XRP",
+            side="short",
+            reason="price",
+            created_at=now,
+            updated_at=now,
+            leverage=20,
+            trader="alpha_trader",
+            trader_entry=0.5,
+            summary="OPEN XRP SHORT 20x @alpha_trader",
+        )
+    )
     db.upsert_open_copy(
         investment_base_id="dot",
         base_short_id="Rq48",
@@ -251,8 +306,13 @@ def test_collect_hud_pending_includes_trader(tmp_path: Path) -> None:
     assert by_coin["BTC"]["last_tried_at"] == "2026-08-13T12:00:10+00:00"
     assert by_coin["BTC"]["tried_age_s"] is not None
     assert by_coin["SOL"]["kind"] == "OPEN"
+    assert by_coin["XRP"]["kind"] == "OPEN"
+    assert by_coin["XRP"]["wait"] == "price"
+    assert by_coin["XRP"]["reason"] == "entry-or-better ≥ 0.5"
     assert by_coin["DOT"]["kind"] == "UPDATE"
-    assert by_coin["DOT"]["reason"] == "size"
+    assert by_coin["DOT"]["wait"] == "size"
+    assert by_coin["DOT"]["amount"] == 12.5
+    assert by_coin["DOT"]["reason"] == "size↑ +$12.50 · under min"
 
     db = AgentDB(settings.db_path)
     copy = db.get_open_copy("eth")

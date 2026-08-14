@@ -23,7 +23,12 @@ from invo_agent.dex.session import (
     refresh_dex_session,
     session_ttl_remaining_seconds,
 )
-from invo_agent.hud import format_age, pending_kind, pending_last_tried_age
+from invo_agent.hud import (
+    format_age,
+    format_pending_reason,
+    pending_kind,
+    pending_last_tried_age,
+)
 from invo_agent.labels import tags_from_summary
 from invo_agent.logging_setup import setup_logging
 from invo_agent.notify import ensure_alerter, find_alerter, notify_mac
@@ -219,7 +224,12 @@ def status_cmd() -> None:
                 f"@{intent.trader}" if intent.trader else "?",
                 intent.side,
                 f"{intent.trader_entry:g}" if intent.trader_entry is not None else "?",
-                intent.reason,
+                format_pending_reason(
+                    kind="OPEN",
+                    reason=intent.reason,
+                    side=intent.side,
+                    trader_entry=intent.trader_entry,
+                ),
                 age,
                 (intent.summary or "")[:48],
             )
