@@ -73,3 +73,6 @@ fi
 echo "==> healthy"
 curl -sS -H "Authorization: Bearer ${TOKEN}" "http://127.0.0.1:${PORT}/v1/health"
 echo
+
+echo "==> check HUD 24h PnL vs Involio rule"
+.venv/bin/invo-agent check-hud-pnl

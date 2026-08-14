@@ -1,8 +1,11 @@
 from invo_agent.hud import (
+    PNL_RULE,
+    RollingPnl,
     _PNL_BASELINE_MAX_LAG_MS,
     _account_value_samples,
     _baseline_at_window_start,
     _usable_baseline,
+    pnl_served_matches_fresh,
 )
 
 
@@ -61,3 +64,61 @@ def test_involio_pct_matches_header_formula() -> None:
     assert round(pct, 2) == 9.09
 
 
+def test_served_pnl_allows_mark_move_on_same_baseline() -> None:
+    fresh = RollingPnl(
+        pnl=10.0,
+        pct=9.09,
+        baseline_ms=1700075600000,
+        baseline_equity=60.0,
+        net_flow=50.0,
+        gross_in=50.0,
+    )
+    # Equity ticked +$1.50; 24h $ must move by the same amount.
+    err = pnl_served_matches_fresh(
+        served_equity=121.5,
+        served_pnl=11.5,
+        served_baseline_ms=fresh.baseline_ms,
+        served_rule=PNL_RULE,
+        fresh=fresh,
+    )
+    assert err is None
+
+
+def test_served_pnl_rejects_old_6h_baseline() -> None:
+    fresh = RollingPnl(
+        pnl=10.0,
+        pct=9.09,
+        baseline_ms=1700075600000,
+        baseline_equity=60.0,
+        net_flow=50.0,
+        gross_in=50.0,
+    )
+    err = pnl_served_matches_fresh(
+        served_equity=120.0,
+        served_pnl=20.0,
+        served_baseline_ms=1700046500000,
+        served_rule=PNL_RULE,
+        fresh=fresh,
+    )
+    assert err is not None
+    assert "baseline" in err
+
+
+def test_served_pnl_rejects_missing_rule() -> None:
+    fresh = RollingPnl(
+        pnl=5.0,
+        pct=4.2,
+        baseline_ms=1,
+        baseline_equity=60.0,
+        net_flow=0.0,
+        gross_in=0.0,
+    )
+    err = pnl_served_matches_fresh(
+        served_equity=65.0,
+        served_pnl=5.0,
+        served_baseline_ms=1,
+        served_rule=None,
+        fresh=fresh,
+    )
+    assert err is not None
+    assert "pnl_rule" in err

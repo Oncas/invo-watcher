@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 
 import typer
@@ -395,6 +396,23 @@ def migrate_cmd() -> None:
         f"[green]migrate[/green] tagged={stats['tagged']} "
         f"traders={stats['traders']} meta_dropped={stats['meta_dropped']}"
     )
+
+
+@app.command("check-hud-pnl")
+def check_hud_pnl_cmd() -> None:
+    """Fail if the running HUD 24h number is not the Involio first-after rule."""
+    from invo_agent.hud import check_local_hud_pnl
+
+    settings = get_settings()
+    last_err = "check did not run"
+    for _ in range(3):
+        last_err = check_local_hud_pnl(settings)
+        if last_err is None:
+            console.print("[green]check-hud-pnl[/green] HUD matches Involio 24h rule")
+            return
+        time.sleep(1)
+    console.print(f"[red]check-hud-pnl[/red] {last_err}")
+    raise typer.Exit(1)
 
 
 def _run_poll_loop(*, force_dry_run: bool) -> None:

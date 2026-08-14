@@ -14,6 +14,8 @@ from invo_agent.labels import tags_from_summary, trader_from_summary
 
 # How often to refresh Hyperliquid mark/PnL (network call).
 PNL_CACHE_SECONDS = 5.0
+# Involio PnlService.getBaselineAtWindowStart — do not pin or 6h-lag-pick.
+PNL_RULE = "first_at_or_after"
 
 
 @dataclass
@@ -49,6 +51,8 @@ class HudSnapshot:
     positions: list[PositionRow] = field(default_factory=list)
     pnl_updated_at: str | None = None
     pending: list[dict] = field(default_factory=list)
+    pnl_baseline_ms: int | None = None
+    pnl_rule: str | None = None
 
 
 def hud_path(settings: Settings) -> Path:
@@ -157,7 +161,18 @@ def _account_value_samples(portfolio: object) -> list[tuple[int, float]]:
 # Involio PnlService.getBaselineAtWindowStart (main.dart.js): first perp
 # print at or after T−24h. The 6h lag (216e5 ms) is a staleness gate that
 # *hides* PnL when only an older fallback exists — it is not a picker.
+# Recompute every fetch (no pin). That matches a refreshed wallet header.
 _PNL_BASELINE_MAX_LAG_MS = 21_600_000
+
+
+@dataclass(frozen=True)
+class RollingPnl:
+    pnl: float
+    pct: float
+    baseline_ms: int
+    baseline_equity: float
+    net_flow: float
+    gross_in: float
 
 
 def _baseline_at_window_start(
@@ -242,7 +257,7 @@ def _involio_rolling_24h_pnl(
     trader: object,
     address: str,
     equity: float,
-) -> tuple[float, float] | None:
+) -> RollingPnl | None:
     """Match Involio AccountHeader rolling-24h PnL.
 
     pnl = equity − baseline − net_external_flows
@@ -282,7 +297,40 @@ def _involio_rolling_24h_pnl(
     denom = baseline_equity + gross_in
     if abs(denom) <= 1e-9:
         return None
-    return pnl, (pnl / denom) * 100.0
+    return RollingPnl(
+        pnl=pnl,
+        pct=(pnl / denom) * 100.0,
+        baseline_ms=baseline_ms,
+        baseline_equity=baseline_equity,
+        net_flow=net_flow,
+        gross_in=gross_in,
+    )
+
+
+def pnl_served_matches_fresh(
+    *,
+    served_equity: float | None,
+    served_pnl: float | None,
+    served_baseline_ms: int | None,
+    served_rule: str | None,
+    fresh: RollingPnl,
+    max_drift: float = 0.05,
+) -> str | None:
+    """None if the served HUD header uses the same Involio window as ``fresh``.
+
+    Marks can move between fetches. Same baseline + flows means
+    Δpnl must equal Δequity.
+    """
+    if served_rule != PNL_RULE:
+        return f"pnl_rule {served_rule!r} != {PNL_RULE!r}"
+    if served_baseline_ms != fresh.baseline_ms:
+        return f"baseline {served_baseline_ms} != {fresh.baseline_ms}"
+    if served_equity is None or served_pnl is None:
+        return "served equity/pnl missing"
+    expected = served_equity - fresh.baseline_equity - fresh.net_flow
+    if abs(served_pnl - expected) > max_drift:
+        return f"pnl {served_pnl:.4f} != {expected:.4f} (same window)"
+    return None
 
 
 def _load_pnl_cache(settings: Settings) -> dict | None:
@@ -295,6 +343,8 @@ def _load_pnl_cache(settings: Settings) -> dict | None:
         return None
     fetched = float(data.get("fetched_at") or 0)
     if time.time() - fetched > PNL_CACHE_SECONDS:
+        return None
+    if data.get("pnl_rule") != PNL_RULE:
         return None
     return data
 
@@ -313,6 +363,8 @@ def _fetch_hl_pnl(settings: Settings) -> dict:
         "equity": None,
         "pnl_24h": None,
         "pnl_24h_pct": None,
+        "pnl_baseline_ms": None,
+        "pnl_rule": PNL_RULE,
         "positions": [],
         "error": None,
     }
@@ -346,7 +398,9 @@ def _fetch_hl_pnl(settings: Settings) -> dict:
         out["positions"] = rows
         rolling = _involio_rolling_24h_pnl(trader, data.master_address, equity)
         if rolling is not None:
-            out["pnl_24h"], out["pnl_24h_pct"] = rolling
+            out["pnl_24h"] = rolling.pnl
+            out["pnl_24h_pct"] = rolling.pct
+            out["pnl_baseline_ms"] = rolling.baseline_ms
         trader.close()
         signer.close()
     except DexSessionError as exc:
@@ -464,6 +518,8 @@ def collect_hud(
     pnl_24h: float | None = None
     pnl_24h_pct: float | None = None
     pnl_updated_at: str | None = None
+    pnl_baseline_ms: int | None = None
+    pnl_rule: str | None = None
     if with_pnl:
         pnl = _fetch_hl_pnl(settings)
         equity = pnl.get("equity")
@@ -471,6 +527,10 @@ def collect_hud(
         raw_pct = pnl.get("pnl_24h_pct")
         pnl_24h = float(raw_24) if raw_24 is not None else None
         pnl_24h_pct = float(raw_pct) if raw_pct is not None else None
+        raw_base = pnl.get("pnl_baseline_ms")
+        pnl_baseline_ms = int(raw_base) if raw_base is not None else None
+        raw_rule = pnl.get("pnl_rule")
+        pnl_rule = str(raw_rule) if raw_rule else None
         if pnl.get("fetched_at"):
             pnl_updated_at = datetime.fromtimestamp(
                 float(pnl["fetched_at"]), tz=UTC
@@ -506,6 +566,8 @@ def collect_hud(
         positions=positions,
         pnl_updated_at=pnl_updated_at,
         pending=pending_rows,
+        pnl_baseline_ms=pnl_baseline_ms,
+        pnl_rule=pnl_rule,
     )
 
 
@@ -574,3 +636,52 @@ def format_pnl_24h(pnl: float, pct: float | None = None) -> str:
         bits.append(f"{sign}{pct:.2f}%")
     bits.append(format_pnl(pnl))
     return f"{' · '.join(bits)} 24h"
+
+
+def check_local_hud_pnl(settings: Settings) -> str | None:
+    """Compare the running /v1/hud 24h header to a fresh Involio-rule compute."""
+    import urllib.error
+    import urllib.request
+
+    from invo_agent.dex.hl_trader import HlTrader
+    from invo_agent.dex.session import DexSessionStore, load_signer
+
+    if not settings.hud_token:
+        return "HUD_TOKEN unset"
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{settings.hud_port}/v1/hud",
+        headers={"Authorization": f"Bearer {settings.hud_token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            served = json.loads(resp.read().decode())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        return f"hud fetch failed: {exc}"
+    if not isinstance(served, dict):
+        return "hud payload is not an object"
+
+    store = DexSessionStore(settings.dex_session_path)
+    data, signer = load_signer(store)
+    trader = HlTrader(signer, data.master_address)
+    try:
+        state = trader.info.user_state(data.master_address)
+        summary = state.get("marginSummary") or state.get("crossMarginSummary") or {}
+        equity = float(summary.get("accountValue") or 0)
+        fresh = _involio_rolling_24h_pnl(trader, data.master_address, equity)
+    finally:
+        trader.close()
+        signer.close()
+    if fresh is None:
+        return "fresh Involio 24h PnL unavailable"
+    raw_base = served.get("pnl_baseline_ms")
+    try:
+        served_baseline_ms = int(raw_base) if raw_base is not None else None
+    except (TypeError, ValueError):
+        served_baseline_ms = None
+    return pnl_served_matches_fresh(
+        served_equity=served.get("equity"),
+        served_pnl=served.get("pnl_24h"),
+        served_baseline_ms=served_baseline_ms,
+        served_rule=served.get("pnl_rule"),
+        fresh=fresh,
+    )
