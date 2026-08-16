@@ -31,8 +31,14 @@ class _FakeTrader:
     def position_detail(self, coin: str):
         return None
 
+    def position_size(self, coin: str):
+        return (80.0, True)
 
-def _inv(*, base_id, entry_size=0.4, entry_price=0.181, leverage=10):
+    def update_leverage(self, *args, **kwargs):
+        self.orders.append({"kind": "leverage", **kwargs})
+
+
+def _inv(*, base_id, entry_size=40.0, entry_price=0.181, leverage=10):
     return InvestmentUpdate.model_validate(
         {
             "baseId": str(base_id),
@@ -45,6 +51,99 @@ def _inv(*, base_id, entry_size=0.4, entry_price=0.181, leverage=10):
             "changes": {"simIncrease": True, "entrySize": 0.16},
         }
     )
+
+
+def test_pending_add_drain_does_not_touch_tpsl(tmp_path) -> None:
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=False,
+        dry_run=True,
+        min_order_usd=1.0,
+        hl_min_order_usd=10.0,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="adaShort",
+        ticker="ADA",
+        portfolio_id=None,
+        notification_id="n1",
+        side="long",
+        size=80.0,
+        leverage=10,
+        trader="alpha_trader",
+    )
+    db.set_pending_add_notional(str(base_id), 25.0, entry=0.181, reason="margin")
+    exe = DexExecutor(settings, db=db)
+    exe._sync_tpsl = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("drain must not sync TP/SL")
+    )
+    trader = _FakeTrader(mid=0.20, available=0.0)
+    notif = Notification.model_validate(
+        {
+            "id": str(uuid4()),
+            "content": "queued UPDATE ADA size +$25.00",
+            "notificationType": "user_updated_investment",
+            "createdAt": datetime.now(UTC).isoformat(),
+            "investmentBaseId": str(base_id),
+            "notifier": {"username": "alpha_trader"},
+        }
+    )
+    action = TradeAction(
+        action=ActionType.UPDATE,
+        notification=notif,
+        investment=_inv(base_id=base_id),
+        reason="pending_add_drain",
+    )
+    exe._update(action, trader, 100.0)  # type: ignore[arg-type]
+    assert trader.orders == []
+    copy = db.get_open_copy(str(base_id))
+    assert copy is not None
+    assert copy.pending_add_reason == "margin"
+    db.close()
+
+
+def test_action_from_pending_add_is_drain(tmp_path) -> None:
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=False,
+        dry_run=True,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = str(uuid4())
+    db.upsert_open_copy(
+        investment_base_id=base_id,
+        base_short_id="ShortIdD04",
+        ticker="HEMI",
+        portfolio_id=None,
+        notification_id="n1",
+        trader="alpha_trader",
+    )
+    db.set_pending_add_notional(base_id, 49.0, reason="margin")
+    copy = db.get_open_copy(base_id)
+    assert copy is not None
+    poller = NotificationPoller(
+        client=SimpleNamespace(session=None),
+        db=db,
+        settings=settings,
+        session_store=SimpleNamespace(),
+    )  # type: ignore[arg-type]
+    inv = InvestmentUpdate.model_validate(
+        {
+            "baseId": base_id,
+            "baseShortId": "ShortIdD04",
+            "ticker": "HEMI",
+            "directionLong": False,
+            "leverage": 3,
+            "entrySize": 0.3,
+        }
+    )
+    action = poller._action_from_pending_add(copy, inv)
+    assert action.reason == "pending_add_drain"
+    db.close()
 
 
 def test_size_increase_queues_when_no_margin(tmp_path) -> None:
@@ -273,4 +372,57 @@ def test_refresh_pending_skips_when_already_open(tmp_path) -> None:
         session_store=SimpleNamespace(),
     )  # type: ignore[arg-type]
     assert poller._refresh_pending_from_update(action) is False
+    db.close()
+
+
+def test_queued_ready_locally_price_and_margin() -> None:
+    from invo_agent.dex.pricing import queued_ready_locally
+
+    assert queued_ready_locally(
+        reason="price", mid=0.18, trader_entry=0.20, is_long=True
+    )
+    assert not queued_ready_locally(
+        reason="price", mid=0.22, trader_entry=0.20, is_long=True
+    )
+    assert not queued_ready_locally(
+        reason="margin", available=0.0, leverage=10, hl_min_order_usd=10, min_order_usd=1
+    )
+    assert queued_ready_locally(
+        reason="margin", available=5.0, leverage=10, hl_min_order_usd=10, min_order_usd=1
+    )
+    assert not queued_ready_locally(
+        reason="size", leftover_notional=4.0, hl_min_order_usd=10
+    )
+    assert queued_ready_locally(
+        reason="size", leftover_notional=12.0, hl_min_order_usd=10
+    )
+    assert queued_ready_locally(reason="same_coin", coin_free=True)
+    assert not queued_ready_locally(reason="same_coin", coin_free=False)
+
+
+def test_should_attempt_queued_local_or_fallback(tmp_path) -> None:
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=False,
+        dry_run=True,
+    )
+    db = AgentDB(settings.db_path)
+    poller = NotificationPoller(
+        client=SimpleNamespace(session=None),
+        db=db,
+        settings=settings,
+        session_store=SimpleNamespace(),
+    )  # type: ignore[arg-type]
+    recent = datetime.now(UTC).isoformat()
+    assert poller._should_attempt_queued(
+        reason="margin", last_tried_at=recent, local_ok=True
+    )
+    assert not poller._should_attempt_queued(
+        reason="margin", last_tried_at=recent, local_ok=False
+    )
+    stale = (datetime.now(UTC) - timedelta(minutes=20)).isoformat()
+    assert poller._should_attempt_queued(
+        reason="margin", last_tried_at=stale, local_ok=False
+    )
     db.close()

@@ -198,6 +198,42 @@ class AgentDB:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def unmark_rate_limited_errors(self, *, max_age_seconds: float = 120) -> list[str]:
+        """Re-open a fresh ERROR_CLOSE that hit the HL request cap (not stale ones)."""
+        rows = self._conn.execute(
+            """
+            SELECT notification_id, action, summary, processed_at
+            FROM processed_notifications
+            WHERE action = 'ERROR_CLOSE'
+            """
+        ).fetchall()
+        ids: list[str] = []
+        now = datetime.now(UTC)
+        for row in rows:
+            blob = f"{row['action']} {row['summary'] or ''}".lower()
+            if (
+                "too many cumulative requests" not in blob
+                and "too many requests" not in blob
+            ):
+                continue
+            raw = row["processed_at"]
+            try:
+                processed = datetime.fromisoformat(str(raw))
+            except (TypeError, ValueError):
+                continue
+            if processed.tzinfo is None:
+                processed = processed.replace(tzinfo=UTC)
+            age = (now - processed.astimezone(UTC)).total_seconds()
+            if age <= max_age_seconds:
+                ids.append(str(row["notification_id"]))
+        if ids:
+            self._conn.executemany(
+                "DELETE FROM processed_notifications WHERE notification_id = ?",
+                [(nid,) for nid in ids],
+            )
+            self._conn.commit()
+        return ids
+
     def unmark_processed_matching(self, action_prefix: str) -> list[str]:
         rows = self._conn.execute(
             "SELECT notification_id FROM processed_notifications WHERE action LIKE ?",

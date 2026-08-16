@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -21,6 +23,114 @@ from invo_agent.dex.turnkey_client import TurnkeySigner
 
 class HlTraderError(RuntimeError):
     pass
+
+
+# Returned by sync_position_tpsl when resting TP/SL already match — no HL write.
+TPSL_UNCHANGED = "unchanged"
+
+
+def _order_tpsl_kind(order: dict[str, Any]) -> str | None:
+    raw = order.get("tpsl")
+    if raw in ("tp", "sl"):
+        return str(raw)
+    order_type = order.get("orderType")
+    if isinstance(order_type, dict):
+        trigger = order_type.get("trigger") or {}
+        raw = trigger.get("tpsl")
+        if raw in ("tp", "sl"):
+            return str(raw)
+    if isinstance(order_type, str):
+        low = order_type.lower()
+        if "take profit" in low:
+            return "tp"
+        if "stop" in low:
+            return "sl"
+    return None
+
+
+def _order_trigger_px(order: dict[str, Any]) -> float | None:
+    for key in ("triggerPx", "trigger_px"):
+        raw = order.get(key)
+        if raw is None:
+            continue
+        try:
+            px = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if px > 0:
+            return px
+    order_type = order.get("orderType")
+    if isinstance(order_type, dict):
+        trigger = order_type.get("trigger") or {}
+        raw = trigger.get("triggerPx")
+        if raw is not None:
+            try:
+                px = float(raw)
+            except (TypeError, ValueError):
+                return None
+            if px > 0:
+                return px
+    return None
+
+
+def _order_trigger_sz(order: dict[str, Any]) -> float | None:
+    raw = order.get("sz") or order.get("origSz")
+    if raw is None:
+        return None
+    try:
+        sz = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return sz if sz > 0 else None
+
+
+def resting_tpsl(orders: list[dict[str, Any]] | None, coin: str) -> tuple[
+    float | None, float | None, float | None
+]:
+    """Return (tp_px, sl_px, trigger_sz) for reduce triggers on coin."""
+    coin_u = coin.upper()
+    tp: float | None = None
+    sl: float | None = None
+    sz: float | None = None
+    for order in orders or []:
+        if str(order.get("coin") or "").upper() != coin_u:
+            continue
+        if not (order.get("isTrigger") or order.get("isPositionTpsl")):
+            continue
+        kind = _order_tpsl_kind(order)
+        px = _order_trigger_px(order)
+        trig_sz = _order_trigger_sz(order)
+        if trig_sz is not None:
+            sz = trig_sz
+        if kind == "tp":
+            tp = px
+        elif kind == "sl":
+            sl = px
+    return tp, sl, sz
+
+
+def tpsl_already_resting(
+    *,
+    have_tp: float | None,
+    have_sl: float | None,
+    have_sz: float | None,
+    want_tp: float | None,
+    want_sl: float | None,
+    want_sz: float | None,
+) -> bool:
+    def _eq(left: float | None, right: float | None) -> bool:
+        if left is None and right is None:
+            return True
+        if left is None or right is None:
+            return False
+        scale = max(abs(left), abs(right), 1e-12)
+        return abs(left - right) <= max(1e-8, 1e-6 * scale)
+
+    if not _eq(have_tp, want_tp) or not _eq(have_sl, want_sl):
+        return False
+    if want_sz is not None and have_sz is not None and not _eq(have_sz, want_sz):
+        return False
+    return True
 
 
 class InsufficientMarginError(HlTraderError):
@@ -65,6 +175,16 @@ class GhostCopyError(HlTraderError):
     pass
 
 
+@dataclass
+class HlBookSnapshot:
+    """Last info-API read: mids + free margin. Not an order."""
+
+    mids: dict[str, float]
+    available: float
+    equity: float
+    at: float
+
+
 class TurnkeyWalletAdapter:
     """Minimal wallet duck-type for hyperliquid sign_inner / LocalAccount.sign_message."""
 
@@ -84,9 +204,37 @@ class HlTrader:
         self.base_url = constants.MAINNET_API_URL if mainnet else constants.TESTNET_API_URL
         self.info = Info(self.base_url, skip_ws=True)
         self._http = httpx.Client(timeout=30.0)
+        self._book: HlBookSnapshot | None = None
 
     def close(self) -> None:
         self._http.close()
+
+    def refresh_book(self) -> HlBookSnapshot:
+        """One all_mids + user_state. Used to decide drains without placing."""
+        raw_mids = self.info.all_mids() or {}
+        mids = {str(k).upper(): float(v) for k, v in raw_mids.items() if v is not None}
+        state = self.info.user_state(self.address)
+        summary = state.get("crossMarginSummary") or state.get("marginSummary") or {}
+        equity = float(summary.get("accountValue") or 0)
+        used = float(summary.get("totalMarginUsed") or 0)
+        self._book = HlBookSnapshot(
+            mids=mids,
+            available=max(0.0, equity - used),
+            equity=equity,
+            at=time.monotonic(),
+        )
+        return self._book
+
+    def cached_mid(self, coin: str) -> float | None:
+        if self._book is None:
+            return None
+        px = self._book.mids.get(coin.upper())
+        return float(px) if px is not None and float(px) > 0 else None
+
+    def cached_available(self) -> float | None:
+        if self._book is None:
+            return None
+        return float(self._book.available)
 
     def account_value(self) -> float:
         state = self.info.user_state(self.address)
@@ -269,9 +417,15 @@ class HlTrader:
             }
         return None
 
-    def cancel_reduce_triggers(self, coin: str) -> list[int]:
+    def cancel_reduce_triggers(
+        self, coin: str, orders: list[dict[str, Any]] | None = None
+    ) -> list[int]:
         """Cancel open trigger / position TP-SL orders for coin. Returns cancelled oids."""
-        orders = self.info.frontend_open_orders(self.address)
+        orders = (
+            orders
+            if orders is not None
+            else self.info.frontend_open_orders(self.address)
+        )
         cancelled: list[int] = []
         for order in orders or []:
             if order.get("coin") != coin:
@@ -337,7 +491,7 @@ class HlTrader:
         sz: float,
         tp_px: float,
         sl_px: float,
-    ) -> tuple[dict[str, Any], dict[str, Any], int]:
+    ) -> tuple[dict[str, Any], dict[str, Any], int] | str:
         """Cancel existing triggers, then place reduce-only TP+SL as positionTpsl."""
         return self.sync_position_tpsl(
             coin, is_long=is_long, sz=sz, tp_px=tp_px, sl_px=sl_px
@@ -353,22 +507,44 @@ class HlTrader:
         sl_px: float | None,
         tp_cloid: Cloid | None = None,
         sl_cloid: Cloid | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any], int] | None:
+    ) -> tuple[dict[str, Any], dict[str, Any], int] | str | None:
         """Cancel existing reduce triggers, then place whatever TP/SL legs are set.
 
-        Returns (hl_order, response, nonce) when at least one leg is placed, else None
-        after a clear-only cancel.
+        Returns (hl_order, response, nonce) when at least one leg is placed,
+        ``TPSL_UNCHANGED`` when resting triggers already match, or None after a
+        clear-only cancel.
         """
-        self.cancel_reduce_triggers(coin)
         sz = self.round_size(coin, sz)
+        want_tp = (
+            self.round_price(coin, float(tp_px))
+            if tp_px is not None and float(tp_px) > 0
+            else None
+        )
+        want_sl = (
+            self.round_price(coin, float(sl_px))
+            if sl_px is not None and float(sl_px) > 0
+            else None
+        )
+        open_orders = self.info.frontend_open_orders(self.address)
+        have_tp, have_sl, have_sz = resting_tpsl(open_orders, coin)
+        if tpsl_already_resting(
+            have_tp=have_tp,
+            have_sl=have_sl,
+            have_sz=have_sz,
+            want_tp=want_tp,
+            want_sl=want_sl,
+            want_sz=sz,
+        ):
+            return TPSL_UNCHANGED
+        self.cancel_reduce_triggers(coin, open_orders)
         if sz <= 0:
             raise HlTraderError(f"Size rounded to zero for {coin}")
 
         legs: list[tuple[float, str, Cloid | None]] = []
-        if tp_px is not None and float(tp_px) > 0:
-            legs.append((self.round_price(coin, float(tp_px)), "tp", tp_cloid))
-        if sl_px is not None and float(sl_px) > 0:
-            legs.append((self.round_price(coin, float(sl_px)), "sl", sl_cloid))
+        if want_tp is not None:
+            legs.append((want_tp, "tp", tp_cloid))
+        if want_sl is not None:
+            legs.append((want_sl, "sl", sl_cloid))
         if not legs:
             return None
 

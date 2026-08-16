@@ -223,7 +223,7 @@ MIN_ORDER_USD=1
 invo-agent run
 ```
 
-**Sizing:** each OPEN copies the source trader’s `entrySize` (portfolio %) as margin % of *your* HL equity. If that would make order notional (`margin × leverage`) below `HL_MIN_ORDER_USD` ($10), it bids the % up to clear that floor. `POSITION_PCT` is only used when `entrySize` is missing.
+**Sizing:** each OPEN copies the source trader’s `entrySize` as percent of *your* HL equity (Involio `0.8` = 0.8%, `1` = 1%, `12` = 12% — not a 0–1 fraction). If that would make order notional (`margin × leverage`) below `HL_MIN_ORDER_USD` ($10), it bids the % up to clear that floor. `POSITION_PCT` is only used when `entrySize` is missing.
 
 `size ≈ (margin × leverage) / mid_price`
 

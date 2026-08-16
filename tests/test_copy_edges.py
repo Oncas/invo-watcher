@@ -8,7 +8,12 @@ from invo_agent.api.models import ActionType, InvestmentUpdate, Notification, Tr
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB
 from invo_agent.dex.executor import DexExecutor
-from invo_agent.dex.hl_trader import GhostCopyError, SideMismatchError
+from invo_agent.dex.hl_trader import (
+    GhostCopyError,
+    HlTraderError,
+    SideMismatchError,
+    tpsl_already_resting,
+)
 from invo_agent.engine import CopyEngine
 from invo_agent.labels import format_recent_line, update_labels
 from invo_agent.poller import NotificationPoller
@@ -87,6 +92,21 @@ def _cut_inv(*, base_id, entry_size=0.1, prev=0.4, leverage=10):
     )
 
 
+def test_entry_size_is_percent_not_fraction(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    exe = DexExecutor(settings)
+    assert exe._trader_allocation_pct(0.801) == 0.801
+    assert exe._trader_allocation_pct(0.10) == 0.10
+    assert exe._trader_allocation_pct(1.0) == 1.0
+    assert exe._trader_allocation_pct(12.54) == 12.54
+    assert exe._trader_allocation_pct(101.0) is None
+    _margin, meta = exe._resolve_margin(equity=100.0, leverage=5, entry_size=0.801)
+    assert meta["trader_pct"] == 0.801
+    assert meta["bumped_to_hl_min"] is True
+    assert meta["order_notional_usd"] == 10.0
+    assert meta["capped"] is False
+
+
 def test_size_cut_reduces_and_cancels_pending(tmp_path) -> None:
     settings = _settings(tmp_path)
     db = AgentDB(settings.db_path)
@@ -105,17 +125,13 @@ def test_size_cut_reduces_and_cancels_pending(tmp_path) -> None:
     db.set_pending_add_notional(str(base_id), 25.0, reason="margin")
     exe = DexExecutor(settings, db=db)
     trader = _FakeTrader(mid=0.20, available=80.0, pos=(200.0, True))
-    # current notional 40; target 10% * 100 * 10 = 100? entry 0.1 → 10% * 100 equity * 10 lev = 100
-    # that's an increase. Use entry 0.05 → target 50. current 200*0.2=40. That's still up.
-    # current 200 * 0.20 = 40. Target entry 0.1, equity 100, lev 10 → 100. Still up.
-    # Need current > target: size 400, mid 0.20 → 80. entry 0.1 → target 100. still up.
-    # size 600, mid 0.20 → 120. entry 0.1 → target 100. sell 20. Good.
+    # size 600, mid 0.20 → $120. entrySize 10 = 10% → target $100. sell $20.
     db.set_open_copy_fill(
         str(base_id), our_entry_px=0.20, side="long", size=600.0, leverage=10
     )
     sz, sub = exe._apply_size_decrease(
         trader,  # type: ignore[arg-type]
-        inv=_cut_inv(base_id=base_id, entry_size=0.1, prev=0.4),
+        inv=_cut_inv(base_id=base_id, entry_size=10.0, prev=40.0),
         coin="ADA",
         is_long=True,
         current_sz=600.0,
@@ -148,10 +164,10 @@ def test_size_cut_below_hl_min_flattens(tmp_path) -> None:
     )
     exe = DexExecutor(settings, db=db)
     trader = _FakeTrader(mid=0.20, available=80.0, pos=None, coins=set())
-    # entry 0.005 → 0.5% of 100 * 10 lev = $5 < $10 → flatten
+    # entry 0.5 → 0.5% of 100 * 10 lev = $5 < $10 → flatten
     sz, sub = exe._apply_size_decrease(
         trader,  # type: ignore[arg-type]
-        inv=_cut_inv(base_id=base_id, entry_size=0.005, prev=0.4),
+        inv=_cut_inv(base_id=base_id, entry_size=0.5, prev=40.0),
         coin="ADA",
         is_long=True,
         current_sz=80.0,
@@ -188,7 +204,7 @@ def test_size_add_dust_leftover_stays(tmp_path) -> None:
             "ticker": "ADA",
             "directionLong": True,
             "leverage": 10,
-            "entrySize": 0.028,
+            "entrySize": 2.8,
             "entryPrice": 0.20,
             "changes": {"simIncrease": True, "entrySize": 0.16},
         }
@@ -311,6 +327,159 @@ def test_close_side_mismatch_keeps_copy(tmp_path) -> None:
     assert db.get_open_copy(str(base_id)) is not None
     assert db.is_processed(str(notif.id))
     db.close()
+
+
+def _rate_limit_exc() -> HlTraderError:
+    return HlTraderError(
+        "HL close not ok: Too many cumulative requests sent (35804 > 34878)"
+    )
+
+
+def _close_action(*, created: datetime) -> tuple[Notification, TradeAction]:
+    notif = Notification.model_validate(
+        {
+            "id": str(uuid4()),
+            "content": "x",
+            "notificationType": "user_sold_investment",
+            "createdAt": created.isoformat(),
+            "investmentBaseId": str(uuid4()),
+            "notifier": {"username": "delta_trader"},
+        }
+    )
+    inv = InvestmentUpdate.model_validate(
+        {
+            "baseId": str(notif.investment_base_id),
+            "baseShortId": "ShortIdF06",
+            "ticker": "UNI",
+            "directionLong": False,
+        }
+    )
+    return notif, TradeAction(
+        action=ActionType.CLOSE, notification=notif, investment=inv
+    )
+
+
+def test_rate_limit_close_is_not_marked_processed(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    notif, action = _close_action(created=datetime.now(UTC))
+    poller = NotificationPoller(
+        client=SimpleNamespace(session=None),
+        db=db,
+        settings=settings,
+        session_store=SimpleNamespace(),
+    )  # type: ignore[arg-type]
+    poller._record_executor_error(str(notif.id), action, _rate_limit_exc())
+    assert not db.is_processed(str(notif.id))
+    db.close()
+
+
+def test_stale_rate_limit_close_is_marked_processed(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    notif, action = _close_action(created=datetime.now(UTC) - timedelta(hours=1))
+    poller = NotificationPoller(
+        client=SimpleNamespace(session=None),
+        db=db,
+        settings=settings,
+        session_store=SimpleNamespace(),
+    )  # type: ignore[arg-type]
+    poller._record_executor_error(str(notif.id), action, _rate_limit_exc())
+    assert db.is_processed(str(notif.id))
+    db.close()
+
+
+def test_rate_limit_update_is_marked_processed(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    notif = Notification.model_validate(
+        {
+            "id": str(uuid4()),
+            "content": "x",
+            "notificationType": "user_updated_investment",
+            "createdAt": datetime.now(UTC).isoformat(),
+            "investmentBaseId": str(uuid4()),
+        }
+    )
+    inv = InvestmentUpdate.model_validate(
+        {
+            "baseId": str(notif.investment_base_id),
+            "baseShortId": "ShortIdD04",
+            "ticker": "HEMI",
+            "directionLong": False,
+        }
+    )
+    action = TradeAction(action=ActionType.UPDATE, notification=notif, investment=inv)
+    poller = NotificationPoller(
+        client=SimpleNamespace(session=None),
+        db=db,
+        settings=settings,
+        session_store=SimpleNamespace(),
+    )  # type: ignore[arg-type]
+    poller._record_executor_error(str(notif.id), action, _rate_limit_exc())
+    assert db.is_processed(str(notif.id))
+    db.close()
+
+
+def test_migrate_unmarks_only_fresh_rate_limited_close(tmp_path) -> None:
+    from invo_agent.migrate import migrate_state
+
+    settings = _settings(tmp_path, log_dir=tmp_path / "logs")
+    db = AgentDB(settings.db_path)
+    fresh = str(uuid4())
+    stale = str(uuid4())
+    other = str(uuid4())
+    db.mark_processed(
+        fresh,
+        "ERROR_CLOSE",
+        "HL close not ok: Too many cumulative requests sent (35804 > 34878)",
+    )
+    db.mark_processed(
+        stale,
+        "ERROR_CLOSE",
+        "HL close not ok: Too many cumulative requests sent (35804 > 34878)",
+    )
+    db._conn.execute(
+        "UPDATE processed_notifications SET processed_at = ? WHERE notification_id = ?",
+        ((datetime.now(UTC) - timedelta(hours=6)).isoformat(), stale),
+    )
+    db._conn.commit()
+    db.mark_processed(other, "ERROR_CLOSE", "HL close not ok: Insufficient margin")
+    db.close()
+    stats = migrate_state(settings)
+    assert stats["rate_limited_retried"] == 1
+    db = AgentDB(settings.db_path)
+    assert not db.is_processed(fresh)
+    assert db.is_processed(stale)
+    assert db.is_processed(other)
+    db.close()
+
+
+def test_tpsl_already_resting_matches_same_levels() -> None:
+    assert tpsl_already_resting(
+        have_tp=0.01,
+        have_sl=0.02,
+        have_sz=100.0,
+        want_tp=0.01,
+        want_sl=0.02,
+        want_sz=100.0,
+    )
+    assert not tpsl_already_resting(
+        have_tp=0.01,
+        have_sl=0.02,
+        have_sz=100.0,
+        want_tp=0.011,
+        want_sl=0.02,
+        want_sz=100.0,
+    )
+    assert not tpsl_already_resting(
+        have_tp=0.01,
+        have_sl=0.02,
+        have_sz=100.0,
+        want_tp=0.01,
+        want_sl=0.02,
+        want_sz=150.0,
+    )
 
 
 def test_enrich_retry_then_timeout(tmp_path) -> None:

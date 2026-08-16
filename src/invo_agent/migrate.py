@@ -124,6 +124,7 @@ def migrate_state(settings: Settings) -> dict[str, int]:
         if db.append_summary_tags(row.id, tags):
             tagged += 1
     traders = backfill_trader_names(db)
+    rate_limited = db.unmark_rate_limited_errors()
     dropped = db.delete_meta_prefix("update_tags:")
     dropped += db.delete_meta_prefix("pnl_baseline")
     db.close()
@@ -133,6 +134,7 @@ def migrate_state(settings: Settings) -> dict[str, int]:
     return {
         "tagged": tagged,
         "traders": traders,
+        "rate_limited_retried": len(rate_limited),
         "meta_dropped": dropped,
         "logs_deleted": pruned.get("deleted", 0),
         "logs_trimmed": pruned.get("trimmed", 0),

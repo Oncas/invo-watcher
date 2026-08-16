@@ -19,6 +19,7 @@ from invo_agent.dex.cloid import (
     mimic_tp_cloid,
 )
 from invo_agent.dex.hl_trader import (
+    TPSL_UNCHANGED,
     GhostCopyError,
     HlTrader,
     HlTraderError,
@@ -259,14 +260,16 @@ class DexExecutor:
 
     @staticmethod
     def _trader_allocation_pct(entry_size: float | None) -> float | None:
-        """Involio entrySize is usually a fraction of portfolio (0.1 → 10%)."""
+        """Involio entrySize is already percent of the trader's book.
+
+        UI 0.8% arrives as 0.801; 1% as 1.0; 12% as 12.54. Do not treat
+        values ≤ 1 as a 0–1 fraction (that turned 0.8% into 80%).
+        """
         if entry_size is None or entry_size <= 0:
             return None
-        if entry_size <= 1.0:
-            return float(entry_size) * 100.0
-        if entry_size <= 100.0:
-            return float(entry_size)
-        return None
+        if entry_size > 100.0:
+            return None
+        return float(entry_size)
 
     def _resolve_margin(
         self, *, equity: float, leverage: int, entry_size: float | None
@@ -538,7 +541,7 @@ class DexExecutor:
                     "hlResponse": hl_resp,
                 }
             ]
-            if tpsl_placed is not None:
+            if tpsl_placed is not None and tpsl_placed != TPSL_UNCHANGED:
                 tpsl_order, tpsl_resp, tpsl_nonce = tpsl_placed
                 # Involio only accepts submission kind "tpsl" (not "tp"/"sl").
                 submissions.append(
@@ -648,6 +651,20 @@ class DexExecutor:
             f"tp={inv.price_target} sl={inv.stop_loss} "
             f"entrySize={inv.entry_size})"
         )
+        # Queue retry is size-only. A blocked size↑ must not cancel/replace TP/SL
+        # or rewrite leverage every poll — that burned the HL request budget.
+        if action.reason == "pending_add_drain":
+            if self._size_direction(inv) == "up":
+                self._apply_size_increase(
+                    trader,
+                    inv=inv,
+                    coin=coin,
+                    is_long=is_long,
+                    current_sz=sz,
+                    equity=equity,
+                )
+            return
+
         leverage = int(inv.leverage or 1)
         try:
             trader.update_leverage(coin, leverage, is_cross=True)
@@ -698,6 +715,10 @@ class DexExecutor:
             base_short_id=inv.base_short_id,
             copy_update=True,
         )
+        if size_sub is None and tpsl_placed == TPSL_UNCHANGED:
+            return
+        if tpsl_placed == TPSL_UNCHANGED:
+            tpsl_placed = None
 
         client_tx = new_client_tx_id()
         submissions: list[dict[str, Any]] = []
@@ -1472,7 +1493,7 @@ class DexExecutor:
         context: str,
         base_short_id: str | None = None,
         copy_update: bool = False,
-    ) -> tuple[dict[str, Any], dict[str, Any], int] | None:
+    ) -> tuple[dict[str, Any], dict[str, Any], int] | str | None:
         """Best-effort: replace HL reduce-only TP/SL from the trader's levels.
 
         When ``copy_update`` is True, cloids use Involio ``mimicCopyUpdate`` (same
@@ -1562,8 +1583,8 @@ class DexExecutor:
                 tp_cloid=tp_cloid,
                 sl_cloid=sl_cloid,
             )
-            if placed is None:
-                return None
+            if placed is None or placed == TPSL_UNCHANGED:
+                return placed
             hl_order, hl_resp, nonce = placed
             self._check_hl_ok(hl_resp, f"{context}_tpsl")
             console.print(
@@ -1909,13 +1930,43 @@ class DexExecutor:
             )
 
         assert decision.tp is not None and decision.sl is not None
-        hl_order, hl_resp, nonce = trader.place_position_tpsl(
+        parked = trader.place_position_tpsl(
             coin,
             is_long=is_long,
             sz=sz,
             tp_px=decision.tp,
             sl_px=decision.sl,
         )
+        if parked == TPSL_UNCHANGED:
+            msg = (
+                f"RECOVERY parked TP/SL on {coin} reason={decision.reason} "
+                f"tp={decision.tp} sl={decision.sl} (already resting) "
+                f"our_pnl={_pct(decision.our_pnl_pct)} "
+                f"trader_pnl={_pct(decision.trader_pnl_pct)}"
+            )
+            console.print(f"[yellow]{msg}[/yellow]")
+            logger.info(msg)
+            log_event(
+                "recovery_park",
+                coin=coin,
+                reason=decision.reason,
+                tp=decision.tp,
+                sl=decision.sl,
+                already_resting=True,
+                our_pnl_pct=decision.our_pnl_pct,
+                trader_pnl_pct=decision.trader_pnl_pct,
+            )
+            return RecoveryResult(
+                status="parked",
+                coin=coin,
+                reason=decision.reason,
+                message=msg,
+                tp=decision.tp,
+                sl=decision.sl,
+                our_pnl_pct=decision.our_pnl_pct,
+                trader_pnl_pct=decision.trader_pnl_pct,
+            )
+        hl_order, hl_resp, nonce = parked
         self._check_hl_ok(hl_resp, "recovery_park")
         msg = (
             f"RECOVERY parked TP/SL on {coin} reason={decision.reason} "

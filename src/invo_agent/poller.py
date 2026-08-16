@@ -36,6 +36,7 @@ from invo_agent.dex.session import (
     session_should_proactive_renew,
     session_ttl_remaining_seconds,
 )
+from invo_agent.dex.pricing import queued_ready_locally
 from invo_agent.engine import CopyEngine
 from invo_agent.events import log_event, log_event_throttled
 from invo_agent.logging_setup import prune_logs
@@ -56,6 +57,12 @@ HEARTBEAT_EVERY = 8  # polls between "still alive" lines when idle
 DEX_RECOVER_COOLDOWN_SECONDS = 10 * 60
 # Transient network / 5xx: log quietly until this many in a row.
 TRANSIENT_NOTIFY_AFTER = 5
+# Live market-close retry after an HL request cap. After this, recovery
+# parks or flattens from PnL — do not dump hours later at a worse print.
+CLOSE_LIVE_RETRY_SECONDS = 120
+# If the local book still says "blocked", still hit HL this often in case cache is stale.
+QUEUED_PRICE_FALLBACK_SECONDS = 60.0
+QUEUED_MARGIN_FALLBACK_SECONDS = 900.0
 
 
 class NotificationPoller:
@@ -82,6 +89,7 @@ class NotificationPoller:
         self._dex_dead_notified = False
         self._transient_failures = 0
         self._last_log_prune = 0.0
+        self._last_missed_close = 0.0
 
     @property
     def is_dry_run(self) -> bool:
@@ -584,6 +592,8 @@ class NotificationPoller:
             return "same_coin"
         if self._is_insufficient_margin_error(exc):
             return "margin"
+        if self._is_hl_rate_limit_error(exc):
+            return "margin"
         return None
 
     def _queue_open_from_error(
@@ -766,6 +776,54 @@ class NotificationPoller:
             )
             return
 
+        if self._is_hl_rate_limit_error(exc):
+            age = self._notification_age_seconds(action.notification)
+            live_close_retry = (
+                action.action is ActionType.CLOSE and age < CLOSE_LIVE_RETRY_SECONDS
+            )
+            if live_close_retry:
+                logger.warning(
+                    "HL rate-limited %s age=%.0fs — retry CLOSE this poll window: %s",
+                    action.summary,
+                    age,
+                    exc,
+                )
+                log_event_throttled(
+                    "hl_rate_limit",
+                    key=nid,
+                    action=action.action.value,
+                    summary=action.summary,
+                    error=str(exc)[:300],
+                    notification_id=nid,
+                    will_retry=True,
+                )
+                return
+            logger.warning(
+                "HL rate-limited %s — not live-retrying (age=%.0fs): %s",
+                action.summary,
+                age,
+                exc,
+            )
+            self.db.mark_processed(
+                nid, f"ERROR_{action.action.value}", str(exc)[:500]
+            )
+            self.db.log_action(
+                action=f"ERROR_{action.action.value}",
+                summary=f"{format_action_summary(action)}: {exc}"[:500],
+                notification_id=nid,
+                dry_run=self.is_dry_run,
+            )
+            log_event(
+                "hl_rate_limit",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc)[:300],
+                notification_id=nid,
+                will_retry=False,
+                age_seconds=age,
+            )
+            return
+
         if isinstance(exc, NotOpenCopyError):
             self.db.mark_processed(
                 nid, f"SKIP_NOT_OPEN_{action.action.value}", str(exc)[:500]
@@ -804,6 +862,25 @@ class NotificationPoller:
             enabled=self.settings.mac_notify,
             sticky=self.settings.mac_notify_sticky,
         )
+
+    @staticmethod
+    def _is_hl_rate_limit_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return (
+            "too many cumulative requests" in msg
+            or "too many requests" in msg
+        )
+
+    def _tried_within(self, raw: str | None, seconds: float) -> bool:
+        if not raw:
+            return False
+        try:
+            last = datetime.fromisoformat(raw)
+        except ValueError:
+            return False
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - last.astimezone(UTC)).total_seconds() < seconds
 
     @staticmethod
     def _is_insufficient_margin_error(exc: BaseException) -> bool:
@@ -1128,11 +1205,71 @@ class NotificationPoller:
                 sticky=False,
             )
 
+    def _queued_fallback_seconds(self, reason: str | None) -> float:
+        if (reason or "") == "price":
+            return QUEUED_PRICE_FALLBACK_SECONDS
+        return QUEUED_MARGIN_FALLBACK_SECONDS
+
+    def _ensure_book_snapshot(self) -> None:
+        try:
+            self.executor._ensure_trader().refresh_book()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("book snapshot failed: %s", exc)
+
+    def _coin_is_free(self, coin: str) -> bool:
+        want = coin.upper()
+        return not any((c.ticker or "").upper() == want for c in self.db.list_open_copies())
+
+    def _should_attempt_queued(
+        self, *, reason: str | None, last_tried_at: str | None, local_ok: bool
+    ) -> bool:
+        if local_ok:
+            return True
+        return not self._tried_within(
+            last_tried_at, self._queued_fallback_seconds(reason)
+        )
+
+    def _pending_open_local_ok(self, intent: PendingIntent) -> bool:
+        trader = getattr(self.executor, "_trader", None)
+        return queued_ready_locally(
+            reason=intent.reason,
+            mid=trader.cached_mid(intent.coin) if trader is not None else None,
+            available=trader.cached_available() if trader is not None else None,
+            trader_entry=intent.trader_entry,
+            is_long=intent.side.lower() == "long",
+            hl_min_order_usd=self.settings.hl_min_order_usd,
+            min_order_usd=self.settings.min_order_usd,
+            leverage=float(intent.leverage or 1),
+            coin_free=self._coin_is_free(intent.coin),
+        )
+
+    def _pending_add_local_ok(self, copy: OpenCopy) -> bool:
+        trader = getattr(self.executor, "_trader", None)
+        coin = (copy.ticker or "").upper()
+        return queued_ready_locally(
+            reason=copy.pending_add_reason or "size",
+            mid=trader.cached_mid(coin) if trader is not None and coin else None,
+            available=trader.cached_available() if trader is not None else None,
+            trader_entry=copy.pending_add_entry,
+            is_long=(copy.side or "long").lower() == "long",
+            leftover_notional=float(copy.pending_add_notional or 0),
+            hl_min_order_usd=self.settings.hl_min_order_usd,
+            min_order_usd=self.settings.min_order_usd,
+            leverage=float(copy.leverage or 1),
+        )
+
     def _drain_pending(self) -> None:
         intents = self.db.list_pending_intents()
         if not intents:
             return
+        self._ensure_book_snapshot()
         for intent in intents:
+            if not self._should_attempt_queued(
+                reason=intent.reason,
+                last_tried_at=intent.last_tried_at,
+                local_ok=self._pending_open_local_ok(intent),
+            ):
+                continue
             self.db.mark_pending_tried(intent.investment_base_id)
             try:
                 resp = self.client.get_current_shadow_post_by_investment_base_id(
@@ -1232,7 +1369,14 @@ class NotificationPoller:
         ]
         if not waiting:
             return
+        self._ensure_book_snapshot()
         for copy in waiting:
+            if not self._should_attempt_queued(
+                reason=copy.pending_add_reason,
+                last_tried_at=copy.pending_add_tried_at,
+                local_ok=self._pending_add_local_ok(copy),
+            ):
+                continue
             self.db.mark_pending_add_tried(copy.investment_base_id)
             try:
                 resp = self.client.get_current_shadow_post_by_investment_base_id(
@@ -1333,6 +1477,7 @@ class NotificationPoller:
             action=ActionType.UPDATE,
             notification=notification,
             investment=inv,
+            reason="pending_add_drain",
         )
 
     def _apply_drain_failure(
@@ -1445,6 +1590,16 @@ class NotificationPoller:
             )
             return False
 
+    def _maybe_reconcile_missed_closes(self) -> None:
+        now = time.monotonic()
+        if self._last_missed_close and now - self._last_missed_close < 300:
+            return
+        self._last_missed_close = now
+        try:
+            self.reconcile_missed_closes()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("missed-close reconcile failed: %s", exc)
+
     def _maybe_prune_logs(self) -> None:
         now = time.monotonic()
         if self._last_log_prune and now - self._last_log_prune < 3600:
@@ -1489,6 +1644,7 @@ class NotificationPoller:
         )
         self.ensure_catchup()
         self.reconcile_missed_closes()
+        self._last_missed_close = time.monotonic()
 
         while True:
             if stop_fn and stop_fn():
@@ -1497,6 +1653,7 @@ class NotificationPoller:
                 actions = self.poll_once()
                 self._maybe_proactive_dex_renew()
                 self._maybe_prune_logs()
+                self._maybe_reconcile_missed_closes()
                 self._transient_failures = 0
                 if actions:
                     self._idle_polls = 0

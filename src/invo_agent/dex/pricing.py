@@ -3,6 +3,42 @@ from __future__ import annotations
 from typing import Any
 
 
+def queued_ready_locally(
+    *,
+    reason: str,
+    mid: float | None = None,
+    available: float | None = None,
+    trader_entry: float | None = None,
+    is_long: bool = True,
+    leftover_notional: float = 0.0,
+    hl_min_order_usd: float = 10.0,
+    min_order_usd: float = 1.0,
+    leverage: float = 1.0,
+    coin_free: bool = False,
+) -> bool:
+    """True when cached book says a queued open/add can fill — no order yet."""
+    why = (reason or "").lower()
+    if why == "price":
+        if mid is None or mid <= 0:
+            return False
+        return price_is_at_or_better(
+            mid=mid, trader_entry=trader_entry, is_long=is_long
+        )
+    if why == "margin":
+        if available is None:
+            return False
+        lev = max(1.0, float(leverage or 1))
+        return (
+            available + 1e-9 >= float(min_order_usd)
+            and available * 0.98 * lev + 1e-9 >= float(hl_min_order_usd)
+        )
+    if why in {"size", "dust"}:
+        return leftover_notional + 1e-9 >= float(hl_min_order_usd)
+    if why == "same_coin":
+        return bool(coin_free)
+    return False
+
+
 def price_is_at_or_better(
     *,
     mid: float,
