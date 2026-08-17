@@ -16,6 +16,7 @@ from invo_agent.auth.email_otp import login_with_otp
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB, OpenCopy, PendingIntent
+from invo_agent.dex.budget import BudgetDeniedError
 from invo_agent.dex.executor import DexExecutor, RecoveryResult
 from invo_agent.dex.hl_trader import (
     GhostCopyError,
@@ -27,6 +28,7 @@ from invo_agent.dex.hl_trader import (
     SameCoinOpenError,
     SideMismatchError,
 )
+from invo_agent.dex.pricing import queued_ready_locally
 from invo_agent.dex.session import (
     DexSessionError,
     DexSessionStore,
@@ -37,16 +39,15 @@ from invo_agent.dex.session import (
     session_should_proactive_renew,
     session_ttl_remaining_seconds,
 )
-from invo_agent.dex.pricing import queued_ready_locally
 from invo_agent.engine import CopyEngine
 from invo_agent.events import log_event, log_event_throttled
-from invo_agent.logging_setup import prune_logs
 from invo_agent.labels import (
     format_action_summary,
     merge_update_tags,
     tags_from_summary,
     trader_from_action,
 )
+from invo_agent.logging_setup import prune_logs
 from invo_agent.notify import notify_mac
 
 console = Console()
@@ -231,6 +232,10 @@ class NotificationPoller:
         results: list[RecoveryResult] = []
         if not self.is_dry_run:
             self._ensure_dex_session()
+            try:
+                self.executor._ensure_trader().refresh_book()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("recovery snapshot failed: %s", exc)
 
         for copy in open_copies:
             try:
@@ -545,8 +550,11 @@ class NotificationPoller:
         actions: list[TradeAction] = []
         if not self.is_dry_run:
             self._ensure_dex_session()
-            self._reconcile_ghosts()
+            self._refresh_account()
+            self._adopt_resting_fills()
+            self._reconcile_inverse_ghosts()
         items = sorted(resp.items, key=lambda n: n.created_at)
+        self._supersede_batch(items)
         for notification in items:
             nid = str(notification.id)
             if self.db.is_processed(nid):
@@ -684,6 +692,8 @@ class NotificationPoller:
             return "price"
         if isinstance(exc, SameCoinOpenError):
             return "same_coin"
+        if isinstance(exc, BudgetDeniedError):
+            return "budget"
         if self._is_insufficient_margin_error(exc):
             return "margin"
         if self._is_hl_rate_limit_error(exc):
@@ -1277,12 +1287,31 @@ class NotificationPoller:
         if refreshed is None:
             return False
         refreshed.reason = existing.reason
+        entry_moved = (
+            existing.trader_entry is not None
+            and refreshed.trader_entry is not None
+            and abs(float(existing.trader_entry) - float(refreshed.trader_entry))
+            > max(1e-8, 1e-6 * abs(float(existing.trader_entry)))
+        )
+        if entry_moved and existing.resting_oid:
+            self._cancel_pending_resting(existing)
+            existing.resting_oid = None
+            existing.resting_cloid = None
+            existing.resting_px = None
+            existing.resting_sz = None
+            existing.resting_at = None
+        refreshed.resting_oid = existing.resting_oid
+        refreshed.resting_cloid = existing.resting_cloid
+        refreshed.resting_px = existing.resting_px
+        refreshed.resting_sz = existing.resting_sz
+        refreshed.resting_at = existing.resting_at
         self.db.upsert_pending_intent(refreshed)
         log_event(
             "pending_refresh",
             base_id=refreshed.investment_base_id,
             trader_entry=refreshed.trader_entry,
             entry_size=refreshed.entry_size,
+            entry_moved=entry_moved,
         )
         return True
 
@@ -1304,6 +1333,7 @@ class NotificationPoller:
                     break
         if existing is None:
             return False
+        self._cancel_pending_resting(existing)
         self.db.delete_pending_intent(base_id)
         logger.info("cancelled pending %s (%s)", existing.summary or base_id, reason)
         log_event(
@@ -1347,6 +1377,7 @@ class NotificationPoller:
                 if inv is not None and not self._investment_closed(inv):
                     still_open = True
                 elif inv is not None and self._investment_closed(inv):
+                    self._cancel_pending_resting(intent)
                     self.db.delete_pending_intent(intent.investment_base_id)
                     log_event(
                         "pending_cancel",
@@ -1371,6 +1402,7 @@ class NotificationPoller:
             if shadow_ok and not still_open:
                 # No post and not explicitly closed — treat as gone.
                 pass
+            self._cancel_pending_resting(intent)
             self.db.delete_pending_intent(intent.investment_base_id)
             logger.warning(
                 "expired pending %s age=%.0fs shadow_ok=%s",
@@ -1393,6 +1425,234 @@ class NotificationPoller:
                 sticky=False,
             )
 
+    def _refresh_account(self) -> None:
+        raw = self.db.get_meta("hl_fills_since_ms")
+        try:
+            since = int(raw) if raw else int((time.time() - 3600) * 1000)
+        except ValueError:
+            since = int((time.time() - 3600) * 1000)
+        try:
+            self.executor.refresh_account(fills_since_ms=since)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("account snapshot failed: %s", exc)
+            return
+        self.db.set_meta("hl_fills_since_ms", str(int(time.time() * 1000) - 5000))
+
+    def _supersede_batch(self, items: list) -> None:
+        """One investment → last UPDATE; drop UPDATEs when a CLOSE is in the same poll."""
+        by_base: dict[str, list] = {}
+        for notification in items:
+            nid = str(notification.id)
+            if self.db.is_processed(nid):
+                continue
+            if notification.investment_base_id is None:
+                continue
+            if notification.action_type not in {ActionType.UPDATE, ActionType.CLOSE}:
+                continue
+            by_base.setdefault(str(notification.investment_base_id), []).append(
+                notification
+            )
+        for group in by_base.values():
+            group.sort(key=lambda n: n.created_at)
+            has_close = any(n.action_type is ActionType.CLOSE for n in group)
+            last_update = None
+            for notification in group:
+                if notification.action_type is ActionType.UPDATE:
+                    last_update = notification
+            for notification in group:
+                if notification.action_type is not ActionType.UPDATE:
+                    continue
+                nid = str(notification.id)
+                if has_close:
+                    self.db.mark_processed(
+                        nid, "SUPERSEDED_BY_CLOSE", notification.content
+                    )
+                    log_event(
+                        "superseded",
+                        notification_id=nid,
+                        reason="close_in_batch",
+                    )
+                elif last_update is not None and notification.id != last_update.id:
+                    self.db.mark_processed(
+                        nid, "SUPERSEDED_UPDATE", notification.content
+                    )
+                    log_event(
+                        "superseded",
+                        notification_id=nid,
+                        reason="older_update",
+                    )
+
+    def _cancel_pending_resting(self, intent: PendingIntent) -> None:
+        if not intent.resting_oid:
+            return
+        try:
+            self.executor.cancel_resting_oid(intent.coin, int(intent.resting_oid))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "cancel resting %s oid=%s failed: %s",
+                intent.coin,
+                intent.resting_oid,
+                exc,
+            )
+        self.db.clear_pending_resting(intent.investment_base_id)
+
+    def _adopt_resting_fills(self) -> None:
+        trader = getattr(self.executor, "_trader", None)
+        book = getattr(trader, "_book", None) if trader is not None else None
+        if book is None:
+            return
+        for intent in self.db.list_pending_intents():
+            if not intent.resting_oid and not intent.resting_cloid:
+                continue
+            want_cloid = (intent.resting_cloid or "").lower().removeprefix("0x")
+            matched = [
+                fill
+                for fill in book.fills
+                if fill.coin == intent.coin.upper()
+                and (
+                    (want_cloid and fill.cloid == want_cloid)
+                    or (
+                        intent.resting_oid is not None
+                        and fill.oid == intent.resting_oid
+                    )
+                )
+            ]
+            pos = book.position(intent.coin)
+            still_resting = any(
+                int(order.get("oid") or 0) == int(intent.resting_oid or 0)
+                for order in book.open_orders
+            )
+            if not matched and not (pos is not None and not still_resting):
+                continue
+            try:
+                resp = self.client.get_current_shadow_post_by_investment_base_id(
+                    intent.investment_base_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "adopt shadow failed base_id=%s: %s",
+                    intent.investment_base_id,
+                    exc,
+                )
+                continue
+            inv = resp.post.update if resp.post else None
+            if inv is None:
+                continue
+            if matched:
+                sz = sum(fill.sz for fill in matched)
+                notional = sum(fill.sz * fill.px for fill in matched)
+                px = notional / sz if sz else float(intent.resting_px or 0)
+            else:
+                sz = float(pos.sz) if pos else float(intent.resting_sz or 0)
+                px = float(pos.entry_px) if pos and pos.entry_px else float(
+                    intent.resting_px or 0
+                )
+            if sz <= 0 or px <= 0:
+                continue
+            is_long = intent.side.lower() == "long"
+            try:
+                self.executor.adopt_open_fill(
+                    inv=inv,
+                    coin=intent.coin,
+                    is_long=is_long,
+                    sz=sz,
+                    px=px,
+                    leverage=int(intent.leverage or 1),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("adopt fill failed %s: %s", intent.coin, exc)
+                continue
+            leftover = max(0.0, float(intent.resting_sz or 0) - sz)
+            if leftover > 1e-9 and still_resting:
+                self.db.set_pending_resting(
+                    intent.investment_base_id,
+                    oid=intent.resting_oid,
+                    cloid=intent.resting_cloid,
+                    px=intent.resting_px,
+                    sz=leftover,
+                )
+                continue
+            action = self._action_from_pending(intent, inv)
+            self.db.delete_pending_intent(intent.investment_base_id)
+            self.db.delete_pending_for_coin(
+                intent.coin, exclude_base_id=intent.investment_base_id
+            )
+            self.engine.remember(action)
+            self.db.log_action(
+                action="OPEN",
+                summary=action.summary,
+                notification_id=intent.notification_id,
+                dry_run=False,
+            )
+            self._notify_action(action)
+            logger.info("adopted resting OPEN %s sz=%s px=%s", action.summary, sz, px)
+            log_event(
+                "pending_fill",
+                via="resting",
+                base_id=intent.investment_base_id,
+                coin=intent.coin,
+                sz=sz,
+                px=px,
+            )
+
+    def _reconcile_inverse_ghosts(self) -> None:
+        try:
+            coins = self.executor.untracked_hl_coins()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("inverse ghost scan failed: %s", exc)
+            return
+        trader = getattr(self.executor, "_trader", None)
+        book = getattr(trader, "_book", None) if trader is not None else None
+        for coin in coins:
+            pending = self.db.get_pending_for_coin(coin)
+            pos = book.position(coin) if book is not None else None
+            if pending is not None and pos is not None:
+                logger.info(
+                    "inverse ghost %s: adopting pending %s",
+                    coin,
+                    pending.base_short_id or pending.investment_base_id,
+                )
+                try:
+                    resp = self.client.get_current_shadow_post_by_investment_base_id(
+                        pending.investment_base_id
+                    )
+                    inv = resp.post.update if resp.post else None
+                    if inv is None:
+                        raise RuntimeError("no shadow post")
+                    self.executor.adopt_open_fill(
+                        inv=inv,
+                        coin=coin,
+                        is_long=pos.is_long,
+                        sz=pos.sz,
+                        px=float(pos.entry_px or pending.trader_entry or 0),
+                        leverage=int(pos.leverage or pending.leverage or 1),
+                    )
+                    action = self._action_from_pending(pending, inv)
+                    self.db.delete_pending_intent(pending.investment_base_id)
+                    self.engine.remember(action)
+                    self.db.log_action(
+                        action="OPEN",
+                        summary=f"{action.summary} (adopted)",
+                        notification_id=pending.notification_id,
+                        dry_run=False,
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("inverse ghost adopt failed %s: %s", coin, exc)
+            logger.error(
+                "HL holds %s with no open_copy — not flattening (external?)",
+                coin,
+            )
+            log_event("inverse_ghost", coin=coin, pending=pending is not None)
+            notify_mac(
+                "invo-agent · WARN",
+                f"HL holds {coin} with no tracked copy",
+                subtitle="Not flattening",
+                sound="Basso",
+                enabled=self.settings.mac_notify,
+                sticky=self.settings.mac_notify_sticky,
+            )
+
     def _queued_fallback_seconds(self, reason: str | None) -> float:
         if (reason or "") == "price":
             return QUEUED_PRICE_FALLBACK_SECONDS
@@ -1411,6 +1671,9 @@ class NotificationPoller:
     def _should_attempt_queued(
         self, *, reason: str | None, last_tried_at: str | None, local_ok: bool
     ) -> bool:
+        budget = self.executor.budget()
+        if budget is not None and not budget.can_spend(1, essential=False):
+            return False
         if local_ok:
             # Fillable per the cached book — go, but not on every 4s poll.
             return not self._tried_within(last_tried_at, QUEUED_LOCAL_MIN_GAP_SECONDS)
@@ -1419,9 +1682,18 @@ class NotificationPoller:
         )
 
     def _pending_open_local_ok(self, intent: PendingIntent) -> bool:
+        if intent.resting_oid:
+            return False
         trader = getattr(self.executor, "_trader", None)
+        why = (intent.reason or "").lower()
+        if why == "budget":
+            budget = self.executor.budget()
+            return bool(budget and budget.can_spend(1, essential=False))
+        if why == "price":
+            # A resting GTC waits on the book — we only need free margin + a free coin.
+            why = "margin"
         return queued_ready_locally(
-            reason=intent.reason,
+            reason=why,
             mid=trader.cached_mid(intent.coin) if trader is not None else None,
             available=trader.cached_available() if trader is not None else None,
             trader_entry=intent.trader_entry,
@@ -1487,6 +1759,7 @@ class NotificationPoller:
                 intent.trader = owner
                 self.db.upsert_pending_intent(intent)
             if self._investment_closed(inv):
+                self._cancel_pending_resting(intent)
                 self.db.delete_pending_intent(intent.investment_base_id)
                 log_event(
                     "pending_cancel",
@@ -1495,15 +1768,17 @@ class NotificationPoller:
                     reason="trader_closed_on_drain",
                 )
                 continue
+            if intent.resting_oid:
+                continue
             action = self._action_from_pending(intent, inv)
             try:
-                self.executor.handle(action)
+                placed = self.executor.place_resting_open(action)
             except Exception as exc:  # noqa: BLE001
                 if self._is_dex_session_error(exc):
                     self.executor.invalidate_trader()
                     if self._recover_dex_session():
                         try:
-                            self.executor.handle(action)
+                            placed = self.executor.place_resting_open(action)
                         except Exception as retry_exc:  # noqa: BLE001
                             if self._apply_drain_failure(intent, action, retry_exc):
                                 if self._is_insufficient_margin_error(retry_exc):
@@ -1522,24 +1797,61 @@ class NotificationPoller:
                         exc,
                     )
                     continue
-            self.db.delete_pending_intent(intent.investment_base_id)
-            self.db.delete_pending_for_coin(
-                intent.coin, exclude_base_id=intent.investment_base_id
+            filled_sz = placed.get("filled_sz")
+            if filled_sz and float(filled_sz) > 0:
+                try:
+                    self.executor.adopt_open_fill(
+                        inv=inv,
+                        coin=intent.coin,
+                        is_long=intent.side.lower() == "long",
+                        sz=float(filled_sz),
+                        px=float(placed.get("filled_px") or placed.get("px") or 0),
+                        leverage=int(intent.leverage or 1),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("immediate rest fill adopt failed: %s", exc)
+                self.db.delete_pending_intent(intent.investment_base_id)
+                self.db.delete_pending_for_coin(
+                    intent.coin, exclude_base_id=intent.investment_base_id
+                )
+                self.engine.remember(action)
+                self.db.log_action(
+                    action="OPEN",
+                    summary=action.summary,
+                    notification_id=intent.notification_id,
+                    dry_run=False,
+                )
+                self._notify_action(action)
+                logger.info("drained pending OPEN %s (immediate fill)", action.summary)
+                continue
+            oid = placed.get("oid")
+            if oid is None:
+                logger.warning(
+                    "resting OPEN %s placed but no oid — will retry",
+                    intent.summary or intent.coin,
+                )
+                continue
+            self.db.set_pending_resting(
+                intent.investment_base_id,
+                oid=int(oid),
+                cloid=placed.get("cloid"),
+                px=placed.get("px"),
+                sz=placed.get("sz"),
             )
-            self.engine.remember(action)
-            self.db.log_action(
-                action="OPEN",
-                summary=action.summary,
-                notification_id=intent.notification_id,
-                dry_run=False,
+            logger.info(
+                "resting OPEN %s oid=%s px=%s sz=%s",
+                action.summary,
+                oid,
+                placed.get("px"),
+                placed.get("sz"),
             )
-            self._notify_action(action)
-            logger.info("drained pending OPEN %s", action.summary)
             log_event(
-                "pending_fill",
+                "pending_resting",
                 base_id=intent.investment_base_id,
                 coin=intent.coin,
-                trader_entry=inv.entry_price,
+                oid=oid,
+                px=placed.get("px"),
+                sz=placed.get("sz"),
             )
 
     def _pending_add_age_seconds(self, copy: OpenCopy) -> float:

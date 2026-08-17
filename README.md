@@ -185,7 +185,11 @@ How a CLOSE is handled depends on how late we are:
 | Failed on a blip (cap / network), < 2 min old | Retried at market on the next poll |
 | Older than 10 min, or still failing | Recovery prices it: flatten while green or less red than the trader, otherwise park TP/SL. A parked copy is never market-dumped later. |
 
-When Hyperliquid answers “too many requests”, queued opens and size-adds pause for 2 minutes so the remaining request budget goes to closes. Queued rows are retried at most once every 15s each, a few per poll.
+Hyperliquid’s address budget is `10,000 + 1 request per USDC traded` (lifetime, no daily reset). The agent tracks it locally from `userFees` volume plus every action it posts, and re-anchors from HL’s rejection string. Closes and protective TP/SL always go through; new opens and size-adds wait while remaining slots are at or below `HL_BUDGET_RESERVE` (default 50). While over the cap, actions are spaced 11s apart so we use HL’s one-per-10s allowance on the trade instead of a leverage write.
+
+A fresh OPEN is still an IoC at entry-or-better. Queued opens place **one** resting GTC at the trader’s entry and wait; they are not re-probed every poll. An unchanged UPDATE writes nothing. TP/SL replaces only the leg that moved.
+
+When Hyperliquid answers “too many requests”, opportunistic queue work also pauses for 2 minutes as a backstop.
 
 You’ll get:
 

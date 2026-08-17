@@ -10,6 +10,7 @@ from invo_agent.api.client import InvolioClient
 from invo_agent.api.models import ActionType, InvestmentUpdate, TradeAction
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB, OpenCopy
+from invo_agent.dex.budget import BudgetDeniedError, RequestBudget, daily_volume_from_user_fees
 from invo_agent.dex.cloid import (
     mimic_close_cloid,
     mimic_entry_cloid,
@@ -30,6 +31,8 @@ from invo_agent.dex.hl_trader import (
     RecoveryParkedError,
     SameCoinOpenError,
     SideMismatchError,
+    extract_fill_sz_px,
+    extract_resting_oid,
 )
 from invo_agent.dex.pricing import (
     extract_avg_px,
@@ -78,6 +81,7 @@ class DexExecutor:
         self.db = db
         self._trader: HlTrader | None = None
         self._dex_session = None
+        self._budget: RequestBudget | None = None
         self.last_update_tags: list[str] = []
 
     @property
@@ -89,12 +93,27 @@ class DexExecutor:
         self._trader = None
         self._dex_session = None
 
+    def budget(self) -> RequestBudget | None:
+        if self.db is None:
+            return None
+        if self._budget is None:
+            self._budget = RequestBudget(
+                self.db, reserve=float(self.settings.hl_budget_reserve)
+            )
+        return self._budget
+
     def _ensure_trader(self) -> HlTrader:
         if self._trader is not None:
             return self._trader
         data, signer = load_signer(self.dex_store)
         self._dex_session = data
-        self._trader = HlTrader(signer, data.master_address, mainnet=True)
+        self._trader = HlTrader(
+            signer,
+            data.master_address,
+            mainnet=True,
+            budget=self.budget(),
+            leverage_stale_seconds=float(self.settings.hl_leverage_stale_seconds),
+        )
         return self._trader
 
     def handle(self, action: TradeAction) -> None:
@@ -139,6 +158,7 @@ class DexExecutor:
             raise DexSessionError("InvolioClient required for live execution")
 
         trader = self._ensure_trader()
+        trader._ensure_book()
         equity = trader.account_value()
         logger.info(
             "LIVE handle %s equity=%.4f pct=%s summary=%s",
@@ -227,6 +247,17 @@ class DexExecutor:
             logger.warning("LIVE %s side mismatch: %s", action.action.value, exc)
             log_event(
                 "live_skip_side_mismatch",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=str(action.notification.id),
+            )
+            raise
+        except BudgetDeniedError as exc:
+            logger.info("LIVE %s deferred (budget): %s", action.action.value, exc)
+            log_event_throttled(
+                "live_budget_denied",
+                key=str(action.notification.id),
                 action=action.action.value,
                 summary=action.summary,
                 error=str(exc),
@@ -443,7 +474,9 @@ class DexExecutor:
         )
 
         try:
-            trader.update_leverage(coin, leverage, is_cross=True)
+            trader.ensure_leverage(coin, leverage, is_cross=True)
+        except BudgetDeniedError:
+            raise
         except HlTraderError as exc:
             if "insufficient margin" in str(exc).lower():
                 raise InsufficientMarginError(str(exc)) from exc
@@ -668,20 +701,57 @@ class DexExecutor:
         # Queue retry is size-only. A blocked size↑ must not cancel/replace TP/SL
         # or rewrite leverage every poll — that burned the HL request budget.
         if action.reason == "pending_add_drain":
-            if self._size_direction(inv) == "up":
-                self._apply_size_increase(
-                    trader,
+            if self._size_direction(inv) != "up":
+                return
+            qty_before = sz
+            sz, size_sub = self._apply_size_increase(
+                trader,
+                inv=inv,
+                coin=coin,
+                is_long=is_long,
+                current_sz=sz,
+                equity=equity,
+            )
+            if size_sub is None:
+                return
+            leverage = int(inv.leverage or 1)
+            try:
+                recorded = self._mimic_copy(
                     inv=inv,
+                    update_type="increase",
                     coin=coin,
-                    is_long=is_long,
-                    current_sz=sz,
-                    equity=equity,
+                    asset_index=trader.asset_index(coin),
+                    client_tx=new_client_tx_id(),
+                    submissions=[size_sub],
+                    summary={
+                        "qtyBefore": str(qty_before),
+                        "qtyAfter": str(sz),
+                        "intendedLeverage": leverage,
+                    },
+                    include_update_base_short_id=True,
                 )
+                logger.info(
+                    "UPDATE drain recorded coin=%s sz=%s→%s: %s",
+                    coin,
+                    qty_before,
+                    sz,
+                    recorded,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "UPDATE drain mimic/copy failed coin=%s (HL size kept): %s",
+                    coin,
+                    exc,
+                )
+            tags = merge_update_tags(update_labels(inv), ["size↑"])
+            self.last_update_tags = tags
             return
 
         leverage = int(inv.leverage or 1)
         try:
-            trader.update_leverage(coin, leverage, is_cross=True)
+            trader.ensure_leverage(coin, leverage, is_cross=True)
+        except BudgetDeniedError as exc:
+            logger.warning("UPDATE %s leverage skipped (budget): %s", coin, exc)
         except HlTraderError as exc:
             # Size-add / TP/SL must still run — leverage is best-effort on UPDATE.
             console.print(
@@ -2195,6 +2265,141 @@ class DexExecutor:
             self.client.dex_post("/dex/mimic/seen", {"baseShortId": base_short_id})
         except Exception as exc:  # noqa: BLE001
             logger.warning("mimic/seen failed baseShortId=%s: %s", base_short_id, exc)
+
+    def refresh_account(self, *, fills_since_ms: int | None = None) -> None:
+        """One snapshot + occasional userFees. Info only — no orders."""
+        trader = self._ensure_trader()
+        trader.refresh_book(fills_since_ms=fills_since_ms)
+        budget = self.budget()
+        if budget is None:
+            return
+        age = budget.fees_age_seconds()
+        if age is not None and age < float(self.settings.hl_fees_refresh_seconds):
+            return
+        try:
+            fees = trader.fetch_user_fees()
+            budget.record_daily_volume(daily_volume_from_user_fees(fees))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("userFees refresh failed: %s", exc)
+
+    def place_resting_open(self, action: TradeAction) -> dict[str, Any]:
+        """One GTC at the trader's entry. TP/SL wait until the fill is adopted."""
+        inv = action.investment
+        if inv is None:
+            raise HlTraderError("Cannot rest without enriched investment")
+        trader = self._ensure_trader()
+        coin = self._coin(action)
+        is_long = bool(inv.direction_long)
+        self._refuse_same_coin_open(
+            coin,
+            exclude_base_id=str(inv.base_id) if inv.base_id is not None else None,
+        )
+        leverage = int(inv.leverage or 1)
+        equity = trader.account_value()
+        margin, size_meta = self._resolve_margin(
+            equity=equity, leverage=leverage, entry_size=inv.entry_size
+        )
+        available = trader.available_margin()
+        if available + 1e-9 < self.settings.min_order_usd:
+            raise InsufficientMarginError(
+                f"No free margin for {coin} (available=${available:.2f})"
+            )
+        if margin > available:
+            margin = available * 0.98
+            size_meta["order_notional_usd"] = margin * max(1, leverage)
+        order_notional = float(size_meta["order_notional_usd"])
+        if margin < self.settings.min_order_usd:
+            raise InsufficientMarginError(
+                f"Margin ${margin:.2f} < MIN_ORDER_USD={self.settings.min_order_usd}"
+            )
+        if order_notional + 1e-9 < float(self.settings.hl_min_order_usd):
+            raise InsufficientMarginError(
+                f"Order notional ${order_notional:.2f} < HL min"
+            )
+        trader_entry = float(inv.entry_price) if inv.entry_price else None
+        if trader_entry is None or trader_entry <= 0:
+            raise PriceNotBetterError(f"{coin}: no trader entry to rest at")
+        mid = trader.mid_price(coin)
+        sz = trader.round_size(coin, order_notional / mid)
+        trader.ensure_leverage(coin, leverage, is_cross=True)
+        cloid = mimic_entry_cloid(inv.base_short_id)
+        _hl_order, hl_resp, _nonce = trader.limit_order(
+            coin,
+            is_buy=is_long,
+            sz=sz,
+            limit_px=trader_entry,
+            tif="Gtc",
+            cloid=cloid,
+            essential=False,
+        )
+        self._check_hl_ok(hl_resp, "resting_open")
+        filled_sz, filled_px = extract_fill_sz_px(hl_resp)
+        oid = extract_resting_oid(hl_resp)
+        log_event(
+            "resting_open",
+            coin=coin,
+            sz=sz,
+            px=trader_entry,
+            oid=oid,
+            cloid=cloid.to_raw() if cloid else None,
+            filled_sz=filled_sz,
+        )
+        return {
+            "oid": oid,
+            "cloid": cloid.to_raw() if cloid else None,
+            "px": trader.round_price(coin, trader_entry),
+            "sz": sz,
+            "filled_sz": filled_sz,
+            "filled_px": filled_px,
+            "hl_response": hl_resp,
+        }
+
+    def adopt_open_fill(
+        self,
+        *,
+        inv: InvestmentUpdate,
+        coin: str,
+        is_long: bool,
+        sz: float,
+        px: float,
+        leverage: int,
+    ) -> None:
+        """Turn a resting (or external) fill into a tracked copy + TP/SL."""
+        trader = self._ensure_trader()
+        self._persist_open_fill(
+            inv=inv,
+            coin=coin,
+            mid=px,
+            sz=sz,
+            is_long=is_long,
+            leverage=leverage,
+        )
+        self._sync_tpsl(
+            trader,
+            coin=coin,
+            is_long=is_long,
+            sz=sz,
+            tp=inv.price_target,
+            sl=inv.stop_loss,
+            context="open",
+            base_short_id=inv.base_short_id,
+            copy_update=False,
+        )
+
+    def untracked_hl_coins(self) -> list[str]:
+        if self.db is None:
+            return []
+        trader = self._ensure_trader()
+        book = trader._ensure_book()
+        tracked = {
+            (copy.ticker or "").upper()
+            for copy in self.db.list_open_copies()
+            if copy.ticker
+        }
+        return sorted(coin for coin in book.positions if coin not in tracked)
+
+    def cancel_resting_oid(self, coin: str, oid: int) -> None:
+        self._ensure_trader().cancel_oids(coin, [oid], essential=True)
 
     @staticmethod
     def _check_hl_ok(resp: dict[str, Any], label: str) -> None:

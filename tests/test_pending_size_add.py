@@ -105,6 +105,64 @@ def test_pending_add_drain_does_not_touch_tpsl(tmp_path) -> None:
     db.close()
 
 
+def test_pending_add_drain_records_mimic_after_fill(tmp_path) -> None:
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=True,
+        dry_run=False,
+        min_order_usd=1.0,
+        hl_min_order_usd=10.0,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="adaShort",
+        ticker="ADA",
+        portfolio_id=None,
+        notification_id="n1",
+        side="long",
+        size=80.0,
+        leverage=10,
+        trader="alpha_trader",
+    )
+    exe = DexExecutor(settings, db=db)
+    recorded: list[str] = []
+    exe._mimic_copy = lambda **kwargs: recorded.append(kwargs["update_type"]) or {}  # type: ignore[method-assign]
+    exe._sync_tpsl = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("drain must not sync TP/SL")
+    )
+    trader = _FakeTrader(mid=0.20, available=50.0)
+    trader.asset_index = lambda coin: 1  # type: ignore[method-assign]
+    trader.position_detail = lambda coin: {  # type: ignore[method-assign]
+        "sz": 200.0,
+        "is_long": True,
+        "entry_px": 0.20,
+        "leverage": 10,
+    }
+    notif = Notification.model_validate(
+        {
+            "id": str(uuid4()),
+            "content": "queued UPDATE ADA",
+            "notificationType": "user_updated_investment",
+            "createdAt": datetime.now(UTC).isoformat(),
+            "investmentBaseId": str(base_id),
+            "notifier": {"username": "alpha_trader"},
+        }
+    )
+    action = TradeAction(
+        action=ActionType.UPDATE,
+        notification=notif,
+        investment=_inv(base_id=base_id, entry_size=8.0, entry_price=0.20),
+        reason="pending_add_drain",
+    )
+    exe._update(action, trader, 100.0)  # type: ignore[arg-type]
+    assert trader.orders
+    assert recorded == ["increase"]
+    db.close()
+
+
 def test_size_increase_rate_limit_keeps_add_queued(tmp_path) -> None:
     settings = Settings(
         db_path=tmp_path / "agent.db",

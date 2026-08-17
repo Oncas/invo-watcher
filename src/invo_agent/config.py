@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     dex_renew_before_seconds: float = 6 * 3600
     # Drop queued opens the trader never closed after this many seconds.
     pending_max_age_seconds: float = 24 * 3600
+    # Keep this many request slots for closes / protective TP/SL.
+    hl_budget_reserve: float = 50.0
+    # How often to refresh HL userFees (info, not an order).
+    hl_fees_refresh_seconds: float = 60.0
+    # Re-assert coin leverage if our cache is older than this.
+    hl_leverage_stale_seconds: float = 3 * 3600
 
     portfolio_allowlist: str = ""
 

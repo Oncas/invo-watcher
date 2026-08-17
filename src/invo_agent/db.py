@@ -50,6 +50,11 @@ class PendingIntent:
     summary: str | None = None
     trader: str | None = None
     last_tried_at: str | None = None
+    resting_oid: int | None = None
+    resting_cloid: str | None = None
+    resting_px: float | None = None
+    resting_sz: float | None = None
+    resting_at: str | None = None
 
 
 @dataclass
@@ -82,6 +87,11 @@ _OPEN_COPY_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
 _PENDING_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("trader", "TEXT"),
     ("last_tried_at", "TEXT"),
+    ("resting_oid", "INTEGER"),
+    ("resting_cloid", "TEXT"),
+    ("resting_px", "REAL"),
+    ("resting_sz", "REAL"),
+    ("resting_at", "TEXT"),
 )
 
 
@@ -127,6 +137,12 @@ class AgentDB:
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS hl_daily_volume (
+                date TEXT PRIMARY KEY,
+                usd REAL NOT NULL,
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS pending_intents (
@@ -659,14 +675,18 @@ class AgentDB:
         existing = self.get_pending_intent(intent.investment_base_id)
         created_at = existing.created_at if existing else intent.created_at
         now = datetime.now(UTC).isoformat()
+        def _keep(new, old):
+            return new if new is not None else old
+
         self._conn.execute(
             """
             INSERT OR REPLACE INTO pending_intents (
                 investment_base_id, coin, side, reason, created_at, updated_at,
                 base_short_id, notification_id, investment_id, leverage,
                 trader_entry, tp, sl, entry_size, portfolio_id, summary, trader,
-                last_tried_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_tried_at,
+                resting_oid, resting_cloid, resting_px, resting_sz, resting_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 intent.investment_base_id,
@@ -687,6 +707,11 @@ class AgentDB:
                 intent.summary,
                 intent.trader or (existing.trader if existing else None),
                 intent.last_tried_at or (existing.last_tried_at if existing else None),
+                _keep(intent.resting_oid, existing.resting_oid if existing else None),
+                _keep(intent.resting_cloid, existing.resting_cloid if existing else None),
+                _keep(intent.resting_px, existing.resting_px if existing else None),
+                _keep(intent.resting_sz, existing.resting_sz if existing else None),
+                _keep(intent.resting_at, existing.resting_at if existing else None),
             ),
         )
         self._conn.commit()
@@ -764,7 +789,75 @@ class AgentDB:
             summary=row["summary"],
             trader=row["trader"] if "trader" in row.keys() else None,
             last_tried_at=row["last_tried_at"] if "last_tried_at" in row.keys() else None,
+            resting_oid=int(row["resting_oid"])
+            if "resting_oid" in row.keys() and row["resting_oid"] is not None
+            else None,
+            resting_cloid=row["resting_cloid"]
+            if "resting_cloid" in row.keys()
+            else None,
+            resting_px=float(row["resting_px"])
+            if "resting_px" in row.keys() and row["resting_px"] is not None
+            else None,
+            resting_sz=float(row["resting_sz"])
+            if "resting_sz" in row.keys() and row["resting_sz"] is not None
+            else None,
+            resting_at=row["resting_at"] if "resting_at" in row.keys() else None,
         )
+
+    def set_pending_resting(
+        self,
+        investment_base_id: str,
+        *,
+        oid: int | None,
+        cloid: str | None,
+        px: float | None,
+        sz: float | None,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        self._conn.execute(
+            """
+            UPDATE pending_intents
+            SET resting_oid = ?,
+                resting_cloid = ?,
+                resting_px = ?,
+                resting_sz = ?,
+                resting_at = ?,
+                updated_at = ?
+            WHERE investment_base_id = ?
+            """,
+            (
+                oid,
+                cloid,
+                px,
+                sz,
+                now if oid is not None else None,
+                now,
+                investment_base_id,
+            ),
+        )
+        self._conn.commit()
+
+    def clear_pending_resting(self, investment_base_id: str) -> None:
+        self.set_pending_resting(
+            investment_base_id, oid=None, cloid=None, px=None, sz=None
+        )
+
+    def upsert_hl_daily_volume(self, days: dict[str, float]) -> None:
+        now = datetime.now(UTC).isoformat()
+        self._conn.executemany(
+            """
+            INSERT OR REPLACE INTO hl_daily_volume (date, usd, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            [(date, float(usd), now) for date, usd in days.items()],
+        )
+        self._conn.commit()
+
+    def hl_lifetime_volume(self) -> float:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(usd), 0) AS total FROM hl_daily_volume"
+        ).fetchone()
+        return float(row["total"] or 0)
 
     def mark_pending_tried(self, investment_base_id: str) -> None:
         now = datetime.now(UTC).isoformat()
