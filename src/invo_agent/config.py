@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     pending_max_age_seconds: float = 24 * 3600
     # Keep this many request slots for closes / protective TP/SL.
     hl_budget_reserve: float = 50.0
+    # Temporary: allow queued opens/adds while over the address cap so fills
+    # can earn the limit back. Still waits ~11s between posts. Off by default.
+    hl_budget_allow_deficit: bool = False
     # How often to refresh HL userFees (info, not an order).
     hl_fees_refresh_seconds: float = 60.0
     # Re-assert coin leverage if our cache is older than this.

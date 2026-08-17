@@ -99,7 +99,9 @@ class DexExecutor:
             return None
         if self._budget is None:
             self._budget = RequestBudget(
-                self.db, reserve=float(self.settings.hl_budget_reserve)
+                self.db,
+                reserve=float(self.settings.hl_budget_reserve),
+                allow_deficit=bool(self.settings.hl_budget_allow_deficit),
             )
         return self._budget
 

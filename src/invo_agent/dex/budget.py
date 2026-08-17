@@ -101,12 +101,20 @@ class RequestBudget:
         reserve: float = DEFAULT_RESERVE,
         normal_gap: float = NORMAL_GAP_SECONDS,
         deficit_gap: float = DEFICIT_GAP_SECONDS,
+        allow_deficit: bool = False,
     ):
         self.db = db
         self.reserve = float(reserve)
         self.normal_gap = float(normal_gap)
         self.deficit_gap = float(deficit_gap)
+        self.allow_deficit = bool(allow_deficit)
         self._last_post = 0.0
+        if self.allow_deficit:
+            logger.warning(
+                "HL budget allow_deficit=on — opportunistic posts while over the "
+                "cap (still paced at %.0fs)",
+                self.deficit_gap,
+            )
 
     def record_daily_volume(self, days: dict[str, float]) -> None:
         if days:
@@ -144,7 +152,7 @@ class RequestBudget:
         return self.remaining() <= 0
 
     def can_spend(self, legs: int, *, essential: bool) -> bool:
-        if essential:
+        if essential or self.allow_deficit:
             return True
         return self.remaining() - max(1, int(legs)) > self.reserve
 

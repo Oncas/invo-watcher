@@ -87,6 +87,10 @@ def test_gating_essential_vs_opportunistic(tmp_path) -> None:
     budget.db.set_meta("hl_sent", str(budget.limit() - 40))
     assert not budget.can_spend(1, essential=False)
     assert budget.can_spend(1, essential=True)
+    drain = RequestBudget(db, reserve=50, allow_deficit=True)
+    drain.db.set_meta("hl_sent", str(drain.limit() + 2000))
+    assert drain.in_deficit()
+    assert drain.can_spend(1, essential=False)
     db.close()
 
 
