@@ -1424,6 +1424,24 @@ class DexExecutor:
                 pending_add_notional=need,
             )
             return current_sz, None
+        except BudgetDeniedError as exc:
+            # Local request-cap gate — same as an HL "too many" reject: keep the
+            # leftover so the next drain can send it. Do not raise (that was
+            # ERROR_UPDATE and the add vanished).
+            self._stash_pending_add(inv, need, reason="ratelimit", entry=trader_entry)
+            console.print(
+                f"[yellow]UPDATE {coin}: size increase queued "
+                f"(ratelimit; +${need:.2f})[/yellow]"
+            )
+            log_event_throttled(
+                "size_increase_skip",
+                key=f"{coin}:rate_limited",
+                coin=coin,
+                reason="rate_limited",
+                error=str(exc),
+                pending_add_notional=need,
+            )
+            return current_sz, None
         except HlTraderError as exc:
             msg = str(exc).lower()
             if "insufficient margin" in msg:

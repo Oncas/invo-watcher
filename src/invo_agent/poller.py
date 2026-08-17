@@ -673,6 +673,8 @@ class NotificationPoller:
                         return True
                     if self._queue_open_from_error(nid, action, retry_exc):
                         return True
+                    if self._queue_update_from_error(nid, action, retry_exc):
+                        return True
                     self._record_executor_error(nid, action, retry_exc)
                     return True
                 return False  # retry succeeded — fall through to remember
@@ -682,6 +684,8 @@ class NotificationPoller:
             self._notify_dex_login_needed(exc)
             return True
         if self._queue_open_from_error(nid, action, exc):
+            return True
+        if self._queue_update_from_error(nid, action, exc):
             return True
         self._record_executor_error(nid, action, exc)
         return True
@@ -770,6 +774,86 @@ class NotificationPoller:
             "invo-agent · queued",
             f"Waiting ({reason}) — {action.summary}",
             subtitle="Entry-or-better / margin / coin",
+            sound=None,
+            enabled=self.settings.mac_notify,
+            sticky=False,
+        )
+        return True
+
+    def _size_add_gap_notional(
+        self, copy: OpenCopy, inv: InvestmentUpdate
+    ) -> float | None:
+        trader = getattr(self.executor, "_trader", None)
+        coin = (copy.ticker or inv.ticker or inv.name or "").upper()
+        if trader is None or not coin:
+            return None
+        mid = trader.cached_mid(coin)
+        if mid is None or mid <= 0:
+            return None
+        equity = trader.cached_equity()
+        if equity is None or equity <= 0:
+            return None
+        lev = int(inv.leverage or copy.leverage or 1)
+        _, meta = self.executor._resolve_margin(
+            equity=float(equity), leverage=lev, entry_size=inv.entry_size
+        )
+        current = float(copy.size or 0) * float(mid)
+        return max(0.0, float(meta["order_notional_usd"]) - current)
+
+    def _ensure_queued_size_add(self, action: TradeAction, *, reason: str) -> bool:
+        inv = action.investment
+        if inv is None or inv.base_id is None:
+            return False
+        copy = self.db.get_open_copy(str(inv.base_id))
+        if copy is None:
+            return False
+        leftover = float(copy.pending_add_notional or 0)
+        if leftover <= 1e-9:
+            leftover = self._size_add_gap_notional(copy, inv) or 0.0
+        if leftover <= 1e-9:
+            return False
+        entry = inv.entry_price or copy.pending_add_entry or copy.our_entry_px
+        self.db.set_pending_add_notional(
+            str(inv.base_id), leftover, entry=entry, reason=reason
+        )
+        return True
+
+    def _queue_update_from_error(
+        self, nid: str, action: TradeAction, exc: BaseException
+    ) -> bool:
+        """Size↑ blocked by the request cap → queue like a blocked OPEN."""
+        if action.action is not ActionType.UPDATE:
+            return False
+        if not (
+            isinstance(exc, BudgetDeniedError) or self._is_hl_rate_limit_error(exc)
+        ):
+            return False
+        self._note_hl_rate_limit(exc)
+        if not self._ensure_queued_size_add(action, reason="ratelimit"):
+            return False
+        copy = self.db.get_open_copy(str(action.investment.base_id))
+        add = float(copy.pending_add_notional) if copy else 0.0
+        summary = f"{format_action_summary(action)} (ratelimit +${add:.2f})"
+        self.db.mark_processed(nid, "QUEUED_SIZE", str(exc)[:500])
+        self.db.log_action(
+            action="QUEUED_SIZE",
+            summary=summary,
+            notification_id=nid,
+            dry_run=self.is_dry_run,
+        )
+        logger.info("queued size↑ %s", summary)
+        log_event(
+            "pending_add_enqueue",
+            reason="ratelimit",
+            summary=action.summary,
+            error=str(exc),
+            pending_add_notional=add,
+            notification_id=nid,
+        )
+        notify_mac(
+            "invo-agent · queued",
+            f"Waiting (ratelimit) — {action.summary}",
+            subtitle="Size add · request cap",
             sound=None,
             enabled=self.settings.mac_notify,
             sticky=False,

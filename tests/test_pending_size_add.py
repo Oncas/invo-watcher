@@ -5,6 +5,7 @@ from uuid import uuid4
 from invo_agent.api.models import ActionType, InvestmentUpdate, Notification, TradeAction
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB, PendingIntent
+from invo_agent.dex.budget import BudgetDeniedError
 from invo_agent.dex.executor import DexExecutor
 from invo_agent.poller import NotificationPoller
 
@@ -202,6 +203,110 @@ def test_size_increase_rate_limit_keeps_add_queued(tmp_path) -> None:
     copy = db.get_open_copy(str(base_id))
     assert copy is not None
     assert copy.pending_add_notional > 0
+    db.close()
+
+
+def test_size_increase_budget_denied_keeps_add_queued(tmp_path) -> None:
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=False,
+        dry_run=True,
+        hl_min_order_usd=10.0,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="ShortIdH08",
+        ticker="BTC",
+        portfolio_id=None,
+        notification_id="n1",
+        side="short",
+        size=0.00016,
+        leverage=40,
+        trader="alpha_trader",
+    )
+    exe = DexExecutor(settings, db=db)
+
+    def _deny(*args, **kwargs):
+        raise BudgetDeniedError("HL budget reserve: remaining=-2323 need=1 reserve=50")
+
+    trader = _FakeTrader(mid=63623.0, available=50.0)
+    trader.market_order = _deny  # type: ignore[method-assign]
+    sz, sub = exe._apply_size_increase(
+        trader,  # type: ignore[arg-type]
+        inv=_inv(
+            base_id=base_id, entry_size=1.0, entry_price=63256.0, leverage=40
+        ),
+        coin="BTC",
+        is_long=False,
+        current_sz=0.00016,
+        equity=100.0,
+    )
+    assert sub is None
+    assert sz == 0.00016
+    copy = db.get_open_copy(str(base_id))
+    assert copy is not None
+    assert copy.pending_add_notional > 0
+    assert copy.pending_add_reason == "ratelimit"
+    db.close()
+
+
+def test_queue_update_from_budget_denied(tmp_path) -> None:
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=False,
+        dry_run=True,
+        hl_min_order_usd=10.0,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = str(uuid4())
+    nid = str(uuid4())
+    db.upsert_open_copy(
+        investment_base_id=base_id,
+        base_short_id="ShortIdH08",
+        ticker="BTC",
+        portfolio_id=None,
+        notification_id=nid,
+        side="short",
+        size=0.00016,
+        leverage=40,
+        trader="alpha_trader",
+    )
+    db.set_pending_add_notional(base_id, 22.0, entry=63256.0, reason="ratelimit")
+    poller = NotificationPoller(
+        client=SimpleNamespace(session=None),
+        db=db,
+        settings=settings,
+        session_store=SimpleNamespace(),
+    )  # type: ignore[arg-type]
+    notif = Notification.model_validate(
+        {
+            "id": nid,
+            "content": "UPDATE BTC SHORT 40x @alpha_trader ShortIdH08",
+            "notificationType": "user_updated_investment",
+            "createdAt": datetime.now(UTC).isoformat(),
+            "investmentBaseId": base_id,
+            "notifier": {"username": "alpha_trader"},
+        }
+    )
+    action = TradeAction(
+        action=ActionType.UPDATE,
+        notification=notif,
+        investment=_inv(
+            base_id=base_id, entry_size=1.0, entry_price=63256.0, leverage=40
+        ),
+    )
+    assert poller._queue_update_from_error(
+        nid, action, BudgetDeniedError("HL budget reserve: remaining=-2323")
+    )
+    assert db.processed_action(nid) == "QUEUED_SIZE"
+    copy = db.get_open_copy(base_id)
+    assert copy is not None
+    assert copy.pending_add_reason == "ratelimit"
+    assert copy.pending_add_notional == 22.0
     db.close()
 
 

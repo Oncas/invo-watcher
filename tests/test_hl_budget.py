@@ -206,6 +206,11 @@ def test_budget_denied_is_queueable() -> None:
         poller._queueable_open_reason(action, BudgetDeniedError("reserve"))
         == "ratelimit"
     )
+    update = SimpleNamespace(action=ActionType.UPDATE)
+    assert (
+        poller._queueable_open_reason(update, BudgetDeniedError("reserve"))
+        is None
+    )
 
 
 def test_open_skips_leverage_and_counts_order_plus_tpsl(tmp_path) -> None:
