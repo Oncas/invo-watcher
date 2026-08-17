@@ -376,12 +376,6 @@ class DexExecutor:
         )
         available = trader.available_margin()
         size_meta["available_margin_usd"] = available
-        if available + 1e-9 < self.settings.min_order_usd:
-            raise InsufficientMarginError(
-                f"No free margin for {coin} (available=${available:.2f}, "
-                f"need≥${self.settings.min_order_usd:g}; "
-                f"account fully allocated — close something or deposit)"
-            )
         if margin > available:
             # Fit into free margin; may drop below trader % / HL min.
             old_margin = margin
@@ -401,10 +395,6 @@ class DexExecutor:
                 available,
             )
         order_notional = float(size_meta["order_notional_usd"])
-        if margin < self.settings.min_order_usd:
-            raise InsufficientMarginError(
-                f"Margin ${margin:.2f} < MIN_ORDER_USD={self.settings.min_order_usd}"
-            )
         if order_notional + 1e-9 < float(self.settings.hl_min_order_usd):
             raise InsufficientMarginError(
                 f"Order notional ${order_notional:.2f} < HL_MIN_ORDER_USD="
@@ -1305,7 +1295,7 @@ class DexExecutor:
         available = trader.available_margin()
         lev = max(1, leverage)
         buyable = available * 0.98 * lev
-        if available + 1e-9 < self.settings.min_order_usd or buyable + 1e-9 < hl_min:
+        if buyable + 1e-9 < hl_min:
             self._stash_pending_add(inv, need, reason="margin", entry=trader_entry)
             console.print(
                 f"[yellow]UPDATE {coin}: size increase queued "
@@ -2300,18 +2290,10 @@ class DexExecutor:
             equity=equity, leverage=leverage, entry_size=inv.entry_size
         )
         available = trader.available_margin()
-        if available + 1e-9 < self.settings.min_order_usd:
-            raise InsufficientMarginError(
-                f"No free margin for {coin} (available=${available:.2f})"
-            )
         if margin > available:
             margin = available * 0.98
             size_meta["order_notional_usd"] = margin * max(1, leverage)
         order_notional = float(size_meta["order_notional_usd"])
-        if margin < self.settings.min_order_usd:
-            raise InsufficientMarginError(
-                f"Margin ${margin:.2f} < MIN_ORDER_USD={self.settings.min_order_usd}"
-            )
         if order_notional + 1e-9 < float(self.settings.hl_min_order_usd):
             raise InsufficientMarginError(
                 f"Order notional ${order_notional:.2f} < HL min"

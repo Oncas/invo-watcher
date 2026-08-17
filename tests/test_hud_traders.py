@@ -34,6 +34,8 @@ def test_format_pending_reason() -> None:
     assert format_pending_reason(kind="OPEN", reason="same_coin") == "same_coin"
     assert format_pending_reason(kind="OPEN", reason="margin") == "margin"
     assert format_pending_reason(kind="OPEN", reason="price") == "price"
+    assert format_pending_reason(kind="OPEN", reason="ratelimit") == "ratelimit"
+    assert format_pending_reason(kind="OPEN", reason="budget") == "ratelimit"
     assert (
         format_pending_reason(
             kind="OPEN", reason="price", side="short", trader_entry=0.5

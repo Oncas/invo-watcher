@@ -59,7 +59,6 @@ def test_pending_add_drain_does_not_touch_tpsl(tmp_path) -> None:
         session_path=tmp_path / "session.json",
         live=False,
         dry_run=True,
-        min_order_usd=1.0,
         hl_min_order_usd=10.0,
     )
     db = AgentDB(settings.db_path)
@@ -111,7 +110,6 @@ def test_pending_add_drain_records_mimic_after_fill(tmp_path) -> None:
         session_path=tmp_path / "session.json",
         live=True,
         dry_run=False,
-        min_order_usd=1.0,
         hl_min_order_usd=10.0,
     )
     db = AgentDB(settings.db_path)
@@ -169,7 +167,6 @@ def test_size_increase_rate_limit_keeps_add_queued(tmp_path) -> None:
         session_path=tmp_path / "session.json",
         live=False,
         dry_run=True,
-        min_order_usd=1.0,
         hl_min_order_usd=10.0,
     )
     db = AgentDB(settings.db_path)
@@ -255,7 +252,6 @@ def test_size_increase_queues_when_no_margin(tmp_path) -> None:
         session_path=tmp_path / "session.json",
         live=False,
         dry_run=True,
-        min_order_usd=1.0,
         hl_min_order_usd=10.0,
     )
     db = AgentDB(settings.db_path)
@@ -298,7 +294,6 @@ def test_size_increase_queues_when_price_worse(tmp_path) -> None:
         session_path=tmp_path / "session.json",
         live=False,
         dry_run=True,
-        min_order_usd=1.0,
         hl_min_order_usd=10.0,
     )
     db = AgentDB(settings.db_path)
@@ -488,10 +483,17 @@ def test_queued_ready_locally_price_and_margin() -> None:
         reason="price", mid=0.22, trader_entry=0.20, is_long=True
     )
     assert not queued_ready_locally(
-        reason="margin", available=0.0, leverage=10, hl_min_order_usd=10, min_order_usd=1
+        reason="margin", available=0.0, leverage=10, hl_min_order_usd=10
     )
     assert queued_ready_locally(
-        reason="margin", available=5.0, leverage=10, hl_min_order_usd=10, min_order_usd=1
+        reason="margin", available=5.0, leverage=10, hl_min_order_usd=10
+    )
+    # High lev: $0.50 free cash can still clear HL's $10 notional.
+    assert queued_ready_locally(
+        reason="margin", available=0.50, leverage=40, hl_min_order_usd=10
+    )
+    assert not queued_ready_locally(
+        reason="margin", available=0.20, leverage=20, hl_min_order_usd=10
     )
     assert not queued_ready_locally(
         reason="size", leftover_notional=4.0, hl_min_order_usd=10

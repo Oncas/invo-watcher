@@ -693,10 +693,10 @@ class NotificationPoller:
         if isinstance(exc, SameCoinOpenError):
             return "same_coin"
         if isinstance(exc, BudgetDeniedError):
-            return "budget"
-        if self._is_insufficient_margin_error(exc):
-            return "margin"
+            return "ratelimit"
         if self._is_hl_rate_limit_error(exc):
+            return "ratelimit"
+        if self._is_insufficient_margin_error(exc):
             return "margin"
         return None
 
@@ -1686,7 +1686,7 @@ class NotificationPoller:
             return False
         trader = getattr(self.executor, "_trader", None)
         why = (intent.reason or "").lower()
-        if why == "budget":
+        if why in {"ratelimit", "budget"}:
             budget = self.executor.budget()
             return bool(budget and budget.can_spend(1, essential=False))
         if why == "price":
@@ -1699,7 +1699,6 @@ class NotificationPoller:
             trader_entry=intent.trader_entry,
             is_long=intent.side.lower() == "long",
             hl_min_order_usd=self.settings.hl_min_order_usd,
-            min_order_usd=self.settings.min_order_usd,
             leverage=float(intent.leverage or 1),
             coin_free=self._coin_is_free(intent.coin),
         )
@@ -1715,7 +1714,6 @@ class NotificationPoller:
             is_long=(copy.side or "long").lower() == "long",
             leftover_notional=float(copy.pending_add_notional or 0),
             hl_min_order_usd=self.settings.hl_min_order_usd,
-            min_order_usd=self.settings.min_order_usd,
             leverage=float(copy.leverage or 1),
         )
 

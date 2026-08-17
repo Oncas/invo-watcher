@@ -72,7 +72,6 @@ def _settings(tmp_path, **extra) -> Settings:
         session_path=tmp_path / "session.json",
         live=False,
         dry_run=True,
-        min_order_usd=1.0,
         hl_min_order_usd=10.0,
         **extra,
     )
@@ -106,6 +105,9 @@ def test_entry_size_is_percent_not_fraction(tmp_path) -> None:
     assert meta["bumped_to_hl_min"] is True
     assert meta["order_notional_usd"] == 10.0
     assert meta["capped"] is False
+    tiny, tiny_meta = exe._resolve_margin(equity=100.0, leverage=20, entry_size=0.1)
+    assert tiny == 0.5
+    assert tiny_meta["order_notional_usd"] == 10.0
 
 
 def test_size_cut_reduces_and_cancels_pending(tmp_path) -> None:
@@ -518,7 +520,6 @@ def test_reparking_keeps_original_levels_and_stays_quiet(tmp_path) -> None:
         session_path=tmp_path / "session.json",
         live=True,
         dry_run=False,
-        min_order_usd=1.0,
         hl_min_order_usd=10.0,
         recovery_sl_pct=3.0,
     )
@@ -615,7 +616,6 @@ def test_late_close_routes_to_recovery(tmp_path) -> None:
         session_path=tmp_path / "session.json",
         live=True,
         dry_run=False,
-        min_order_usd=1.0,
         hl_min_order_usd=10.0,
     )
     db = AgentDB(settings.db_path)

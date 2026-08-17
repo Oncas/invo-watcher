@@ -84,6 +84,8 @@ def format_pending_reason(
     """Queue label: wait reason, plus size↑ on leftover adds."""
     _ = (side, trader_entry, amount)
     wait = (reason or "").strip() or "?"
+    if wait == "budget":
+        wait = "ratelimit"
     if wait in _BELOW_MIN_REASONS:
         wait = "under min"
     if pending_kind(kind=kind) == "UPDATE":

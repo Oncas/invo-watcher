@@ -91,7 +91,6 @@ MAC_NOTIFY_SOUND=Glass
 | `RECOVERY_ENABLED` | On startup, reconcile open copies vs Involio closes (default true) |
 | `RECOVERY_SL_PCT` | Adverse % from mid for parked SL while waiting recovery TP (default 3) |
 | `MIN_EQUITY_USD` | Skip trades if HL equity is below this |
-| `MIN_ORDER_USD` | Skip if sized margin is below this |
 | `PORTFOLIO_ALLOWLIST` | Only act on these followed portfolios |
 | `MAC_NOTIFY` | macOS notifications on actions/errors (Mac sidecar; set `false` on the VPS) |
 | `MAC_NOTIFY_STICKY` | Stay until **Dismiss** (Slack-style via `alerter`) |
@@ -185,7 +184,7 @@ How a CLOSE is handled depends on how late we are:
 | Failed on a blip (cap / network), < 2 min old | Retried at market on the next poll |
 | Older than 10 min, or still failing | Recovery prices it: flatten while green or less red than the trader, otherwise park TP/SL. A parked copy is never market-dumped later. |
 
-Hyperliquid’s address budget is `10,000 + 1 request per USDC traded` (lifetime, no daily reset). The agent tracks it locally from `userFees` volume plus every action it posts, and re-anchors from HL’s rejection string. Closes and protective TP/SL always go through; new opens and size-adds wait while remaining slots are at or below `HL_BUDGET_RESERVE` (default 50). While over the cap, actions are spaced 11s apart so we use HL’s one-per-10s allowance on the trade instead of a leverage write.
+Hyperliquid’s address request cap is `10,000 + 1 request per USDC traded` (lifetime, no daily reset). The agent tracks it locally from `userFees` volume plus every action it posts, and re-anchors from HL’s rejection string. Closes and protective TP/SL always go through; new opens and size-adds wait (HUD tag `ratelimit`) while remaining slots are at or below `HL_BUDGET_RESERVE` (default 50). While over the cap, actions are spaced 11s apart so we use HL’s one-per-10s allowance on the trade instead of a leverage write.
 
 A fresh OPEN is still an IoC at entry-or-better. Queued opens place **one** resting GTC at the trader’s entry and wait; they are not re-probed every poll. An unchanged UPDATE writes nothing. TP/SL replaces only the leg that moved.
 
@@ -228,7 +227,6 @@ DRY_RUN=false
 LIVE=true
 POSITION_PCT=5
 MIN_EQUITY_USD=5
-MIN_ORDER_USD=1
 ```
 
 ### 6c. Run

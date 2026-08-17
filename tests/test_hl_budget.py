@@ -203,7 +203,8 @@ def test_budget_denied_is_queueable() -> None:
     )  # type: ignore[arg-type]
     action = SimpleNamespace(action=ActionType.OPEN)
     assert (
-        poller._queueable_open_reason(action, BudgetDeniedError("reserve")) == "budget"
+        poller._queueable_open_reason(action, BudgetDeniedError("reserve"))
+        == "ratelimit"
     )
 
 
@@ -216,7 +217,6 @@ def test_open_skips_leverage_and_counts_order_plus_tpsl(tmp_path) -> None:
         session_path=tmp_path / "session.json",
         live=True,
         dry_run=False,
-        min_order_usd=1.0,
         hl_min_order_usd=10.0,
     )
     db = AgentDB(settings.db_path)
@@ -303,7 +303,6 @@ def test_unchanged_update_posts_nothing(tmp_path) -> None:
         session_path=tmp_path / "session.json",
         live=True,
         dry_run=False,
-        min_order_usd=1.0,
         hl_min_order_usd=10.0,
     )
     db = AgentDB(settings.db_path)

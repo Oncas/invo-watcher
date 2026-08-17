@@ -44,7 +44,6 @@ class Settings(BaseSettings):
     max_position_pct: float = 50.0
     notification_page_size: int = 20
     min_equity_usd: float = 5.0
-    min_order_usd: float = 1.0
     # Hyperliquid rejects orders with notional (margin×leverage) below this.
     hl_min_order_usd: float = 10.0
 
