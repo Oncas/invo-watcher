@@ -27,12 +27,40 @@ def price_at_pnl(entry: float, pnl_pct: float, is_long: bool) -> float:
     return entry * (1.0 - pnl_pct)
 
 
-def adverse_sl_price(mid: float, sl_pct: float, is_long: bool) -> float:
-    """sl_pct is percent points (e.g. 3.0 → 3% adverse from mid)."""
-    frac = abs(sl_pct) / 100.0
+def adverse_sl_price(
+    mid: float,
+    sl_pct: float,
+    is_long: bool,
+    leverage: float = 1.0,
+) -> float:
+    """``sl_pct`` is ROE / margin points (e.g. 3.0 → 3% of our equity on this clip).
+
+    Price distance is ``sl_pct / leverage`` so 3x and 40x risk the same cash.
+    """
+    lev = max(1.0, float(leverage or 1))
+    frac = abs(sl_pct) / 100.0 / lev
     if is_long:
         return mid * (1.0 - frac)
     return mid * (1.0 + frac)
+
+
+def looks_like_unlevered_park_sl(
+    sl: float,
+    mid: float,
+    *,
+    sl_pct: float,
+    leverage: float,
+) -> bool:
+    """True when a parked SL is still the old price-% stop (not ROE / lev)."""
+    if mid <= 0 or sl <= 0:
+        return False
+    lev = max(1.0, float(leverage or 1))
+    if lev <= 1.0 + 1e-9:
+        return False
+    frac = abs(float(sl) - mid) / mid
+    unlev = abs(sl_pct) / 100.0
+    levered = unlev / lev
+    return frac > levered * 1.2 and abs(frac - unlev) < 0.012
 
 
 def tp_already_reached(mid: float, tp: float, is_long: bool) -> bool:
@@ -49,10 +77,11 @@ def decide_missed_close(
     trader_entry: float | None,
     trader_close: float | None,
     recovery_sl_pct: float,
+    leverage: float = 1.0,
 ) -> RecoveryDecision:
     """Decide flatten-now vs park reduce-only TP/SL for a missed Involio close."""
     our_pnl = unrealized_pnl_pct(our_entry, mid, is_long)
-    sl = adverse_sl_price(mid, recovery_sl_pct, is_long)
+    sl = adverse_sl_price(mid, recovery_sl_pct, is_long, leverage)
 
     if our_pnl >= 0:
         return RecoveryDecision(

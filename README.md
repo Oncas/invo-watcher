@@ -89,7 +89,7 @@ MAC_NOTIFY_SOUND=Glass
 | `HL_MIN_ORDER_USD` | Floor order notional (margin×leverage); default $10 for Hyperliquid |
 | `MAX_POSITION_PCT` | Cap each OPEN to this % of equity as margin (default 50) |
 | `RECOVERY_ENABLED` | On startup, reconcile open copies vs Involio closes (default true) |
-| `RECOVERY_SL_PCT` | Adverse % from mid for parked SL while waiting recovery TP (default 3) |
+| `RECOVERY_SL_PCT` | Parked SL as % of our margin (price move = this / leverage; default 3) |
 | `MIN_EQUITY_USD` | Skip trades if HL equity is below this |
 | `PORTFOLIO_ALLOWLIST` | Only act on these followed portfolios |
 | `MAC_NOTIFY` | macOS notifications on actions/errors (Mac sidecar; set `false` on the VPS) |

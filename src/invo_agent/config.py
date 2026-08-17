@@ -49,7 +49,7 @@ class Settings(BaseSettings):
 
     # Missed-close startup recovery: when Involio closed offline but we still hold HL.
     recovery_enabled: bool = True
-    # Adverse % from current mid for parked reduce-only SL while waiting for TP.
+    # Parked reduce-only SL: ROE / margin % (divided by leverage → price).
     recovery_sl_pct: float = 3.0
     # Background Turnkey renew when remaining TTL is below this (capped to 25% of issued TTL).
     dex_renew_before_seconds: float = 6 * 3600

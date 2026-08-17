@@ -562,7 +562,12 @@ def test_reparking_keeps_original_levels_and_stays_quiet(tmp_path) -> None:
     exe._record_recovery_close = lambda **kwargs: None  # type: ignore[method-assign]
 
     first = exe.recover_missed_close(
-        coin="UNI", inv=inv, our_entry_px=3.0, our_side="short", our_size=22.0
+        coin="UNI",
+        inv=inv,
+        our_entry_px=3.0,
+        our_side="short",
+        our_size=22.0,
+        our_leverage=10,
     )
     assert first.status == "parked"
     assert first.changed is True
@@ -578,6 +583,7 @@ def test_reparking_keeps_original_levels_and_stays_quiet(tmp_path) -> None:
         our_size=22.0,
         parked_tp=first.tp,
         parked_sl=first.sl,
+        our_leverage=10,
     )
     assert second.tp == first.tp
     assert second.sl == first.sl

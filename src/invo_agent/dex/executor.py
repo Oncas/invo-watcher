@@ -41,7 +41,11 @@ from invo_agent.dex.pricing import (
     price_is_at_or_better,
     size_clearing_min_notional,
 )
-from invo_agent.dex.recovery import RecoveryDecision, decide_missed_close
+from invo_agent.dex.recovery import (
+    RecoveryDecision,
+    decide_missed_close,
+    looks_like_unlevered_park_sl,
+)
 from invo_agent.dex.session import DexSessionError, DexSessionStore, load_signer
 from invo_agent.dex.turnkey_crypto import new_client_tx_id
 from invo_agent.events import log_event, log_event_throttled
@@ -1878,6 +1882,7 @@ class DexExecutor:
         copy_base_id: str | None = None,
         parked_tp: float | None = None,
         parked_sl: float | None = None,
+        our_leverage: float | None = None,
     ) -> RecoveryResult:
         """Flatten or park TP/SL after detecting Involio closed while we were offline."""
         coin = coin.upper()
@@ -1933,6 +1938,7 @@ class DexExecutor:
                     trader_entry=inv.entry_price,
                     trader_close=inv.closing_price,
                     recovery_sl_pct=self.settings.recovery_sl_pct,
+                    leverage=max(1, int(our_leverage or 1)),
                 )
                 msg = (
                     f"RECOVERY dry-run {decision_preview.action} {coin} "
@@ -2026,6 +2032,10 @@ class DexExecutor:
         entry = float(entry)
         mid = trader.mid_price(coin)
 
+        lev = max(
+            1,
+            int(our_leverage or detail.get("leverage") or 1),
+        )
         decision = decide_missed_close(
             our_entry=entry,
             mid=mid,
@@ -2033,23 +2043,41 @@ class DexExecutor:
             trader_entry=inv.entry_price,
             trader_close=inv.closing_price,
             recovery_sl_pct=self.settings.recovery_sl_pct,
+            leverage=lev,
         )
         # Already parked: keep the levels we parked at. The SL is measured from
         # the mid, so recomputing it would trail the price and cancel/replace the
-        # same pair of triggers on every pass.
+        # same pair of triggers on every pass. Rewrite once if this is still the
+        # old price-% stop (3% of mid, not 3% ROE).
         if (
             decision.action == "park"
             and parked_tp is not None
             and parked_sl is not None
         ):
-            decision = RecoveryDecision(
-                action="park",
-                reason=decision.reason,
-                tp=float(parked_tp),
-                sl=float(parked_sl),
-                our_pnl_pct=decision.our_pnl_pct,
-                trader_pnl_pct=decision.trader_pnl_pct,
-            )
+            keep_sl = float(parked_sl)
+            if not looks_like_unlevered_park_sl(
+                keep_sl,
+                mid,
+                sl_pct=self.settings.recovery_sl_pct,
+                leverage=lev,
+            ):
+                decision = RecoveryDecision(
+                    action="park",
+                    reason=decision.reason,
+                    tp=float(parked_tp),
+                    sl=keep_sl,
+                    our_pnl_pct=decision.our_pnl_pct,
+                    trader_pnl_pct=decision.trader_pnl_pct,
+                )
+            else:
+                decision = RecoveryDecision(
+                    action="park",
+                    reason=decision.reason,
+                    tp=float(parked_tp),
+                    sl=decision.sl,
+                    our_pnl_pct=decision.our_pnl_pct,
+                    trader_pnl_pct=decision.trader_pnl_pct,
+                )
         # Parking positionTpsl cancels other coin triggers — when another open_copy
         # shares the coin, always reduce-only close our slice instead.
         if decision.action == "park" and shared:
