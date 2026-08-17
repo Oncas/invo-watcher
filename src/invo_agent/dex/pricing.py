@@ -15,6 +15,7 @@ def queued_ready_locally(
     hl_min_order_usd: float = 10.0,
     leverage: float = 1.0,
     coin_free: bool = False,
+    need_margin: float | None = None,
 ) -> bool:
     """True when cached book says a queued open/add can fill — no order yet."""
     why = (reason or "").lower()
@@ -27,6 +28,8 @@ def queued_ready_locally(
     if why in {"margin", "size", "dust", "below_hl_min"}:
         if available is None:
             return False
+        if need_margin is not None:
+            return available + 1e-9 >= float(need_margin)
         lev = max(1.0, float(leverage or 1))
         return available * 0.98 * lev + 1e-9 >= float(hl_min_order_usd)
     if why == "same_coin":
@@ -43,14 +46,16 @@ def classify_pending_wait(
     available: float | None = None,
     leverage: float = 1.0,
     hl_min_order_usd: float = 10.0,
+    need_margin: float | None = None,
     can_spend: bool | None = None,
     prior: str | None = None,
 ) -> str:
     """Current queue token from the live book — not the error that first queued it.
 
-    First blocker wins: same_coin, price, margin (not enough cash for $10),
-    ratelimit. Tiny clips are bumped to the HL min when cash allows — they
-    never get their own wait state.
+    First blocker that actually stops *this* row:
+    same_coin → price → margin (cash < this clip's need) → ratelimit.
+    A 20% open can be margin while a $10 bump on the same book is ratelimit
+    or price. Rows that are ready to send all share ratelimit when the cap is hit.
     """
     if not coin_free:
         return "same_coin"
@@ -58,10 +63,12 @@ def classify_pending_wait(
         mid=mid, trader_entry=trader_entry, is_long=is_long
     ):
         return "price"
-    hl_min = float(hl_min_order_usd)
     if available is not None:
-        lev = max(1.0, float(leverage or 1))
-        if available * 0.98 * lev + 1e-9 < hl_min:
+        need = need_margin
+        if need is None:
+            lev = max(1.0, float(leverage or 1))
+            need = float(hl_min_order_usd) / lev
+        if available + 1e-9 < float(need):
             return "margin"
     if can_spend is False:
         return "ratelimit"

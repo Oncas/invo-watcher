@@ -514,6 +514,13 @@ def test_queued_ready_locally_price_and_margin() -> None:
     assert not queued_ready_locally(
         reason="margin", available=0.20, leverage=20, hl_min_order_usd=10
     )
+    # Per-clip need: $18 free funds a $10 bump, not a 20% / $20 open.
+    assert queued_ready_locally(
+        reason="margin", available=18.0, need_margin=0.50
+    )
+    assert not queued_ready_locally(
+        reason="margin", available=18.0, need_margin=20.0
+    )
     assert not queued_ready_locally(
         reason="size", available=0.0, leverage=10, hl_min_order_usd=10
     )
@@ -556,6 +563,118 @@ def test_classify_pending_wait_priority() -> None:
     assert classify_pending_wait(coin_free=True, prior="budget") == "ratelimit"
     assert classify_pending_wait(coin_free=True, prior="size") == "margin"
     assert classify_pending_wait(coin_free=True, prior="dust") == "margin"
+    # Fat clip needs $20; $18 free → margin even while the request cap is hit.
+    assert (
+        classify_pending_wait(
+            coin_free=True,
+            mid=2.0,
+            trader_entry=2.1,
+            is_long=True,
+            available=18.0,
+            need_margin=20.0,
+            can_spend=False,
+            prior="ratelimit",
+        )
+        == "margin"
+    )
+    # Same book, 1% bumped to $10 (~$0.50 cash) → ratelimit, not margin.
+    assert (
+        classify_pending_wait(
+            coin_free=True,
+            mid=2.0,
+            trader_entry=2.1,
+            is_long=True,
+            available=18.0,
+            need_margin=0.50,
+            can_spend=False,
+            prior="margin",
+        )
+        == "ratelimit"
+    )
+    # Tiny clip has cash, but mid is worse → price, not ratelimit.
+    assert (
+        classify_pending_wait(
+            coin_free=True,
+            mid=2.2,
+            trader_entry=2.0,
+            is_long=True,
+            available=18.0,
+            need_margin=0.50,
+            can_spend=False,
+            prior="ratelimit",
+        )
+        == "price"
+    )
+
+
+def test_live_pending_reason_fat_vs_tiny(tmp_path) -> None:
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=False,
+        dry_run=True,
+        hl_min_order_usd=10.0,
+    )
+    db = AgentDB(settings.db_path)
+    poller = NotificationPoller(
+        client=SimpleNamespace(session=None),
+        db=db,
+        settings=settings,
+        session_store=SimpleNamespace(),
+    )  # type: ignore[arg-type]
+    poller.executor._trader = SimpleNamespace(
+        cached_equity=lambda: 100.0,
+        cached_available=lambda: 18.0,
+        cached_mid=lambda coin: 2.0,
+    )
+    poller.executor.budget = lambda: SimpleNamespace(  # type: ignore[method-assign]
+        can_spend=lambda n, essential=False: False
+    )
+    assert poller._need_margin_usd(entry_size=20.0, leverage=10) == 20.0
+    # 0.5% of $100 is $5 notional at 10x → bump to $10 → $1 cash.
+    assert poller._need_margin_usd(entry_size=0.5, leverage=10) == 1.0
+    assert poller._need_margin_usd(
+        entry_size=None, leverage=10, leftover_notional=3.0
+    ) == 1.0
+
+    now = datetime.now(UTC).isoformat()
+    fat = PendingIntent(
+        investment_base_id="fat",
+        coin="XRP",
+        side="long",
+        reason="ratelimit",
+        created_at=now,
+        updated_at=now,
+        leverage=10,
+        trader_entry=2.1,
+        entry_size=20.0,
+    )
+    tiny = PendingIntent(
+        investment_base_id="tiny",
+        coin="ETH",
+        side="long",
+        reason="margin",
+        created_at=now,
+        updated_at=now,
+        leverage=10,
+        trader_entry=2.1,
+        entry_size=0.5,
+    )
+    worse = PendingIntent(
+        investment_base_id="worse",
+        coin="LDO",
+        side="long",
+        reason="ratelimit",
+        created_at=now,
+        updated_at=now,
+        leverage=10,
+        trader_entry=1.8,
+        entry_size=0.5,
+    )
+    assert poller._live_pending_reason(fat) == "margin"
+    assert poller._live_pending_reason(tiny) == "ratelimit"
+    assert poller._live_pending_reason(worse) == "price"
+    db.close()
 
 
 def test_should_attempt_queued_local_or_fallback(tmp_path) -> None:

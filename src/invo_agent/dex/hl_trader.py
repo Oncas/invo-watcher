@@ -469,6 +469,11 @@ class HlTrader:
             return None
         return float(self._book.available)
 
+    def cached_equity(self) -> float | None:
+        if self._book is None:
+            return None
+        return float(self._book.equity)
+
     def account_value(self) -> float:
         return float(self._ensure_book().equity)
 

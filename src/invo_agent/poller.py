@@ -1687,12 +1687,36 @@ class NotificationPoller:
             last_tried_at, self._queued_fallback_seconds(reason)
         )
 
+    def _need_margin_usd(
+        self,
+        *,
+        entry_size: float | None,
+        leverage: float | None,
+        leftover_notional: float | None = None,
+    ) -> float | None:
+        """Cash this clip must lock — trader % after the $10 notional bump."""
+        lev = max(1, int(leverage or 1))
+        hl_min = float(self.settings.hl_min_order_usd)
+        min_margin = hl_min / lev
+        if leftover_notional is not None and leftover_notional > 0:
+            return max(float(leftover_notional) / lev, min_margin)
+        trader = getattr(self.executor, "_trader", None)
+        equity = trader.cached_equity() if trader is not None else None
+        if equity is None or equity <= 0:
+            return min_margin
+        margin, _ = self.executor._resolve_margin(
+            equity=float(equity), leverage=lev, entry_size=entry_size
+        )
+        return max(float(margin), min_margin)
+
+    def _can_spend_opportunistic(self) -> bool | None:
+        budget = self.executor.budget()
+        if budget is None:
+            return None
+        return budget.can_spend(1, essential=False)
+
     def _live_pending_reason(self, intent: PendingIntent) -> str:
         trader = getattr(self.executor, "_trader", None)
-        budget = self.executor.budget()
-        can_spend = None
-        if budget is not None:
-            can_spend = budget.can_spend(1, essential=False)
         return classify_pending_wait(
             coin_free=self._coin_is_free(intent.coin),
             mid=trader.cached_mid(intent.coin) if trader is not None else None,
@@ -1701,8 +1725,32 @@ class NotificationPoller:
             available=trader.cached_available() if trader is not None else None,
             leverage=float(intent.leverage or 1),
             hl_min_order_usd=self.settings.hl_min_order_usd,
-            can_spend=can_spend,
+            need_margin=self._need_margin_usd(
+                entry_size=intent.entry_size, leverage=intent.leverage
+            ),
+            can_spend=self._can_spend_opportunistic(),
             prior=intent.reason,
+        )
+
+    def _live_pending_add_reason(self, copy: OpenCopy) -> str:
+        trader = getattr(self.executor, "_trader", None)
+        coin = (copy.ticker or "").upper()
+        leftover = float(copy.pending_add_notional or 0)
+        return classify_pending_wait(
+            coin_free=True,
+            mid=trader.cached_mid(coin) if trader is not None and coin else None,
+            trader_entry=copy.pending_add_entry,
+            is_long=(copy.side or "long").lower() == "long",
+            available=trader.cached_available() if trader is not None else None,
+            leverage=float(copy.leverage or 1),
+            hl_min_order_usd=self.settings.hl_min_order_usd,
+            need_margin=self._need_margin_usd(
+                entry_size=None,
+                leverage=copy.leverage,
+                leftover_notional=leftover,
+            ),
+            can_spend=self._can_spend_opportunistic(),
+            prior=copy.pending_add_reason,
         )
 
     def _refresh_pending_reasons(self) -> None:
@@ -1721,14 +1769,21 @@ class NotificationPoller:
             self.db.upsert_pending_intent(intent)
         for copy in self.db.list_open_copies():
             add = float(copy.pending_add_notional or 0)
-            why = (copy.pending_add_reason or "").lower()
-            if add <= 0 or why not in {"size", "dust", "below_hl_min", "under min", "budget"}:
+            if add <= 0:
                 continue
-            mapped = "ratelimit" if why == "budget" else "margin"
+            new = self._live_pending_add_reason(copy)
+            if new == (copy.pending_add_reason or ""):
+                continue
+            logger.info(
+                "pending add reason %s %s → %s",
+                copy.ticker,
+                copy.pending_add_reason,
+                new,
+            )
             self.db.set_pending_add_notional(
                 copy.investment_base_id,
                 add,
-                reason=mapped,
+                reason=new,
                 entry=copy.pending_add_entry,
             )
 
@@ -1752,6 +1807,9 @@ class NotificationPoller:
             hl_min_order_usd=self.settings.hl_min_order_usd,
             leverage=float(intent.leverage or 1),
             coin_free=self._coin_is_free(intent.coin),
+            need_margin=self._need_margin_usd(
+                entry_size=intent.entry_size, leverage=intent.leverage
+            ),
         )
 
     def _pending_add_local_ok(self, copy: OpenCopy) -> bool:
@@ -1761,15 +1819,21 @@ class NotificationPoller:
         if why in {"ratelimit", "budget"}:
             budget = self.executor.budget()
             return bool(budget and budget.can_spend(1, essential=False))
+        leftover = float(copy.pending_add_notional or 0)
         return queued_ready_locally(
             reason=why,
             mid=trader.cached_mid(coin) if trader is not None and coin else None,
             available=trader.cached_available() if trader is not None else None,
             trader_entry=copy.pending_add_entry,
             is_long=(copy.side or "long").lower() == "long",
-            leftover_notional=float(copy.pending_add_notional or 0),
+            leftover_notional=leftover,
             hl_min_order_usd=self.settings.hl_min_order_usd,
             leverage=float(copy.leverage or 1),
+            need_margin=self._need_margin_usd(
+                entry_size=None,
+                leverage=copy.leverage,
+                leftover_notional=leftover,
+            ),
         )
 
     def _drain_pending(self) -> None:
