@@ -500,7 +500,7 @@ def collect_hud(
     now_hud = datetime.now(UTC)
     pending_rows: list[dict] = []
     for intent in db.list_pending_intents():
-        wait = intent.reason
+        wait = "ratelimit" if intent.reason == "budget" else intent.reason
         pending_rows.append(
             {
                 "coin": intent.coin,
@@ -526,7 +526,8 @@ def collect_hud(
         add = float(copy.pending_add_notional or 0)
         if add <= 0 or not copy.ticker:
             continue
-        wait = copy.pending_add_reason or "size"
+        raw_wait = copy.pending_add_reason or "size"
+        wait = "ratelimit" if raw_wait == "budget" else raw_wait
         entry = copy.pending_add_entry or copy.our_entry_px
         pending_rows.append(
             {
