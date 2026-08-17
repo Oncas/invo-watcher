@@ -175,7 +175,17 @@ invo-agent dry-run
 
 On every start (or after `reset-state`), **catch-up** marks existing notifications as already handled, then only new trader signals fire OPEN / UPDATE / CLOSE.
 
-After catch-up, **missed-close recovery** checks local open copies against Involio. If the trader already closed while the agent was offline but Hyperliquid still holds the coin, it either market-closes or parks reduce-only TP/SL (`RECOVERY_ENABLED`, `RECOVERY_SL_PCT`).
+After catch-up, **missed-close recovery** checks local open copies against Involio. If the trader already closed while the agent was offline but Hyperliquid still holds the coin, it either market-closes or parks reduce-only TP/SL (`RECOVERY_ENABLED`, `RECOVERY_SL_PCT`). It also runs every 5 minutes, and immediately after a CLOSE we could not execute.
+
+How a CLOSE is handled depends on how late we are:
+
+| Age of the CLOSE signal | Behaviour |
+| --- | --- |
+| Fresh | Market-close our slice |
+| Failed on a blip (cap / network), < 2 min old | Retried at market on the next poll |
+| Older than 10 min, or still failing | Recovery prices it: flatten while green or less red than the trader, otherwise park TP/SL. A parked copy is never market-dumped later. |
+
+When Hyperliquid answers “too many requests”, queued opens and size-adds pause for 2 minutes so the remaining request budget goes to closes. Queued rows are retried at most once every 15s each, a few per poll.
 
 You’ll get:
 

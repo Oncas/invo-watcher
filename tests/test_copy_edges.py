@@ -6,11 +6,12 @@ import pytest
 
 from invo_agent.api.models import ActionType, InvestmentUpdate, Notification, TradeAction
 from invo_agent.config import Settings
-from invo_agent.db import AgentDB
-from invo_agent.dex.executor import DexExecutor
+from invo_agent.db import AgentDB, PendingIntent
+from invo_agent.dex.executor import DexExecutor, RecoveryResult
 from invo_agent.dex.hl_trader import (
     GhostCopyError,
     HlTraderError,
+    RecoveryParkedError,
     SideMismatchError,
     tpsl_already_resting,
 )
@@ -418,6 +419,259 @@ def test_rate_limit_update_is_marked_processed(tmp_path) -> None:
     )  # type: ignore[arg-type]
     poller._record_executor_error(str(notif.id), action, _rate_limit_exc())
     assert db.is_processed(str(notif.id))
+    db.close()
+
+
+def _poller(settings, db) -> NotificationPoller:
+    return NotificationPoller(
+        client=SimpleNamespace(session=None),
+        db=db,
+        settings=settings,
+        session_store=SimpleNamespace(),
+    )  # type: ignore[arg-type]
+
+
+def test_transient_close_retries_then_hands_off_to_recovery(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    poller = _poller(settings, db)
+    blip = HlTraderError("HL close failed: connect error / read timeout")
+
+    fresh_notif, fresh = _close_action(created=datetime.now(UTC))
+    poller._record_executor_error(str(fresh_notif.id), fresh, blip)
+    assert not db.is_processed(str(fresh_notif.id))
+    assert poller._force_missed_close is False
+
+    old_notif, old = _close_action(created=datetime.now(UTC) - timedelta(minutes=30))
+    poller._record_executor_error(str(old_notif.id), old, blip)
+    assert db.is_processed(str(old_notif.id))
+    assert poller._force_missed_close is True
+    db.close()
+
+
+def test_close_is_never_filed_as_no_margin(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    poller = _poller(settings, db)
+    notif, action = _close_action(created=datetime.now(UTC))
+    poller._record_executor_error(
+        str(notif.id), action, HlTraderError("HL close not ok: Insufficient margin")
+    )
+    assert db.processed_action(str(notif.id)) == "ERROR_CLOSE"
+    assert poller._force_missed_close is True
+    db.close()
+
+
+def test_parked_copy_close_keeps_park(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="ShortIdF06",
+        ticker="UNI",
+        portfolio_id=None,
+        notification_id="n1",
+        side="short",
+        size=22.0,
+        trader="delta_trader",
+    )
+    db.set_recovery_state(
+        str(base_id), pending=True, recovery_tp=3.0, recovery_sl=3.2
+    )
+    exe = DexExecutor(settings, db=db)
+    trader = _FakeTrader(mid=3.30, available=10.0, pos=(22.0, False), coins={"UNI"})
+    notif = Notification.model_validate(
+        {
+            "id": str(uuid4()),
+            "content": "x",
+            "notificationType": "user_sold_investment",
+            "createdAt": datetime.now(UTC).isoformat(),
+            "investmentBaseId": str(base_id),
+            "notifier": {"username": "delta_trader"},
+        }
+    )
+    inv = InvestmentUpdate.model_validate(
+        {
+            "baseId": str(base_id),
+            "baseShortId": "ShortIdF06",
+            "ticker": "UNI",
+            "directionLong": False,
+        }
+    )
+    action = TradeAction(action=ActionType.CLOSE, notification=notif, investment=inv)
+    with pytest.raises(RecoveryParkedError):
+        exe._close(action, trader)  # type: ignore[arg-type]
+    assert trader.orders == []
+    poller = _poller(settings, db)
+    poller._record_executor_error(str(notif.id), action, RecoveryParkedError("x"))
+    assert db.processed_action(str(notif.id)) == "SKIP_PARKED_CLOSE"
+    copy = db.get_open_copy(str(base_id))
+    assert copy is not None and copy.recovery_pending
+    db.close()
+
+
+def test_reparking_keeps_original_levels_and_stays_quiet(tmp_path) -> None:
+    """A parked copy must not re-place a trailing SL on every reconcile."""
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=True,
+        dry_run=False,
+        min_order_usd=1.0,
+        hl_min_order_usd=10.0,
+        recovery_sl_pct=3.0,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="ShortIdF06",
+        ticker="UNI",
+        portfolio_id=None,
+        notification_id="n1",
+        side="short",
+        size=22.0,
+        trader="delta_trader",
+    )
+    db.set_open_copy_fill(
+        str(base_id), our_entry_px=3.0, side="short", size=22.0, leverage=10
+    )
+    inv = InvestmentUpdate.model_validate(
+        {
+            "baseId": str(base_id),
+            "baseShortId": "ShortIdF06",
+            "ticker": "UNI",
+            "directionLong": False,
+            "isOpen": False,
+            "closingPrice": 3.1,
+            "entryPrice": 3.15,
+        }
+    )
+    exe = DexExecutor(settings, client=SimpleNamespace(), db=db)  # type: ignore[arg-type]
+    placed: list[tuple[float, float]] = []
+
+    class _ParkTrader(_FakeTrader):
+        def place_position_tpsl(self, coin, *, is_long, sz, tp_px, sl_px):
+            placed.append((tp_px, sl_px))
+            return {}, {"status": "ok"}, 1
+
+    trader = _ParkTrader(mid=3.27, available=10.0, pos=(22.0, False), coins={"UNI"})
+    exe._ensure_trader = lambda: trader  # type: ignore[method-assign,assignment]
+    exe._record_recovery_close = lambda **kwargs: None  # type: ignore[method-assign]
+
+    first = exe.recover_missed_close(
+        coin="UNI", inv=inv, our_entry_px=3.0, our_side="short", our_size=22.0
+    )
+    assert first.status == "parked"
+    assert first.changed is True
+    assert len(placed) == 1
+
+    # Price drifted; a second pass must reuse the stored levels, not trail the SL.
+    trader._mid = 3.25
+    second = exe.recover_missed_close(
+        coin="UNI",
+        inv=inv,
+        our_entry_px=3.0,
+        our_side="short",
+        our_size=22.0,
+        parked_tp=first.tp,
+        parked_sl=first.sl,
+    )
+    assert second.tp == first.tp
+    assert second.sl == first.sl
+    assert placed[1] == placed[0]
+    db.close()
+
+
+def test_rate_limit_pauses_queue_drains(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    db.upsert_pending_intent(
+        PendingIntent(
+            investment_base_id=str(uuid4()),
+            coin="KBONK",
+            side="long",
+            reason="margin",
+            created_at=datetime.now(UTC).isoformat(),
+            updated_at=datetime.now(UTC).isoformat(),
+        )
+    )
+    poller = _poller(settings, db)
+    poller._ensure_book_snapshot = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("must not touch HL during cooldown")
+    )
+    assert not poller._hl_cooling_down()
+    poller._note_hl_rate_limit(_rate_limit_exc())
+    assert poller._hl_cooling_down()
+    poller._drain_pending()
+    poller._drain_pending_adds()
+    db.close()
+
+
+def test_late_close_routes_to_recovery(tmp_path) -> None:
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=True,
+        dry_run=False,
+        min_order_usd=1.0,
+        hl_min_order_usd=10.0,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="ShortIdF06",
+        ticker="UNI",
+        portfolio_id=None,
+        notification_id="n1",
+        side="short",
+        size=22.0,
+        trader="delta_trader",
+    )
+    poller = _poller(settings, db)
+    seen: list[str] = []
+
+    def _fake_reconcile(copy):
+        seen.append(copy.investment_base_id)
+        return RecoveryResult(
+            status="parked",
+            coin="UNI",
+            reason="losing_trader_green_or_unknown",
+            message="RECOVERY parked TP/SL on UNI",
+            tp=3.0,
+            sl=3.2,
+        )
+
+    poller._reconcile_one_copy = _fake_reconcile  # type: ignore[method-assign]
+
+    fresh_notif, fresh = _close_action(created=datetime.now(UTC))
+    assert poller._route_late_close(str(fresh_notif.id), fresh) is False
+    assert seen == []
+
+    notif = Notification.model_validate(
+        {
+            "id": str(uuid4()),
+            "content": "x",
+            "notificationType": "user_sold_investment",
+            "createdAt": (datetime.now(UTC) - timedelta(hours=2)).isoformat(),
+            "investmentBaseId": str(base_id),
+            "notifier": {"username": "delta_trader"},
+        }
+    )
+    inv = InvestmentUpdate.model_validate(
+        {
+            "baseId": str(base_id),
+            "baseShortId": "ShortIdF06",
+            "ticker": "UNI",
+            "directionLong": False,
+        }
+    )
+    action = TradeAction(action=ActionType.CLOSE, notification=notif, investment=inv)
+    assert poller._route_late_close(str(notif.id), action) is True
+    assert seen == [str(base_id)]
+    assert db.processed_action(str(notif.id)) == "CLOSE_LATE_RECOVERY"
     db.close()
 
 

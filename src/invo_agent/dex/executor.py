@@ -27,6 +27,7 @@ from invo_agent.dex.hl_trader import (
     IocUnfilledError,
     NotOpenCopyError,
     PriceNotBetterError,
+    RecoveryParkedError,
     SameCoinOpenError,
     SideMismatchError,
 )
@@ -56,6 +57,9 @@ class RecoveryResult:
     sl: float | None = None
     our_pnl_pct: float | None = None
     trader_pnl_pct: float | None = None
+    # False when nothing was sent to HL (park already resting) — callers use this
+    # to stay quiet instead of logging the same park every reconcile.
+    changed: bool = True
 
 
 class DexExecutor:
@@ -203,6 +207,16 @@ class DexExecutor:
             logger.info("LIVE %s ghost cleared: %s", action.action.value, exc)
             log_event(
                 "live_ghost_clear",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=str(action.notification.id),
+            )
+            raise
+        except RecoveryParkedError as exc:
+            logger.info("LIVE %s kept parked: %s", action.action.value, exc)
+            log_event(
+                "live_skip_recovery_parked",
                 action=action.action.value,
                 summary=action.summary,
                 error=str(exc),
@@ -852,6 +866,32 @@ class DexExecutor:
                 f"CLOSE {coin}: not open "
                 f"(shortId={inv.base_short_id if inv else None}) — skip"
             )
+        if copy.recovery_pending:
+            # Recovery already decided a market exit here locks in a worse loss
+            # than the trader took, and parked reduce-only TP/SL instead.
+            console.print(
+                f"[yellow]CLOSE {coin}: recovery parked "
+                f"(tp={copy.recovery_tp} sl={copy.recovery_sl}) — keep park[/yellow]"
+            )
+            logger.info(
+                "CLOSE %s skipped — recovery parked base_id=%s tp=%s sl=%s",
+                coin,
+                copy.investment_base_id,
+                copy.recovery_tp,
+                copy.recovery_sl,
+            )
+            log_event(
+                "close_skip_recovery_parked",
+                coin=coin,
+                base_id=copy.investment_base_id,
+                base_short_id=copy.base_short_id,
+                recovery_tp=copy.recovery_tp,
+                recovery_sl=copy.recovery_sl,
+            )
+            raise RecoveryParkedError(
+                f"CLOSE {coin}: recovery parked tp={copy.recovery_tp} "
+                f"sl={copy.recovery_sl} — keep park"
+            )
         pos = trader.position_size(coin)
         if pos is None:
             console.print(f"[yellow]CLOSE {coin}: already flat on HL[/yellow]")
@@ -1280,13 +1320,27 @@ class DexExecutor:
             )
             return current_sz, None
         except HlTraderError as exc:
-            if "insufficient margin" in str(exc).lower():
+            msg = str(exc).lower()
+            if "insufficient margin" in msg:
                 self._stash_pending_add(inv, need, reason="margin", entry=trader_entry)
                 log_event_throttled(
                     "size_increase_skip",
                     key=f"{coin}:no_margin",
                     coin=coin,
                     reason="no_margin",
+                    error=str(exc),
+                    pending_add_notional=need,
+                )
+                return current_sz, None
+            if "too many" in msg and "requests" in msg:
+                # HL request cap: keep the add queued so it is not lost until the
+                # trader happens to send another UPDATE.
+                self._stash_pending_add(inv, need, reason="size", entry=trader_entry)
+                log_event_throttled(
+                    "size_increase_skip",
+                    key=f"{coin}:rate_limited",
+                    coin=coin,
+                    reason="rate_limited",
                     error=str(exc),
                     pending_add_notional=need,
                 )
@@ -1701,6 +1755,8 @@ class DexExecutor:
         our_side: str | None = None,
         our_size: float | None = None,
         copy_base_id: str | None = None,
+        parked_tp: float | None = None,
+        parked_sl: float | None = None,
     ) -> RecoveryResult:
         """Flatten or park TP/SL after detecting Involio closed while we were offline."""
         coin = coin.upper()
@@ -1857,6 +1913,22 @@ class DexExecutor:
             trader_close=inv.closing_price,
             recovery_sl_pct=self.settings.recovery_sl_pct,
         )
+        # Already parked: keep the levels we parked at. The SL is measured from
+        # the mid, so recomputing it would trail the price and cancel/replace the
+        # same pair of triggers on every pass.
+        if (
+            decision.action == "park"
+            and parked_tp is not None
+            and parked_sl is not None
+        ):
+            decision = RecoveryDecision(
+                action="park",
+                reason=decision.reason,
+                tp=float(parked_tp),
+                sl=float(parked_sl),
+                our_pnl_pct=decision.our_pnl_pct,
+                trader_pnl_pct=decision.trader_pnl_pct,
+            )
         # Parking positionTpsl cancels other coin triggers — when another open_copy
         # shares the coin, always reduce-only close our slice instead.
         if decision.action == "park" and shared:
@@ -1944,10 +2016,11 @@ class DexExecutor:
                 f"our_pnl={_pct(decision.our_pnl_pct)} "
                 f"trader_pnl={_pct(decision.trader_pnl_pct)}"
             )
-            console.print(f"[yellow]{msg}[/yellow]")
+            console.print(f"[dim]{msg}[/dim]")
             logger.info(msg)
-            log_event(
+            log_event_throttled(
                 "recovery_park",
+                key=f"{coin}:already_resting",
                 coin=coin,
                 reason=decision.reason,
                 tp=decision.tp,
@@ -1965,6 +2038,7 @@ class DexExecutor:
                 sl=decision.sl,
                 our_pnl_pct=decision.our_pnl_pct,
                 trader_pnl_pct=decision.trader_pnl_pct,
+                changed=False,
             )
         hl_order, hl_resp, nonce = parked
         self._check_hl_ok(hl_resp, "recovery_park")

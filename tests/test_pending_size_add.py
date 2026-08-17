@@ -105,6 +105,51 @@ def test_pending_add_drain_does_not_touch_tpsl(tmp_path) -> None:
     db.close()
 
 
+def test_size_increase_rate_limit_keeps_add_queued(tmp_path) -> None:
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=False,
+        dry_run=True,
+        min_order_usd=1.0,
+        hl_min_order_usd=10.0,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="adaShort",
+        ticker="ADA",
+        portfolio_id=None,
+        notification_id="n1",
+        side="long",
+        size=80.0,
+        leverage=10,
+        trader="alpha_trader",
+    )
+    exe = DexExecutor(settings, db=db)
+    trader = _FakeTrader(mid=0.20, available=50.0)
+    trader.market_order = lambda *args, **kwargs: (  # type: ignore[method-assign]
+        {},
+        {"status": "Too many cumulative requests sent (35804 > 34878)"},
+        1,
+    )
+    sz, sub = exe._apply_size_increase(
+        trader,  # type: ignore[arg-type]
+        inv=_inv(base_id=base_id, entry_size=4.0, entry_price=0.20),
+        coin="ADA",
+        is_long=True,
+        current_sz=80.0,
+        equity=100.0,
+    )
+    assert sub is None
+    assert sz == 80.0
+    copy = db.get_open_copy(str(base_id))
+    assert copy is not None
+    assert copy.pending_add_notional > 0
+    db.close()
+
+
 def test_action_from_pending_add_is_drain(tmp_path) -> None:
     settings = Settings(
         db_path=tmp_path / "agent.db",
@@ -415,11 +460,22 @@ def test_should_attempt_queued_local_or_fallback(tmp_path) -> None:
         session_store=SimpleNamespace(),
     )  # type: ignore[arg-type]
     recent = datetime.now(UTC).isoformat()
-    assert poller._should_attempt_queued(
+    # Fillable per the cached book, but not on every 4s poll.
+    assert not poller._should_attempt_queued(
         reason="margin", last_tried_at=recent, local_ok=True
+    )
+    assert poller._should_attempt_queued(
+        reason="margin", last_tried_at=None, local_ok=True
+    )
+    gap_passed = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+    assert poller._should_attempt_queued(
+        reason="margin", last_tried_at=gap_passed, local_ok=True
     )
     assert not poller._should_attempt_queued(
         reason="margin", last_tried_at=recent, local_ok=False
+    )
+    assert not poller._should_attempt_queued(
+        reason="margin", last_tried_at=gap_passed, local_ok=False
     )
     stale = (datetime.now(UTC) - timedelta(minutes=20)).isoformat()
     assert poller._should_attempt_queued(

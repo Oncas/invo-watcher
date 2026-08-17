@@ -175,6 +175,12 @@ class GhostCopyError(HlTraderError):
     pass
 
 
+class RecoveryParkedError(HlTraderError):
+    """Recovery already parked TP/SL for this copy — do not market-dump it."""
+
+    pass
+
+
 @dataclass
 class HlBookSnapshot:
     """Last info-API read: mids + free margin. Not an order."""

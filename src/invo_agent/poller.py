@@ -23,6 +23,7 @@ from invo_agent.dex.hl_trader import (
     IocUnfilledError,
     NotOpenCopyError,
     PriceNotBetterError,
+    RecoveryParkedError,
     SameCoinOpenError,
     SideMismatchError,
 )
@@ -57,12 +58,25 @@ HEARTBEAT_EVERY = 8  # polls between "still alive" lines when idle
 DEX_RECOVER_COOLDOWN_SECONDS = 10 * 60
 # Transient network / 5xx: log quietly until this many in a row.
 TRANSIENT_NOTIFY_AFTER = 5
-# Live market-close retry after an HL request cap. After this, recovery
+# Live market-close retry after a transient HL failure. After this, recovery
 # parks or flattens from PnL — do not dump hours later at a worse print.
 CLOSE_LIVE_RETRY_SECONDS = 120
+# A CLOSE this old is a missed close, not a live one: let recovery price it
+# (flatten if we are green / less red, park if a dump would be worse).
+CLOSE_LATE_RECOVERY_SECONDS = 600
 # If the local book still says "blocked", still hit HL this often in case cache is stale.
 QUEUED_PRICE_FALLBACK_SECONDS = 60.0
 QUEUED_MARGIN_FALLBACK_SECONDS = 900.0
+# Even when local math says "fillable now", leave a gap between HL attempts on
+# the same queued row. Poll interval is ~4s; one IoC per poll rebuilt the cap.
+QUEUED_LOCAL_MIN_GAP_SECONDS = 15.0
+# Queue work is opportunistic. Cap HL order writes per poll so a backlog can
+# never starve the writes that actually protect money (closes).
+QUEUED_MAX_OPENS_PER_POLL = 3
+QUEUED_MAX_ADDS_PER_POLL = 2
+# When HL says "too many requests", stop opportunistic queue work for a while so
+# the remaining budget goes to closes.
+HL_RATE_LIMIT_COOLDOWN_SECONDS = 120.0
 
 
 class NotificationPoller:
@@ -90,6 +104,8 @@ class NotificationPoller:
         self._transient_failures = 0
         self._last_log_prune = 0.0
         self._last_missed_close = 0.0
+        self._hl_cooldown_until = 0.0
+        self._force_missed_close = False
 
     @property
     def is_dry_run(self) -> bool:
@@ -256,23 +272,30 @@ class NotificationPoller:
 
         closed_n = sum(1 for r in results if r.status in {"closed", "already_flat"})
         parked_n = sum(1 for r in results if r.status == "parked")
+        # Parks that were already resting changed nothing — don't re-alert.
+        changed = [r for r in results if r.changed]
         log_event(
             "missed_close_reconcile_done",
             checked=len(open_copies),
             results=len(results),
             closed=closed_n,
             parked=parked_n,
+            changed=len(changed),
         )
-        if results:
-            summary = "; ".join(r.message for r in results[:5])
-            if len(results) > 5:
-                summary += f" (+{len(results) - 5} more)"
+        if changed:
+            summary = "; ".join(r.message for r in changed[:5])
+            if len(changed) > 5:
+                summary += f" (+{len(changed) - 5} more)"
             notify_mac(
                 "invo-agent · RECOVERY",
                 summary,
                 sound=self.settings.mac_notify_sound or None,
                 enabled=self.settings.mac_notify,
                 sticky=self.settings.mac_notify_sticky,
+            )
+        elif results:
+            console.print(
+                f"[dim]Missed-close reconcile: {len(results)} park(s) still resting[/dim]"
             )
         else:
             console.print("[green]Missed-close reconcile:[/green] nothing to recover")
@@ -312,6 +335,8 @@ class NotificationPoller:
             our_side=copy.side,
             our_size=copy.size,
             copy_base_id=copy.investment_base_id,
+            parked_tp=copy.recovery_tp if copy.recovery_pending else None,
+            parked_sl=copy.recovery_sl if copy.recovery_pending else None,
         )
         if result.status in {"closed", "already_flat"}:
             self.db.close_copy(copy.investment_base_id)
@@ -329,12 +354,15 @@ class NotificationPoller:
                 recovery_sl=result.sl,
                 trader_closing_px=inv.closing_price,
             )
-            self.db.log_action(
-                action="RECOVERY_PARK",
-                summary=result.message,
-                notification_id=None,
-                dry_run=self.is_dry_run,
-            )
+            # A park that is already resting is a no-op — don't refill Recent
+            # with the same line every reconcile.
+            if result.changed:
+                self.db.log_action(
+                    action="RECOVERY_PARK",
+                    summary=result.message,
+                    notification_id=None,
+                    dry_run=self.is_dry_run,
+                )
         elif result.status == "dry_run":
             self.db.log_action(
                 action="RECOVERY_DRY_RUN",
@@ -343,6 +371,67 @@ class NotificationPoller:
                 dry_run=True,
             )
         return result
+
+    def _route_late_close(self, nid: str, action: TradeAction) -> bool:
+        """Old CLOSE → price it like a missed close. True if handled here.
+
+        A close we only get to minutes later must not blind-market-dump: recovery
+        flattens when we are green or less red than the trader, and parks TP/SL
+        when dumping would lock a bigger loss than the trader took.
+        """
+        if self.is_dry_run:
+            return False
+        age = self._notification_age_seconds(action.notification)
+        if age < CLOSE_LATE_RECOVERY_SECONDS:
+            return False
+        if not self.settings.recovery_enabled:
+            return False
+        inv = action.investment
+        base_id = None
+        if inv is not None and inv.base_id:
+            base_id = str(inv.base_id)
+        elif action.notification.investment_base_id:
+            base_id = str(action.notification.investment_base_id)
+        if not base_id:
+            return False
+        copy = self.db.get_open_copy(base_id)
+        if copy is None or copy.recovery_pending:
+            # Not ours / already parked — the normal path logs the right skip.
+            return False
+        logger.warning(
+            "CLOSE %s is %.0fs old — routing to recovery instead of market dump",
+            action.summary,
+            age,
+        )
+        try:
+            result = self._reconcile_one_copy(copy)
+        except Exception as exc:  # noqa: BLE001
+            self._note_hl_rate_limit(exc)
+            logger.warning("late CLOSE recovery failed %s: %s", action.summary, exc)
+            self._record_executor_error(nid, action, exc)
+            return True
+        if result is None:
+            # Involio does not show it closed yet — let the live path decide.
+            return False
+        self.db.mark_processed(nid, "CLOSE_LATE_RECOVERY", result.message[:500])
+        log_event(
+            "close_late_recovery",
+            action=action.action.value,
+            summary=action.summary,
+            status=result.status,
+            reason=result.reason,
+            age_seconds=age,
+            notification_id=nid,
+        )
+        notify_mac(
+            "invo-agent · RECOVERY",
+            result.message,
+            subtitle=f"Late CLOSE ({age / 60:.0f}m old)",
+            sound=self.settings.mac_notify_sound or None,
+            enabled=self.settings.mac_notify,
+            sticky=False,
+        )
+        return True
 
     def _logged_summary(self, action: TradeAction) -> str:
         summary = format_action_summary(action)
@@ -501,6 +590,8 @@ class NotificationPoller:
 
             if action.action is ActionType.CLOSE:
                 self._cancel_pending_for_action(action, reason="trader_close")
+                if self._route_late_close(nid, action):
+                    continue
             elif (
                 action.action is ActionType.UPDATE
                 and self._refresh_pending_from_update(action)
@@ -547,6 +638,9 @@ class NotificationPoller:
             self._expire_pending()
             self._drain_pending()
             self._drain_pending_adds()
+            if self._force_missed_close:
+                # A CLOSE we could not execute is money still exposed.
+                self._maybe_reconcile_missed_closes()
         return actions
 
     def _handle_live_failure(
@@ -599,6 +693,7 @@ class NotificationPoller:
     def _queue_open_from_error(
         self, nid: str, action: TradeAction, exc: BaseException
     ) -> bool:
+        self._note_hl_rate_limit(exc)
         reason = self._queueable_open_reason(action, exc)
         if reason is None:
             return False
@@ -671,7 +766,40 @@ class NotificationPoller:
     def _record_executor_error(
         self, nid: str, action: TradeAction, exc: BaseException
     ) -> None:
-        if self._is_insufficient_margin_error(exc):
+        self._note_hl_rate_limit(exc)
+        if isinstance(exc, RecoveryParkedError):
+            self.db.mark_processed(nid, "SKIP_PARKED_CLOSE", str(exc)[:500])
+            self.db.log_action(
+                action="SKIP_PARKED_CLOSE",
+                summary=f"{format_action_summary(action)}: {exc}"[:500],
+                notification_id=nid,
+                dry_run=self.is_dry_run,
+            )
+            logger.info("skip (recovery parked) %s: %s", action.summary, exc)
+            log_event(
+                "skip_recovery_parked",
+                action=action.action.value,
+                summary=action.summary,
+                error=str(exc),
+                notification_id=nid,
+                will_retry=False,
+            )
+            notify_mac(
+                "invo-agent · kept park",
+                f"Recovery TP/SL still on {action.summary}",
+                subtitle="No market dump",
+                sound=None,
+                enabled=self.settings.mac_notify,
+                sticky=False,
+            )
+            return
+
+        # A CLOSE must never be filed as "no margin" — reducing needs none, and
+        # dropping it would leave us holding a trade the trader already exited.
+        if (
+            self._is_insufficient_margin_error(exc)
+            and action.action is not ActionType.CLOSE
+        ):
             self.db.mark_processed(
                 nid, f"SKIP_NO_MARGIN_{action.action.value}", str(exc)[:500]
             )
@@ -776,20 +904,18 @@ class NotificationPoller:
             )
             return
 
-        if self._is_hl_rate_limit_error(exc):
+        if self._is_transient_exec_error(exc):
             age = self._notification_age_seconds(action.notification)
-            live_close_retry = (
-                action.action is ActionType.CLOSE and age < CLOSE_LIVE_RETRY_SECONDS
-            )
-            if live_close_retry:
+            if action.action is ActionType.CLOSE and age < CLOSE_LIVE_RETRY_SECONDS:
+                # Leave unprocessed: a fresh close is worth retrying at market.
                 logger.warning(
-                    "HL rate-limited %s age=%.0fs — retry CLOSE this poll window: %s",
+                    "transient %s age=%.0fs — retry CLOSE next poll: %s",
                     action.summary,
                     age,
                     exc,
                 )
                 log_event_throttled(
-                    "hl_rate_limit",
+                    "exec_transient",
                     key=nid,
                     action=action.action.value,
                     summary=action.summary,
@@ -799,7 +925,7 @@ class NotificationPoller:
                 )
                 return
             logger.warning(
-                "HL rate-limited %s — not live-retrying (age=%.0fs): %s",
+                "transient %s — not live-retrying (age=%.0fs): %s",
                 action.summary,
                 age,
                 exc,
@@ -814,7 +940,7 @@ class NotificationPoller:
                 dry_run=self.is_dry_run,
             )
             log_event(
-                "hl_rate_limit",
+                "exec_transient",
                 action=action.action.value,
                 summary=action.summary,
                 error=str(exc)[:300],
@@ -822,6 +948,18 @@ class NotificationPoller:
                 will_retry=False,
                 age_seconds=age,
             )
+            if action.action is ActionType.CLOSE:
+                # Hand straight to recovery instead of waiting out the 5 min timer:
+                # it still holds on HL and the trader is out.
+                self._force_missed_close = True
+                notify_mac(
+                    "invo-agent · WARN",
+                    f"CLOSE still stuck — recovery will price it: {action.summary}",
+                    subtitle="Flatten or park",
+                    sound="Basso",
+                    enabled=self.settings.mac_notify,
+                    sticky=False,
+                )
             return
 
         if isinstance(exc, NotOpenCopyError):
@@ -854,6 +992,9 @@ class NotificationPoller:
             dry_run=self.is_dry_run,
         )
         logger.exception("executor failed for %s", action.summary)
+        if action.action is ActionType.CLOSE:
+            # We still hold a trade the trader exited — let recovery decide now.
+            self._force_missed_close = True
         notify_mac(
             "invo-agent · ERROR",
             f"{action.summary}: {exc}",
@@ -869,6 +1010,53 @@ class NotificationPoller:
         return (
             "too many cumulative requests" in msg
             or "too many requests" in msg
+        )
+
+    def _note_hl_rate_limit(self, exc: BaseException) -> None:
+        """Back off opportunistic queue work so closes keep their budget."""
+        if not self._is_hl_rate_limit_error(exc):
+            return
+        until = time.monotonic() + HL_RATE_LIMIT_COOLDOWN_SECONDS
+        if until <= self._hl_cooldown_until:
+            return
+        self._hl_cooldown_until = until
+        logger.warning(
+            "HL request cap hit — pausing queue drains for %.0fs",
+            HL_RATE_LIMIT_COOLDOWN_SECONDS,
+        )
+        log_event_throttled(
+            "hl_cooldown",
+            key="hl_cooldown",
+            seconds=HL_RATE_LIMIT_COOLDOWN_SECONDS,
+            error=str(exc)[:300],
+        )
+
+    def _hl_cooling_down(self) -> bool:
+        return time.monotonic() < self._hl_cooldown_until
+
+    def _is_transient_exec_error(self, exc: BaseException) -> bool:
+        """Worth retrying as-is: rate cap, unfilled IoC, network / gateway blips."""
+        if self._is_hl_rate_limit_error(exc) or isinstance(exc, IocUnfilledError):
+            return True
+        if isinstance(exc, httpx.HTTPError):
+            return True
+        msg = str(exc).lower()
+        return any(
+            needle in msg
+            for needle in (
+                "timeout",
+                "timed out",
+                "temporarily",
+                "connection reset",
+                "connect error",
+                "disconnected",
+                "bad gateway",
+                "service unavailable",
+                "gateway time",
+                " 502",
+                " 503",
+                " 504",
+            )
         )
 
     def _tried_within(self, raw: str | None, seconds: float) -> bool:
@@ -1224,7 +1412,8 @@ class NotificationPoller:
         self, *, reason: str | None, last_tried_at: str | None, local_ok: bool
     ) -> bool:
         if local_ok:
-            return True
+            # Fillable per the cached book — go, but not on every 4s poll.
+            return not self._tried_within(last_tried_at, QUEUED_LOCAL_MIN_GAP_SECONDS)
         return not self._tried_within(
             last_tried_at, self._queued_fallback_seconds(reason)
         )
@@ -1262,14 +1451,22 @@ class NotificationPoller:
         intents = self.db.list_pending_intents()
         if not intents:
             return
+        if self._hl_cooling_down():
+            logger.info("skip pending drain — HL cooldown active")
+            return
         self._ensure_book_snapshot()
-        for intent in intents:
-            if not self._should_attempt_queued(
+        candidates = [
+            intent
+            for intent in intents
+            if self._should_attempt_queued(
                 reason=intent.reason,
                 last_tried_at=intent.last_tried_at,
                 local_ok=self._pending_open_local_ok(intent),
-            ):
-                continue
+            )
+        ]
+        # Least-recently-tried first so the per-poll cap can't starve a row.
+        candidates.sort(key=lambda i: i.last_tried_at or "")
+        for intent in candidates[:QUEUED_MAX_OPENS_PER_POLL]:
             self.db.mark_pending_tried(intent.investment_base_id)
             try:
                 resp = self.client.get_current_shadow_post_by_investment_base_id(
@@ -1369,14 +1566,21 @@ class NotificationPoller:
         ]
         if not waiting:
             return
+        if self._hl_cooling_down():
+            logger.info("skip size-add drain — HL cooldown active")
+            return
         self._ensure_book_snapshot()
-        for copy in waiting:
-            if not self._should_attempt_queued(
+        candidates = [
+            copy
+            for copy in waiting
+            if self._should_attempt_queued(
                 reason=copy.pending_add_reason,
                 last_tried_at=copy.pending_add_tried_at,
                 local_ok=self._pending_add_local_ok(copy),
-            ):
-                continue
+            )
+        ]
+        candidates.sort(key=lambda c: c.pending_add_tried_at or "")
+        for copy in candidates[:QUEUED_MAX_ADDS_PER_POLL]:
             self.db.mark_pending_add_tried(copy.investment_base_id)
             try:
                 resp = self.client.get_current_shadow_post_by_investment_base_id(
@@ -1403,12 +1607,14 @@ class NotificationPoller:
             try:
                 self.executor.handle(action)
             except Exception as exc:  # noqa: BLE001
+                self._note_hl_rate_limit(exc)
                 if self._is_dex_session_error(exc):
                     self.executor.invalidate_trader()
                     if self._recover_dex_session():
                         try:
                             self.executor.handle(action)
                         except Exception as retry_exc:  # noqa: BLE001
+                            self._note_hl_rate_limit(retry_exc)
                             if self._is_insufficient_margin_error(retry_exc):
                                 break
                             continue
@@ -1484,6 +1690,7 @@ class NotificationPoller:
         self, intent: PendingIntent, action: TradeAction, exc: BaseException
     ) -> bool:
         """Update pending reason. Return True if this was an expected queueable miss."""
+        self._note_hl_rate_limit(exc)
         reason = self._queueable_open_reason(action, exc)
         if reason is None:
             return False
@@ -1592,8 +1799,10 @@ class NotificationPoller:
 
     def _maybe_reconcile_missed_closes(self) -> None:
         now = time.monotonic()
-        if self._last_missed_close and now - self._last_missed_close < 300:
+        forced = self._force_missed_close
+        if not forced and self._last_missed_close and now - self._last_missed_close < 300:
             return
+        self._force_missed_close = False
         self._last_missed_close = now
         try:
             self.reconcile_missed_closes()
