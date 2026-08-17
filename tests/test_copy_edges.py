@@ -223,7 +223,7 @@ def test_size_add_dust_leftover_stays(tmp_path) -> None:
     assert sub is not None
     copy = db.get_open_copy(str(base_id))
     assert copy is not None
-    assert copy.pending_add_reason == "dust"
+    assert copy.pending_add_reason == "margin"
     assert 0 < copy.pending_add_notional < 10
     db.close()
 

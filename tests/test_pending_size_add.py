@@ -473,6 +473,25 @@ def test_refresh_pending_skips_when_already_open(tmp_path) -> None:
     db.close()
 
 
+def test_size_clearing_min_notional_adds_a_lot() -> None:
+    from invo_agent.dex.pricing import size_clearing_min_notional
+
+    # ETH: $10 / 1800.0 floors to 0.0052 → $9.91; one lot (0.0001) clears.
+    sz = size_clearing_min_notional(
+        mid=1800.0, notional=10.0, min_notional=10.0, sz_decimals=4
+    )
+    assert sz == 0.0056
+    assert sz * 1800.0 + 1e-9 >= 10.0
+    btc = size_clearing_min_notional(
+        mid=60000.0, notional=10.0, min_notional=10.0, sz_decimals=5
+    )
+    assert btc * 60000.0 + 1e-9 >= 10.0
+    exact = size_clearing_min_notional(
+        mid=0.20, notional=10.0, min_notional=10.0, sz_decimals=1
+    )
+    assert exact == 50.0
+
+
 def test_queued_ready_locally_price_and_margin() -> None:
     from invo_agent.dex.pricing import queued_ready_locally
 
@@ -496,13 +515,47 @@ def test_queued_ready_locally_price_and_margin() -> None:
         reason="margin", available=0.20, leverage=20, hl_min_order_usd=10
     )
     assert not queued_ready_locally(
-        reason="size", leftover_notional=4.0, hl_min_order_usd=10
+        reason="size", available=0.0, leverage=10, hl_min_order_usd=10
     )
     assert queued_ready_locally(
-        reason="size", leftover_notional=12.0, hl_min_order_usd=10
+        reason="size", available=5.0, leverage=10, hl_min_order_usd=10
     )
     assert queued_ready_locally(reason="same_coin", coin_free=True)
     assert not queued_ready_locally(reason="same_coin", coin_free=False)
+
+
+def test_classify_pending_wait_priority() -> None:
+    from invo_agent.dex.pricing import classify_pending_wait
+
+    assert (
+        classify_pending_wait(coin_free=False, prior="margin") == "same_coin"
+    )
+    assert (
+        classify_pending_wait(
+            coin_free=True,
+            mid=0.31,
+            trader_entry=0.30,
+            is_long=True,
+            prior="margin",
+        )
+        == "price"
+    )
+    assert (
+        classify_pending_wait(
+            coin_free=True,
+            mid=1906.0,
+            trader_entry=1892.0,
+            is_long=False,
+            available=18.0,
+            leverage=25,
+            can_spend=False,
+            prior="margin",
+        )
+        == "ratelimit"
+    )
+    assert classify_pending_wait(coin_free=True, prior="budget") == "ratelimit"
+    assert classify_pending_wait(coin_free=True, prior="size") == "margin"
+    assert classify_pending_wait(coin_free=True, prior="dust") == "margin"
 
 
 def test_should_attempt_queued_local_or_fallback(tmp_path) -> None:

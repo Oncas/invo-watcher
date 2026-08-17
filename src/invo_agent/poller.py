@@ -28,7 +28,7 @@ from invo_agent.dex.hl_trader import (
     SameCoinOpenError,
     SideMismatchError,
 )
-from invo_agent.dex.pricing import queued_ready_locally
+from invo_agent.dex.pricing import classify_pending_wait, queued_ready_locally
 from invo_agent.dex.session import (
     DexSessionError,
     DexSessionStore,
@@ -551,6 +551,7 @@ class NotificationPoller:
         if not self.is_dry_run:
             self._ensure_dex_session()
             self._refresh_account()
+            self._refresh_pending_reasons()
             self._adopt_resting_fills()
             self._reconcile_inverse_ghosts()
         items = sorted(resp.items, key=lambda n: n.created_at)
@@ -696,6 +697,8 @@ class NotificationPoller:
             return "ratelimit"
         if self._is_hl_rate_limit_error(exc):
             return "ratelimit"
+        if self._is_below_hl_min_error(exc):
+            return "margin"
         if self._is_insufficient_margin_error(exc):
             return "margin"
         return None
@@ -1084,12 +1087,15 @@ class NotificationPoller:
     def _is_insufficient_margin_error(exc: BaseException) -> bool:
         if isinstance(exc, InsufficientMarginError):
             return True
+        if NotificationPoller._is_below_hl_min_error(exc):
+            return False
         msg = str(exc).lower()
-        return (
-            "insufficient margin" in msg
-            or "minimum value of $10" in msg
-            or "free margin too small" in msg
-        )
+        return "insufficient margin" in msg or "free margin too small" in msg
+
+    @staticmethod
+    def _is_below_hl_min_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return "minimum value of $10" in msg or "below_hl_min" in msg
 
     def _notify_dex_login_needed(self, exc: BaseException) -> None:
         if self._dex_dead_notified:
@@ -1681,6 +1687,51 @@ class NotificationPoller:
             last_tried_at, self._queued_fallback_seconds(reason)
         )
 
+    def _live_pending_reason(self, intent: PendingIntent) -> str:
+        trader = getattr(self.executor, "_trader", None)
+        budget = self.executor.budget()
+        can_spend = None
+        if budget is not None:
+            can_spend = budget.can_spend(1, essential=False)
+        return classify_pending_wait(
+            coin_free=self._coin_is_free(intent.coin),
+            mid=trader.cached_mid(intent.coin) if trader is not None else None,
+            trader_entry=intent.trader_entry,
+            is_long=intent.side.lower() == "long",
+            available=trader.cached_available() if trader is not None else None,
+            leverage=float(intent.leverage or 1),
+            hl_min_order_usd=self.settings.hl_min_order_usd,
+            can_spend=can_spend,
+            prior=intent.reason,
+        )
+
+    def _refresh_pending_reasons(self) -> None:
+        """Rewrite stale queue tokens from the current book (margin vs price vs ratelimit)."""
+        for intent in self.db.list_pending_intents():
+            new = self._live_pending_reason(intent)
+            if new == intent.reason:
+                continue
+            logger.info(
+                "pending reason %s %s → %s",
+                intent.coin,
+                intent.reason,
+                new,
+            )
+            intent.reason = new
+            self.db.upsert_pending_intent(intent)
+        for copy in self.db.list_open_copies():
+            add = float(copy.pending_add_notional or 0)
+            why = (copy.pending_add_reason or "").lower()
+            if add <= 0 or why not in {"size", "dust", "below_hl_min", "under min", "budget"}:
+                continue
+            mapped = "ratelimit" if why == "budget" else "margin"
+            self.db.set_pending_add_notional(
+                copy.investment_base_id,
+                add,
+                reason=mapped,
+                entry=copy.pending_add_entry,
+            )
+
     def _pending_open_local_ok(self, intent: PendingIntent) -> bool:
         if intent.resting_oid:
             return False
@@ -1706,8 +1757,12 @@ class NotificationPoller:
     def _pending_add_local_ok(self, copy: OpenCopy) -> bool:
         trader = getattr(self.executor, "_trader", None)
         coin = (copy.ticker or "").upper()
+        why = (copy.pending_add_reason or "margin").lower()
+        if why in {"ratelimit", "budget"}:
+            budget = self.executor.budget()
+            return bool(budget and budget.can_spend(1, essential=False))
         return queued_ready_locally(
-            reason=copy.pending_add_reason or "size",
+            reason=why,
             mid=trader.cached_mid(coin) if trader is not None and coin else None,
             available=trader.cached_available() if trader is not None else None,
             trader_entry=copy.pending_add_entry,

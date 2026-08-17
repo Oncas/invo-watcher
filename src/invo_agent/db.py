@@ -646,7 +646,7 @@ class AgentDB:
         entry_px = entry if entry is not None else (
             existing.pending_add_entry if existing else None
         )
-        why = reason or (existing.pending_add_reason if existing else None) or "size"
+        why = reason or (existing.pending_add_reason if existing else None) or "margin"
         self._conn.execute(
             """
             UPDATE open_copies

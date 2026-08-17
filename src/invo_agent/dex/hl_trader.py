@@ -499,6 +499,24 @@ class HlTrader:
         factor = 10**decimals
         return math.floor(sz * factor) / factor
 
+    def size_for_notional(
+        self,
+        coin: str,
+        notional: float,
+        *,
+        mid: float | None = None,
+        min_notional: float = 0.0,
+    ) -> float:
+        from invo_agent.dex.pricing import size_clearing_min_notional
+
+        px = float(mid) if mid is not None and mid > 0 else self.mid_price(coin)
+        return size_clearing_min_notional(
+            mid=px,
+            notional=notional,
+            min_notional=min_notional,
+            sz_decimals=self.sz_decimals(coin),
+        )
+
     def round_price(self, coin: str, px: float) -> float:
         """Match hyperliquid-python-sdk Exchange._slippage_price rounding."""
         asset = self.asset_index(coin)

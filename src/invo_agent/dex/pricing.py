@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -23,16 +24,79 @@ def queued_ready_locally(
         return price_is_at_or_better(
             mid=mid, trader_entry=trader_entry, is_long=is_long
         )
-    if why == "margin":
+    if why in {"margin", "size", "dust", "below_hl_min"}:
         if available is None:
             return False
         lev = max(1.0, float(leverage or 1))
         return available * 0.98 * lev + 1e-9 >= float(hl_min_order_usd)
-    if why in {"size", "dust"}:
-        return leftover_notional + 1e-9 >= float(hl_min_order_usd)
     if why == "same_coin":
         return bool(coin_free)
     return False
+
+
+def classify_pending_wait(
+    *,
+    coin_free: bool,
+    mid: float | None = None,
+    trader_entry: float | None = None,
+    is_long: bool = True,
+    available: float | None = None,
+    leverage: float = 1.0,
+    hl_min_order_usd: float = 10.0,
+    can_spend: bool | None = None,
+    prior: str | None = None,
+) -> str:
+    """Current queue token from the live book — not the error that first queued it.
+
+    First blocker wins: same_coin, price, margin (not enough cash for $10),
+    ratelimit. Tiny clips are bumped to the HL min when cash allows — they
+    never get their own wait state.
+    """
+    if not coin_free:
+        return "same_coin"
+    if mid is not None and mid > 0 and not price_is_at_or_better(
+        mid=mid, trader_entry=trader_entry, is_long=is_long
+    ):
+        return "price"
+    hl_min = float(hl_min_order_usd)
+    if available is not None:
+        lev = max(1.0, float(leverage or 1))
+        if available * 0.98 * lev + 1e-9 < hl_min:
+            return "margin"
+    if can_spend is False:
+        return "ratelimit"
+    prior = (prior or "").strip().lower()
+    if prior == "budget":
+        return "ratelimit"
+    if prior in {"size", "dust", "below_hl_min", "under min"}:
+        return "margin"
+    return prior or "margin"
+
+
+def size_clearing_min_notional(
+    *,
+    mid: float,
+    notional: float,
+    min_notional: float,
+    sz_decimals: int,
+) -> float:
+    """Floor-round size, then add lots until mid×sz still clears HL's min.
+
+    Targeting exactly $10 and then flooring the lot is what put ETH/BTC under
+    the minimum. One extra lot is a few cents of notional, not a new wait state.
+    """
+    if mid <= 0:
+        return 0.0
+    factor = 10 ** max(0, int(sz_decimals))
+    sz = math.floor(max(0.0, float(notional)) / mid * factor + 1e-12) / factor
+    floor = float(min_notional)
+    if floor <= 0:
+        return sz
+    for _ in range(8):
+        if sz * mid + 1e-9 >= floor:
+            return sz
+        sz = math.floor((sz + 1.0 / factor) * factor + 1e-12) / factor
+    return sz
 
 
 def price_is_at_or_better(

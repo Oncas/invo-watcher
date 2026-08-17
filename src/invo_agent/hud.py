@@ -70,7 +70,18 @@ def pending_kind(summary: str | None = None, *, kind: str | None = None) -> str:
     return "OPEN"
 
 
-_BELOW_MIN_REASONS = frozenset({"size", "dust", "below_hl_min"})
+_WAIT_ALIASES = {
+    "budget": "ratelimit",
+    "size": "margin",
+    "dust": "margin",
+    "below_hl_min": "margin",
+    "under min": "margin",
+}
+
+
+def display_wait(reason: str | None) -> str:
+    wait = (reason or "").strip() or "?"
+    return _WAIT_ALIASES.get(wait, wait)
 
 
 def format_pending_reason(
@@ -83,11 +94,7 @@ def format_pending_reason(
 ) -> str:
     """Queue label: wait reason, plus size↑ on leftover adds."""
     _ = (side, trader_entry, amount)
-    wait = (reason or "").strip() or "?"
-    if wait == "budget":
-        wait = "ratelimit"
-    if wait in _BELOW_MIN_REASONS:
-        wait = "under min"
+    wait = display_wait(reason)
     if pending_kind(kind=kind) == "UPDATE":
         return f"size↑ · {wait}"
     return wait
@@ -500,7 +507,7 @@ def collect_hud(
     now_hud = datetime.now(UTC)
     pending_rows: list[dict] = []
     for intent in db.list_pending_intents():
-        wait = "ratelimit" if intent.reason == "budget" else intent.reason
+        wait = display_wait(intent.reason)
         pending_rows.append(
             {
                 "coin": intent.coin,
@@ -526,8 +533,7 @@ def collect_hud(
         add = float(copy.pending_add_notional or 0)
         if add <= 0 or not copy.ticker:
             continue
-        raw_wait = copy.pending_add_reason or "size"
-        wait = "ratelimit" if raw_wait == "budget" else raw_wait
+        wait = display_wait(copy.pending_add_reason or "margin")
         entry = copy.pending_add_entry or copy.our_entry_px
         pending_rows.append(
             {

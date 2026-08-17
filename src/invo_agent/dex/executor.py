@@ -39,6 +39,7 @@ from invo_agent.dex.pricing import (
     fill_gaps,
     ioc_unfilled_message,
     price_is_at_or_better,
+    size_clearing_min_notional,
 )
 from invo_agent.dex.recovery import RecoveryDecision, decide_missed_close
 from invo_agent.dex.session import DexSessionError, DexSessionStore, load_signer
@@ -358,6 +359,29 @@ class DexExecutor:
         }
         return margin, meta
 
+    @staticmethod
+    def _sz_for_notional(
+        trader: Any,
+        coin: str,
+        notional: float,
+        mid: float,
+        min_notional: float,
+    ) -> float:
+        if hasattr(trader, "size_for_notional"):
+            return float(
+                trader.size_for_notional(
+                    coin, notional, mid=mid, min_notional=min_notional
+                )
+            )
+        if hasattr(trader, "sz_decimals"):
+            return size_clearing_min_notional(
+                mid=mid,
+                notional=notional,
+                min_notional=min_notional,
+                sz_decimals=int(trader.sz_decimals(coin)),
+            )
+        return float(trader.round_size(coin, notional / mid))
+
     def _open(self, action: TradeAction, trader: HlTrader, equity: float) -> None:
         inv = action.investment
         if inv is None:
@@ -411,7 +435,22 @@ class DexExecutor:
                 f"{coin} mid={mid} worse than trader entry={trader_entry} "
                 f"({'long' if is_long else 'short'}) — queue"
             )
-        sz = trader.round_size(coin, order_notional / mid)
+        hl_min = float(self.settings.hl_min_order_usd)
+        sz = self._sz_for_notional(trader, coin, order_notional, mid, hl_min)
+        order_notional = float(sz) * mid
+        size_meta["order_notional_usd"] = order_notional
+        size_meta["margin_usd"] = order_notional / max(1, leverage)
+        margin = float(size_meta["margin_usd"])
+        if order_notional + 1e-9 < hl_min:
+            raise InsufficientMarginError(
+                f"Order notional ${order_notional:.2f} < HL_MIN_ORDER_USD="
+                f"{hl_min} after lot rounding "
+                f"(available=${available:.2f})"
+            )
+        if margin > available + 1e-9:
+            raise InsufficientMarginError(
+                f"Rounded {coin} needs ${margin:.2f} margin, available=${available:.2f}"
+            )
         bump_note = ""
         if size_meta["bumped_to_hl_min"]:
             bump_note = (
@@ -1264,6 +1303,9 @@ class DexExecutor:
         if trader_entry is None and pending_entry is not None and pending_entry > 0:
             trader_entry = float(pending_entry)
 
+        available = trader.available_margin()
+        lev = max(1, leverage)
+        buyable = available * 0.98 * lev
         if need + 1e-9 < hl_min:
             accumulated = (
                 need
@@ -1274,27 +1316,28 @@ class DexExecutor:
                 if self.db is not None and inv.base_id is not None:
                     self.db.set_pending_add_notional(str(inv.base_id), 0.0)
                 return current_sz, None
-            self._stash_pending_add(
-                inv, accumulated, reason="size", entry=trader_entry
-            )
-            console.print(
-                f"[dim]UPDATE {coin}: size increase too small "
-                f"(need=${need:.2f} < HL min ${hl_min:g}) — queued ${accumulated:.2f}[/dim]"
-            )
-            log_event_throttled(
-                "size_increase_skip",
-                key=f"{coin}:below_hl_min",
-                coin=coin,
-                reason="below_hl_min",
-                current_notional=current_notional,
-                target_notional=target_notional,
-                pending_add_notional=accumulated,
-            )
-            return current_sz, None
+            if buyable + 1e-9 >= hl_min:
+                need = hl_min
+            else:
+                self._stash_pending_add(
+                    inv, accumulated, reason="margin", entry=trader_entry
+                )
+                console.print(
+                    f"[yellow]UPDATE {coin}: size increase queued "
+                    f"(need=${accumulated:.2f} < HL min ${hl_min:g}; "
+                    f"available=${available:.2f})[/yellow]"
+                )
+                log_event_throttled(
+                    "size_increase_skip",
+                    key=f"{coin}:no_margin",
+                    coin=coin,
+                    reason="no_margin",
+                    current_notional=current_notional,
+                    target_notional=target_notional,
+                    pending_add_notional=accumulated,
+                )
+                return current_sz, None
 
-        available = trader.available_margin()
-        lev = max(1, leverage)
-        buyable = available * 0.98 * lev
         if buyable + 1e-9 < hl_min:
             self._stash_pending_add(inv, need, reason="margin", entry=trader_entry)
             console.print(
@@ -1340,7 +1383,9 @@ class DexExecutor:
             )
             return current_sz, None
 
-        add_sz = trader.round_size(coin, delta_notional / mid)
+        add_sz = self._sz_for_notional(
+            trader, coin, delta_notional, mid, hl_min
+        )
         if add_sz <= 0:
             return current_sz, None
 
@@ -1395,7 +1440,7 @@ class DexExecutor:
             if "too many" in msg and "requests" in msg:
                 # HL request cap: keep the add queued so it is not lost until the
                 # trader happens to send another UPDATE.
-                self._stash_pending_add(inv, need, reason="size", entry=trader_entry)
+                self._stash_pending_add(inv, need, reason="ratelimit", entry=trader_entry)
                 log_event_throttled(
                     "size_increase_skip",
                     key=f"{coin}:rate_limited",
@@ -1427,13 +1472,9 @@ class DexExecutor:
                 leverage=float(leverage),
             )
             leftover = remainder
-            if leftover + 1e-9 >= hl_min:
+            if leftover > 1e-9:
                 self._stash_pending_add(
                     inv, leftover, reason="margin", entry=trader_entry
-                )
-            elif leftover > 1e-9:
-                self._stash_pending_add(
-                    inv, leftover, reason="dust", entry=trader_entry
                 )
             else:
                 self.db.set_pending_add_notional(str(inv.base_id), 0.0)
@@ -2302,7 +2343,13 @@ class DexExecutor:
         if trader_entry is None or trader_entry <= 0:
             raise PriceNotBetterError(f"{coin}: no trader entry to rest at")
         mid = trader.mid_price(coin)
-        sz = trader.round_size(coin, order_notional / mid)
+        hl_min = float(self.settings.hl_min_order_usd)
+        sz = self._sz_for_notional(trader, coin, order_notional, mid, hl_min)
+        order_notional = float(sz) * mid
+        if order_notional + 1e-9 < hl_min:
+            raise InsufficientMarginError(
+                f"Order notional ${order_notional:.2f} < HL min after lot rounding"
+            )
         trader.ensure_leverage(coin, leverage, is_cross=True)
         cloid = mimic_entry_cloid(inv.base_short_id)
         _hl_order, hl_resp, _nonce = trader.limit_order(
