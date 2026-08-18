@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import Any
+
+# hyperliquid-python-sdk Exchange.market_close DEFAULT_SLIPPAGE
+HL_MARKET_CLOSE_SLIPPAGE = 0.05
 
 
 def queued_ready_locally(
@@ -104,6 +108,45 @@ def size_clearing_min_notional(
             return sz
         sz = math.floor((sz + 1.0 / factor) * factor + 1e-12) / factor
     return sz
+
+
+def flatten_limit_px(
+    *,
+    mid: float,
+    sz: float,
+    is_buy: bool,
+    slippage: float = HL_MARKET_CLOSE_SLIPPAGE,
+    min_notional: float = 10.0,
+    round_price: Callable[[float], float],
+) -> float:
+    """IoC cap for a flatten: SDK 5% slip, then raise until sz×px clears $10.
+
+    HL scores the ticket as coins × this limit, not entry notional. A winning
+    min-clip short (0.57 COMP @ 17.20) is ~$9.81 at mid and can sit under $10
+    at 2% slip. The website Close button uses a fatter cap and fills.
+    Higher px always increases notional (buy = more aggressive; sell = less).
+    """
+    if mid <= 0 or sz <= 0:
+        return float(mid) if mid > 0 else 0.0
+    px = mid * (1 + slippage) if is_buy else mid * (1 - slippage)
+    px = float(round_price(px))
+    floor = float(min_notional)
+    if floor <= 0 or sz * px + 1e-9 >= floor:
+        return px
+    need = floor / sz
+    px = max(px, need)
+    px = float(round_price(px))
+    for _ in range(8):
+        if sz * px + 1e-9 >= floor:
+            return px
+        bumped = px * 1.0001 if px > 0 else need
+        nxt = float(round_price(bumped))
+        if nxt <= px:
+            nxt = float(round_price(px + max(abs(px) * 1e-4, 1e-6)))
+        if nxt <= px:
+            break
+        px = nxt
+    return px
 
 
 def price_is_at_or_better(

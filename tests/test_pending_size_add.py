@@ -578,6 +578,50 @@ def test_refresh_pending_skips_when_already_open(tmp_path) -> None:
     db.close()
 
 
+def _round_comp(px: float) -> float:
+    # COMP: szDecimals=2 → 4 price decimals, 5 significant figures.
+    return round(float(f"{px:.5g}"), 4)
+
+
+def test_flatten_limit_px_clears_comp_dust_short() -> None:
+    from invo_agent.dex.pricing import flatten_limit_px
+
+    # Synthetic small short: a narrow IoC limit remains below the order minimum.
+    two_pct_mid = 12.0
+    assert 0.8 * _round_comp(two_pct_mid * 1.02) + 1e-9 < 10.0
+    px = flatten_limit_px(
+        mid=two_pct_mid,
+        sz=0.8,
+        is_buy=True,
+        slippage=0.02,
+        min_notional=10.0,
+        round_price=_round_comp,
+    )
+    assert 0.8 * px + 1e-9 >= 10.0
+    assert px > two_pct_mid * 1.02
+
+    # Fat clip: SDK 5% only, no extra bump.
+    fat = flatten_limit_px(
+        mid=12.1,
+        sz=10.0,
+        is_buy=True,
+        min_notional=10.0,
+        round_price=_round_comp,
+    )
+    assert fat == _round_comp(12.1 * 1.05)
+    assert 10.0 * fat + 1e-9 >= 10.0
+
+    # The synthetic small fill must clear at the default slippage.
+    comp = flatten_limit_px(
+        mid=12.1,
+        sz=0.8,
+        is_buy=True,
+        min_notional=10.0,
+        round_price=_round_comp,
+    )
+    assert 0.8 * comp + 1e-9 >= 10.0
+
+
 def test_size_clearing_min_notional_adds_a_lot() -> None:
     from invo_agent.dex.pricing import size_clearing_min_notional
 

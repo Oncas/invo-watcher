@@ -24,6 +24,7 @@ from invo_agent.dex.budget import (
     action_leg_count,
     parse_rate_limit_message,
 )
+from invo_agent.dex.pricing import HL_MARKET_CLOSE_SLIPPAGE, flatten_limit_px
 from invo_agent.dex.turnkey_client import TurnkeySigner
 
 
@@ -707,16 +708,28 @@ class HlTrader:
         sz: float,
         is_long: bool,
         *,
-        slippage: float = 0.02,
+        slippage: float = HL_MARKET_CLOSE_SLIPPAGE,
+        min_notional: float = 10.0,
         cloid: Cloid | None = None,
     ) -> tuple[dict, dict, int]:
         # closing a long => sell; closing short => buy
+        is_buy = not is_long
+        sz = self.round_size(coin, sz)
+        mid = self.mid_price(coin)
+        limit_px = flatten_limit_px(
+            mid=mid,
+            sz=sz,
+            is_buy=is_buy,
+            slippage=slippage,
+            min_notional=min_notional,
+            round_price=lambda px: self.round_price(coin, px),
+        )
         return self.market_order(
             coin,
-            is_buy=not is_long,
+            is_buy=is_buy,
             sz=sz,
             reduce_only=True,
-            slippage=slippage,
+            limit_px=limit_px,
             cloid=cloid,
             essential=True,
         )
