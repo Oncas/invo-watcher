@@ -1533,6 +1533,33 @@ class DexExecutor:
             "hlResponse": hl_resp,
         }
 
+    def _hold_size_decrease(
+        self,
+        coin: str,
+        *,
+        reason: str,
+        current_notional: float,
+        target_notional: float,
+        keep_notional: float,
+        sell_notional: float,
+    ) -> None:
+        msg = (
+            f"UPDATE {coin}: size-down held "
+            f"(target=${target_notional:.2f} keep=${keep_notional:.2f} "
+            f"sell=${sell_notional:.2f}) — wait for CLOSE"
+        )
+        console.print(f"[yellow]{msg}[/yellow]")
+        logger.info(msg)
+        log_event(
+            "size_decrease_skip",
+            coin=coin,
+            reason=reason,
+            current_notional=current_notional,
+            target_notional=target_notional,
+            keep_notional=keep_notional,
+            sell_notional=sell_notional,
+        )
+
     def _apply_size_decrease(
         self,
         trader: HlTrader,
@@ -1543,7 +1570,11 @@ class DexExecutor:
         current_sz: float,
         equity: float,
     ) -> tuple[float, dict[str, Any] | None]:
-        """Reduce toward trader's new entrySize allocation. Returns (new_sz, submission)."""
+        """Reduce toward trader's new entrySize allocation. Never flatten.
+
+        CLOSE is the only path that dumps the copy. If matching the new % would
+        leave (or sell) less than HL's $10 notional, keep the current clip.
+        """
         if self.db is not None and inv.base_id is not None:
             self.db.set_pending_add_notional(str(inv.base_id), 0.0)
 
@@ -1557,45 +1588,59 @@ class DexExecutor:
         lev = max(1, leverage)
         target_notional = max(0.0, equity * trader_pct / 100.0) * lev
         hl_min = float(self.settings.hl_min_order_usd)
-        flatten = target_notional + 1e-9 < hl_min
-        sell_notional = (
-            current_notional if flatten else max(0.0, current_notional - target_notional)
-        )
-        if not flatten and sell_notional + 1e-9 < hl_min:
+        keep_notional = max(target_notional, hl_min)
+        sell_notional = max(0.0, current_notional - keep_notional)
+        if sell_notional + 1e-9 < hl_min:
+            self._hold_size_decrease(
+                coin,
+                reason="hold_until_close",
+                current_notional=current_notional,
+                target_notional=target_notional,
+                keep_notional=keep_notional,
+                sell_notional=sell_notional,
+            )
             return current_sz, None
 
-        if flatten:
-            copy = self._get_tracked_copy(inv)
-            if copy is not None and copy.size is not None and float(copy.size) > 0:
-                sell_sz = min(float(copy.size), current_sz)
-            else:
-                sell_sz = current_sz
-        else:
-            sell_sz = sell_notional / mid if mid > 0 else 0.0
+        sell_sz = sell_notional / mid if mid > 0 else 0.0
         sell_sz = trader.round_size(coin, sell_sz)
-        if sell_sz <= 0:
+        leftover_sz = current_sz - sell_sz
+        leftover_notional = leftover_sz * mid if mid > 0 else 0.0
+        if (
+            sell_sz <= 0
+            or leftover_sz <= 1e-12
+            or leftover_notional + 1e-9 < hl_min
+        ):
+            self._hold_size_decrease(
+                coin,
+                reason="hold_until_close",
+                current_notional=current_notional,
+                target_notional=target_notional,
+                keep_notional=keep_notional,
+                sell_notional=sell_sz * mid if mid > 0 else sell_notional,
+            )
             return current_sz, None
 
         cloid = mimic_size_reduce_cloid(inv.base_short_id, copy_update=True)
         console.print(
             f"[cyan]LIVE SIZE DECREASE[/cyan] {coin} "
             f"{'LONG' if is_long else 'SHORT'} -sz={sell_sz} "
-            f"(~${sell_sz * mid:.2f} notional; {current_sz} → ~{max(0.0, current_sz - sell_sz)})"
+            f"(~${sell_sz * mid:.2f} notional; {current_sz} → ~{leftover_sz})"
         )
         logger.info(
-            "SIZE DECREASE %s sell_sz=%s current=%s target_notional=%.4f flatten=%s",
+            "SIZE DECREASE %s sell_sz=%s current=%s target_notional=%.4f "
+            "keep_notional=%.4f",
             coin,
             sell_sz,
             current_sz,
             target_notional,
-            flatten,
+            keep_notional,
         )
         hl_order, hl_resp, nonce = trader.close_position(
             coin, sell_sz, is_long, cloid=cloid
         )
         self._check_hl_ok(hl_resp, "size_decrease")
 
-        new_sz = max(0.0, current_sz - sell_sz)
+        new_sz = max(0.0, leftover_sz)
         try:
             detail = trader.position_detail(coin)
             if detail is None:
@@ -1630,8 +1675,9 @@ class DexExecutor:
             sell_sz=sell_sz,
             qty_before=current_sz,
             qty_after=new_sz,
-            flatten=flatten,
+            flatten=False,
             target_notional=target_notional,
+            keep_notional=keep_notional,
             current_notional=current_notional,
             cloid=cloid.to_raw() if cloid else None,
             hl_response=hl_resp,

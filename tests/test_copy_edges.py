@@ -49,9 +49,18 @@ class _FakeTrader:
         return {}, {"status": "ok"}, 1
 
     def close_position(self, coin, sz, is_long, **kwargs):
-        return self.market_order(
+        result = self.market_order(
             coin, is_buy=not is_long, sz=sz, reduce_only=True, **kwargs
         )
+        if self._pos is not None:
+            cur, long = self._pos
+            left = max(0.0, float(cur) - float(sz))
+            if left <= 1e-12:
+                self._pos = None
+                self._coins = set()
+            else:
+                self._pos = (left, long)
+        return result
 
     def position_detail(self, coin: str):
         if self._pos is None:
@@ -150,7 +159,7 @@ def test_size_cut_reduces_and_cancels_pending(tmp_path) -> None:
     db.close()
 
 
-def test_size_cut_below_hl_min_flattens(tmp_path) -> None:
+def test_size_cut_below_hl_min_holds_until_close(tmp_path) -> None:
     settings = _settings(tmp_path)
     db = AgentDB(settings.db_path)
     base_id = uuid4()
@@ -166,8 +175,8 @@ def test_size_cut_below_hl_min_flattens(tmp_path) -> None:
         trader="alpha_trader",
     )
     exe = DexExecutor(settings, db=db)
-    trader = _FakeTrader(mid=0.20, available=80.0, pos=None, coins=set())
-    # entry 0.5 → 0.5% of 100 * 10 lev = $5 < $10 → flatten
+    trader = _FakeTrader(mid=0.20, available=80.0, pos=(80.0, True), coins={"ADA"})
+    # 80 * $0.20 = $16. entry 0.5% → target $5. Keep floor $10, sell $6 < $10 → hold.
     sz, sub = exe._apply_size_decrease(
         trader,  # type: ignore[arg-type]
         inv=_cut_inv(base_id=base_id, entry_size=0.5, prev=40.0),
@@ -176,9 +185,85 @@ def test_size_cut_below_hl_min_flattens(tmp_path) -> None:
         current_sz=80.0,
         equity=100.0,
     )
-    assert sz == 0.0
+    assert sz == 80.0
+    assert sub is None
+    assert trader.orders == []
+    assert db.get_open_copy(str(base_id)) is not None
+    db.close()
+
+
+def test_wld_style_tiny_cut_does_not_flatten(tmp_path) -> None:
+    """A ~$20 clip, trader cut to 0.1% (~$1) — hold until CLOSE."""
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="ShortIdM13",
+        ticker="WLD",
+        portfolio_id=None,
+        notification_id="n1",
+        side="long",
+        size=60.0,
+        leverage=10,
+        trader="alpha_trader",
+    )
+    db.set_open_copy_fill(
+        str(base_id), our_entry_px=0.35, side="long", size=60.0, leverage=10
+    )
+    exe = DexExecutor(settings, db=db)
+    trader = _FakeTrader(mid=0.32, available=80.0, pos=(60.0, True), coins={"WLD"})
+    sz, sub = exe._apply_size_decrease(
+        trader,  # type: ignore[arg-type]
+        inv=_cut_inv(base_id=base_id, entry_size=0.1, prev=0.3, leverage=10),
+        coin="WLD",
+        is_long=True,
+        current_sz=60.0,
+        equity=100.0,
+    )
+    assert sz == 60.0
+    assert sub is None
+    assert trader.orders == []
+    copy = db.get_open_copy(str(base_id))
+    assert copy is not None
+    assert copy.size == 60.0
+    db.close()
+
+
+def test_size_cut_stops_at_hl_min_clip(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="adaShort",
+        ticker="ADA",
+        portfolio_id=None,
+        notification_id="n1",
+        side="long",
+        size=250.0,
+        leverage=10,
+        trader="alpha_trader",
+    )
+    db.set_open_copy_fill(
+        str(base_id), our_entry_px=0.20, side="long", size=250.0, leverage=10
+    )
+    exe = DexExecutor(settings, db=db)
+    trader = _FakeTrader(mid=0.20, available=80.0, pos=(250.0, True), coins={"ADA"})
+    # 250 * $0.20 = $50. entry 0.5% → target $5. Cut to $10 floor, do not flatten.
+    sz, sub = exe._apply_size_decrease(
+        trader,  # type: ignore[arg-type]
+        inv=_cut_inv(base_id=base_id, entry_size=0.5, prev=40.0),
+        coin="ADA",
+        is_long=True,
+        current_sz=250.0,
+        equity=100.0,
+    )
     assert sub is not None
-    assert db.get_open_copy(str(base_id)) is None
+    assert trader.orders
+    assert abs(sz * 0.20 - 10.0) < 1e-9
+    copy = db.get_open_copy(str(base_id))
+    assert copy is not None
     db.close()
 
 
