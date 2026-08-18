@@ -14,8 +14,8 @@ from invo_agent.notify import notify_mac
 
 logger = logging.getLogger(__name__)
 
-NOTIFY_EXACT = frozenset({"OPEN", "UPDATE", "CLOSE"})
-NOTIFY_PREFIXES = ("ERROR_", "SKIP_", "RECOVERY_")
+NOTIFY_EXACT = frozenset({"OPEN", "UPDATE", "CLOSE", "RECOVERY_CLOSE"})
+NOTIFY_PREFIXES = ("ERROR_", "SKIP_")
 
 
 def cursor_path(settings: Settings) -> Path:
@@ -60,7 +60,7 @@ def _notify_event(settings: Settings, event: dict[str, Any]) -> None:
             "invo-agent · ERROR",
             summary,
             subtitle=action,
-            sound="Basso",
+            sound=settings.mac_notify_sound or None,
             enabled=settings.mac_notify,
             sticky=settings.mac_notify_sticky,
         )

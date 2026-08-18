@@ -253,7 +253,7 @@ class NotificationPoller:
                         notify_mac(
                             "invo-agent · RECOVERY ERROR",
                             f"{copy.ticker or copy.investment_base_id}: {retry_exc}",
-                            sound="Basso",
+                            sound=self.settings.mac_notify_sound or None,
                             enabled=self.settings.mac_notify,
                             sticky=self.settings.mac_notify_sticky,
                         )
@@ -267,7 +267,7 @@ class NotificationPoller:
                     notify_mac(
                         "invo-agent · RECOVERY ERROR",
                         f"{copy.ticker or copy.investment_base_id}: {exc}",
-                        sound="Basso",
+                        sound=self.settings.mac_notify_sound or None,
                         enabled=self.settings.mac_notify,
                         sticky=self.settings.mac_notify_sticky,
                     )
@@ -1054,7 +1054,7 @@ class NotificationPoller:
                     "invo-agent · WARN",
                     f"CLOSE still stuck — recovery will price it: {action.summary}",
                     subtitle="Flatten or park",
-                    sound="Basso",
+                    sound=self.settings.mac_notify_sound or None,
                     enabled=self.settings.mac_notify,
                     sticky=False,
                 )
@@ -1097,7 +1097,7 @@ class NotificationPoller:
             "invo-agent · ERROR",
             f"{action.summary}: {exc}",
             subtitle=action.action.value,
-            sound="Basso",
+            sound=self.settings.mac_notify_sound or None,
             enabled=self.settings.mac_notify,
             sticky=self.settings.mac_notify_sticky,
         )
@@ -1191,7 +1191,7 @@ class NotificationPoller:
             "Turnkey session invalid and auto dex-login failed. "
             f"Check IMAP / run: invo-agent dex-login ({exc})",
             subtitle="Trading paused",
-            sound="Basso",
+            sound=self.settings.mac_notify_sound or None,
             enabled=self.settings.mac_notify,
             sticky=self.settings.mac_notify_sticky,
         )
@@ -1739,7 +1739,7 @@ class NotificationPoller:
                 "invo-agent · WARN",
                 f"HL holds {coin} with no tracked copy",
                 subtitle="Not flattening",
-                sound="Basso",
+                sound=self.settings.mac_notify_sound or None,
                 enabled=self.settings.mac_notify,
                 sticky=self.settings.mac_notify_sticky,
             )
@@ -2305,7 +2305,7 @@ class NotificationPoller:
             notify_mac(
                 "invo-agent · ERROR",
                 f"Auto-login failed: {exc}",
-                sound="Basso",
+                sound=self.settings.mac_notify_sound or None,
                 enabled=self.settings.mac_notify,
                 sticky=self.settings.mac_notify_sticky,
             )
@@ -2417,7 +2417,7 @@ class NotificationPoller:
                     "invo-agent · ERROR",
                     str(exc),
                     subtitle="API",
-                    sound="Basso",
+                    sound=self.settings.mac_notify_sound or None,
                     enabled=self.settings.mac_notify,
                     sticky=self.settings.mac_notify_sticky,
                 )
@@ -2440,7 +2440,7 @@ class NotificationPoller:
                     "invo-agent · ERROR",
                     str(exc),
                     subtitle="Poller",
-                    sound="Basso",
+                    sound=self.settings.mac_notify_sound or None,
                     enabled=self.settings.mac_notify,
                     sticky=self.settings.mac_notify_sticky,
                 )

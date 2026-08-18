@@ -149,7 +149,7 @@ def notify_mac(
     body: str,
     *,
     subtitle: str | None = None,
-    sound: str | None = "Glass",
+    sound: str | None = None,
     enabled: bool = True,
     sticky: bool = True,
 ) -> None:

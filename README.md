@@ -79,7 +79,7 @@ PORTFOLIO_ALLOWLIST=<portfolio-id-1>,<portfolio-id-2>
 
 MAC_NOTIFY=true
 MAC_NOTIFY_STICKY=true
-MAC_NOTIFY_SOUND=Glass
+MAC_NOTIFY_SOUND=
 ```
 
 | Setting | Meaning |

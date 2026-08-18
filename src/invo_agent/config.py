@@ -77,7 +77,8 @@ class Settings(BaseSettings):
     log_dir: Path = Field(default_factory=lambda: _default_home() / "logs")
 
     mac_notify: bool = True
-    mac_notify_sound: str = "Glass"
+    # Empty = silent banners (still shown). Set Glass/Basso to restore a sound.
+    mac_notify_sound: str = ""
     # Stay until dismissed (alerter). False = auto-dismiss osascript banners.
     mac_notify_sticky: bool = True
     log_level: str = "INFO"
