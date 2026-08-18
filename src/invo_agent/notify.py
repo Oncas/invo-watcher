@@ -163,6 +163,10 @@ def notify_mac(
 
     if not enabled:
         return
+    # pytest sets this; unit tests reuse trade-shaped fixtures and must
+    # not pop sticky banners on the machine running the suite.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
 
     title = _clean(title, 80)
     body = _clean(body, 180)
