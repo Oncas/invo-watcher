@@ -342,6 +342,182 @@ class DexExecutor:
             total += self._copy_margin_usd(row)
         return total
 
+    @staticmethod
+    def _change_float(value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if number != number:  # NaN
+            return None
+        return number
+
+    @classmethod
+    def _relative_add_ratio(cls, inv: InvestmentUpdate) -> float | None:
+        """How much they added vs dollars already in the trade.
+
+        Official modify is ``simDifference / previous entrySim`` (e.g. +$35 on
+        $25 = +137% of the clip). ``entrySize`` is only a fallback: the *change*
+        in their book % applied to our clip — never the new % of our account.
+        """
+        changes = inv.changes or {}
+        sim_diff = cls._change_float(changes.get("simDifference"))
+        old_sim = cls._change_float(changes.get("entrySim"))
+        if (
+            sim_diff is not None
+            and old_sim is not None
+            and old_sim > 0
+            and sim_diff > 0
+        ):
+            return sim_diff / old_sim
+        new_sim = cls._change_float(inv.entry_sim)
+        if (
+            new_sim is not None
+            and old_sim is not None
+            and old_sim > 0
+            and new_sim > old_sim
+        ):
+            return (new_sim - old_sim) / old_sim
+        old_pct = cls._change_float(changes.get("entrySize"))
+        new_pct = cls._change_float(inv.entry_size)
+        if (
+            old_pct is not None
+            and new_pct is not None
+            and old_pct > 0
+            and new_pct > old_pct
+        ):
+            return (new_pct - old_pct) / old_pct
+        return None
+
+    @classmethod
+    def _relative_reduce_ratio(cls, inv: InvestmentUpdate) -> float | None:
+        """How much they cut vs dollars already in the trade (0–1)."""
+        changes = inv.changes or {}
+        sim_diff = cls._change_float(changes.get("simDifference"))
+        old_sim = cls._change_float(changes.get("entrySim"))
+        if (
+            sim_diff is not None
+            and old_sim is not None
+            and old_sim > 0
+            and sim_diff > 0
+        ):
+            return min(1.0, sim_diff / old_sim)
+        new_sim = cls._change_float(inv.entry_sim)
+        if (
+            new_sim is not None
+            and old_sim is not None
+            and old_sim > 0
+            and new_sim < old_sim
+        ):
+            return (old_sim - new_sim) / old_sim
+        old_pct = cls._change_float(changes.get("entrySize"))
+        new_pct = cls._change_float(inv.entry_size)
+        if (
+            old_pct is not None
+            and new_pct is not None
+            and old_pct > 0
+            and new_pct < old_pct
+        ):
+            return (old_pct - new_pct) / old_pct
+        return None
+
+    def _cap_position_notional(
+        self,
+        *,
+        equity: float,
+        leverage: int,
+        desired_notional: float,
+        exclude_base_id: str | None = None,
+    ) -> tuple[float, dict[str, Any]]:
+        """Shrink a desired position notional to per-copy and book caps."""
+        lev = max(1, int(leverage or 1))
+        max_pct = float(self.settings.max_position_pct)
+        book_max_pct = float(self.settings.max_book_margin_pct)
+        copy_cap = max(0.0, equity * max_pct / 100.0) * lev
+        book_used = self._book_margin_used_usd(exclude_base_id=exclude_base_id)
+        room_usd = (
+            max(0.0, equity * book_max_pct / 100.0 - book_used) if equity > 0 else 0.0
+        )
+        room_ntl = room_usd * lev
+        this_cap = min(copy_cap, room_ntl)
+        desired = max(0.0, float(desired_notional))
+        final = min(desired, this_cap)
+        book_capped = room_ntl + 1e-9 < copy_cap and final + 1e-9 < desired
+        capped = final + 1e-9 < desired
+        final_pct = (final / lev / equity) * 100.0 if equity > 0 and lev > 0 else 0.0
+        return final, {
+            "capped": capped,
+            "book_capped": book_capped,
+            "book_used_usd": book_used,
+            "book_room_usd": room_usd,
+            "max_book_margin_pct": book_max_pct,
+            "final_pct": final_pct,
+            "copy_cap_notional": copy_cap,
+            "leverage": lev,
+        }
+
+    def _size_add_need(
+        self,
+        *,
+        inv: InvestmentUpdate,
+        current_notional: float,
+        equity: float,
+        pending_add: float,
+        pending_only: bool,
+        exclude_base_id: str | None = None,
+    ) -> tuple[float, dict[str, Any]]:
+        """USD notional to add: grow our clip by their add-ratio, then cap.
+
+        Drain retries use the already-queued leftover only — do not re-apply
+        the same ``simDifference`` onto a clip we already fattened.
+        """
+        lev = max(1, int(inv.leverage or 1))
+        ratio = None if pending_only else self._relative_add_ratio(inv)
+        changes = inv.changes or {}
+        if pending_only:
+            raw_need = max(0.0, pending_add)
+            source = "pending"
+        elif ratio is not None and ratio > 0:
+            raw_need = max(0.0, current_notional * ratio)
+            if pending_add > 1e-9:
+                raw_need += pending_add
+            source = "relative_add"
+        else:
+            raw_need = max(0.0, pending_add)
+            source = "pending" if pending_add > 1e-9 else "none"
+
+        desired = current_notional + raw_need
+        cap_ntl, cap_meta = self._cap_position_notional(
+            equity=equity,
+            leverage=lev,
+            desired_notional=desired,
+            exclude_base_id=exclude_base_id,
+        )
+        need = max(0.0, cap_ntl - current_notional)
+        trader_pct = self._trader_allocation_pct(inv.entry_size)
+        meta = {
+            "source": source,
+            "add_ratio": ratio,
+            "sim_difference": self._change_float(changes.get("simDifference")),
+            "old_entry_sim": self._change_float(changes.get("entrySim")),
+            "trader_pct": trader_pct,
+            "target_pct": trader_pct,
+            "target_notional": cap_ntl,
+            "uncapped_need": raw_need,
+            "uncapped_target": desired,
+            "final_pct": cap_meta["final_pct"],
+            "capped": cap_meta["capped"],
+            "book_capped": cap_meta["book_capped"],
+            "book_used_usd": cap_meta["book_used_usd"],
+            "book_room_usd": cap_meta["book_room_usd"],
+            "max_book_margin_pct": cap_meta["max_book_margin_pct"],
+            "hl_min_order_usd": float(self.settings.hl_min_order_usd),
+            "leverage": lev,
+        }
+        return need, meta
+
     def _resolve_margin(
         self,
         *,
@@ -794,6 +970,7 @@ class DexExecutor:
                 is_long=is_long,
                 current_sz=sz,
                 equity=equity,
+                pending_only=True,
             )
             if size_sub is None:
                 return
@@ -1331,20 +1508,13 @@ class DexExecutor:
         is_long: bool,
         current_sz: float,
         equity: float,
+        pending_only: bool = False,
     ) -> tuple[float, dict[str, Any] | None]:
-        """Buy up toward trader's new entrySize allocation. Returns (new_sz, submission)."""
+        """Grow our clip by the trader's add-ratio. Returns (new_sz, submission)."""
         leverage = int(inv.leverage or 1)
         mid = trader.mid_price(coin)
         current_notional = float(current_sz) * mid
-        _margin, meta = self._resolve_margin(
-            equity=equity,
-            leverage=leverage,
-            entry_size=inv.entry_size,
-            exclude_base_id=str(inv.base_id) if inv.base_id is not None else None,
-        )
-        target_notional = float(meta["order_notional_usd"])
         hl_min = float(self.settings.hl_min_order_usd)
-        gap = target_notional - current_notional
         pending_add = 0.0
         pending_entry: float | None = None
         if self.db is not None and inv.base_id is not None:
@@ -1352,11 +1522,15 @@ class DexExecutor:
             if copy is not None:
                 pending_add = float(copy.pending_add_notional or 0)
                 pending_entry = copy.pending_add_entry
-        # Live trader allocation is the source of truth — don't add pending on top.
-        if inv.entry_size is not None:
-            need = max(0.0, gap)
-        else:
-            need = max(0.0, pending_add)
+        need, meta = self._size_add_need(
+            inv=inv,
+            current_notional=current_notional,
+            equity=equity,
+            pending_add=pending_add,
+            pending_only=pending_only,
+            exclude_base_id=str(inv.base_id) if inv.base_id is not None else None,
+        )
+        target_notional = float(meta["target_notional"])
 
         trader_entry = float(inv.entry_price) if inv.entry_price else None
         if trader_entry is not None and trader_entry <= 0:
@@ -1368,11 +1542,7 @@ class DexExecutor:
         lev = max(1, leverage)
         buyable = available * 0.98 * lev
         if need + 1e-9 < hl_min:
-            accumulated = (
-                need
-                if inv.entry_size is not None
-                else pending_add + max(0.0, gap)
-            )
+            accumulated = need
             if accumulated <= 1e-9:
                 if self.db is not None and inv.base_id is not None:
                     self.db.set_pending_add_notional(str(inv.base_id), 0.0)
@@ -1457,13 +1627,14 @@ class DexExecutor:
             f"(~${add_sz * mid:.2f} notional; {current_sz} → ~{current_sz + add_sz})"
         )
         logger.info(
-            "SIZE INCREASE %s add_sz=%s current=%s entry_size=%s trader_pct=%s "
-            "final_pct=%s equity=%.4f target_notional=%.4f delta_notional=%.4f "
-            "cloid=%s",
+            "SIZE INCREASE %s add_sz=%s current=%s entry_size=%s add_ratio=%s "
+            "trader_pct=%s final_pct=%s equity=%.4f target_notional=%.4f "
+            "delta_notional=%.4f cloid=%s",
             coin,
             add_sz,
             current_sz,
             inv.entry_size,
+            meta.get("add_ratio"),
             meta.get("trader_pct"),
             meta.get("final_pct"),
             equity,
@@ -1587,7 +1758,11 @@ class DexExecutor:
             entry_size=inv.entry_size,
             equity=equity,
             target_notional=target_notional,
-            **{k: v for k, v in meta.items() if k not in {"margin_usd", "order_notional_usd"}},
+            **{
+                k: v
+                for k, v in meta.items()
+                if k not in {"margin_usd", "order_notional_usd", "target_notional"}
+            },
         )
         return new_sz, {
             "kind": "size_increase",
@@ -1633,10 +1808,10 @@ class DexExecutor:
         current_sz: float,
         equity: float,
     ) -> tuple[float, dict[str, Any] | None]:
-        """Reduce toward trader's new entrySize allocation. Never flatten.
+        """Cut our clip by the same fraction they cut theirs. Never flatten.
 
-        CLOSE is the only path that dumps the copy. If matching the new % would
-        leave (or sell) less than HL's $10 notional, keep the current clip.
+        CLOSE is the only path that dumps the copy. If the cut would leave
+        (or sell) less than HL's $10 notional, keep the current clip.
         """
         if self.db is not None and inv.base_id is not None:
             self.db.set_pending_add_notional(str(inv.base_id), 0.0)
@@ -1644,13 +1819,19 @@ class DexExecutor:
         leverage = int(inv.leverage or 1)
         mid = trader.mid_price(coin)
         current_notional = float(current_sz) * mid
-        # Raw trader % — do not bump to HL min (that would refuse a real cut).
-        trader_pct = self._trader_allocation_pct(inv.entry_size)
-        if trader_pct is None:
-            trader_pct = float(self.settings.position_pct)
-        lev = max(1, leverage)
-        target_notional = max(0.0, equity * trader_pct / 100.0) * lev
+        ratio = self._relative_reduce_ratio(inv)
         hl_min = float(self.settings.hl_min_order_usd)
+        if ratio is None or ratio <= 0:
+            self._hold_size_decrease(
+                coin,
+                reason="hold_until_close",
+                current_notional=current_notional,
+                target_notional=current_notional,
+                keep_notional=current_notional,
+                sell_notional=0.0,
+            )
+            return current_sz, None
+        target_notional = max(0.0, current_notional * (1.0 - ratio))
         keep_notional = max(target_notional, hl_min)
         sell_notional = max(0.0, current_notional - keep_notional)
         if sell_notional + 1e-9 < hl_min:
@@ -1690,11 +1871,12 @@ class DexExecutor:
             f"(~${sell_sz * mid:.2f} notional; {current_sz} → ~{leftover_sz})"
         )
         logger.info(
-            "SIZE DECREASE %s sell_sz=%s current=%s target_notional=%.4f "
-            "keep_notional=%.4f",
+            "SIZE DECREASE %s sell_sz=%s current=%s reduce_ratio=%s "
+            "target_notional=%.4f keep_notional=%.4f",
             coin,
             sell_sz,
             current_sz,
+            ratio,
             target_notional,
             keep_notional,
         )
@@ -1742,6 +1924,7 @@ class DexExecutor:
             target_notional=target_notional,
             keep_notional=keep_notional,
             current_notional=current_notional,
+            reduce_ratio=ratio,
             cloid=cloid.to_raw() if cloid else None,
             hl_response=hl_resp,
         )

@@ -126,6 +126,7 @@ def test_pending_add_drain_records_mimic_after_fill(tmp_path) -> None:
         leverage=10,
         trader="alpha_trader",
     )
+    db.set_pending_add_notional(str(base_id), 25.0, entry=0.20, reason="margin")
     exe = DexExecutor(settings, db=db)
     recorded: list[str] = []
     exe._mimic_copy = lambda **kwargs: recorded.append(kwargs["update_type"]) or {}  # type: ignore[method-assign]

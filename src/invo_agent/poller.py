@@ -809,15 +809,16 @@ class NotificationPoller:
         equity = trader.cached_equity()
         if equity is None or equity <= 0:
             return None
-        lev = int(inv.leverage or copy.leverage or 1)
-        _, meta = self.executor._resolve_margin(
+        current = float(copy.size or 0) * float(mid)
+        need, _meta = self.executor._size_add_need(
+            inv=inv,
+            current_notional=current,
             equity=float(equity),
-            leverage=lev,
-            entry_size=inv.entry_size,
+            pending_add=0.0,
+            pending_only=False,
             exclude_base_id=copy.investment_base_id,
         )
-        current = float(copy.size or 0) * float(mid)
-        return max(0.0, float(meta["order_notional_usd"]) - current)
+        return max(0.0, need)
 
     def _ensure_queued_size_add(self, action: TradeAction, *, reason: str) -> bool:
         inv = action.investment

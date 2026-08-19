@@ -236,7 +236,7 @@ MIN_EQUITY_USD=5
 invo-agent run
 ```
 
-**Sizing:** each OPEN copies the source trader’s `entrySize` as percent of *your* HL equity (Involio `0.8` = 0.8%, `1` = 1%, `12` = 12% — not a 0–1 fraction). If that would make order notional (`margin × leverage`) below `HL_MIN_ORDER_USD` ($10), it bids the % up to clear that floor. `POSITION_PCT` is only used when `entrySize` is missing.
+**Sizing:** each OPEN copies the source trader’s `entrySize` as percent of *your* HL equity (Involio `0.8` = 0.8%, `1` = 1%, `12` = 12% — not a 0–1 fraction). If that would make order notional (`margin × leverage`) below `HL_MIN_ORDER_USD` ($10), it bids the % up to clear that floor. `POSITION_PCT` is only used when `entrySize` is missing. Size-ups grow **your existing clip** by `simDifference / previous entrySim` (the same percent they added to dollars already in the trade) — they do not retarget the trader’s new `entrySize` onto your whole account. Per-copy and book caps still apply.
 
 `size ≈ (margin × leverage) / mid_price`
 

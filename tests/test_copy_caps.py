@@ -133,19 +133,28 @@ def _inv(
     entry_price=0.20,
     long=True,
     increase=True,
+    entry_sim=None,
+    prev_sim=None,
+    sim_difference=None,
 ):
-    return InvestmentUpdate.model_validate(
-        {
-            "baseId": str(base_id),
-            "baseShortId": "adaShort",
-            "ticker": ticker,
-            "directionLong": long,
-            "leverage": leverage,
-            "entrySize": entry_size,
-            "entryPrice": entry_price,
-            "changes": {"simIncrease": increase, "entrySize": prev},
-        }
-    )
+    changes: dict = {"simIncrease": increase, "entrySize": prev}
+    if prev_sim is not None:
+        changes["entrySim"] = prev_sim
+    if sim_difference is not None:
+        changes["simDifference"] = sim_difference
+    payload: dict = {
+        "baseId": str(base_id),
+        "baseShortId": "adaShort",
+        "ticker": ticker,
+        "directionLong": long,
+        "leverage": leverage,
+        "entrySize": entry_size,
+        "entryPrice": entry_price,
+        "changes": changes,
+    }
+    if entry_sim is not None:
+        payload["entrySim"] = entry_sim
+    return InvestmentUpdate.model_validate(payload)
 
 
 def _open_action(*, base_id, ticker, entry_size, leverage, entry_price, long=True):
@@ -379,8 +388,150 @@ def test_three_10pct_copies_still_allow_a_fourth(tmp_path) -> None:
 # --- size-add: synthetic allocation examples ----------------------------------------
 
 
+def test_relative_add_ratio_prefers_sim_difference() -> None:
+    inv = _inv(
+        base_id=uuid4(),
+        entry_size=32.0,
+        prev=12.0,
+        entry_sim=60.0,
+        prev_sim=24.0,
+        sim_difference=36.0,
+        leverage=10,
+    )
+    ratio = DexExecutor._relative_add_ratio(inv)
+    assert ratio == pytest.approx(36.0 / 24.0)
+    # Not "30% of the account" and not (32-12)/12 when sim $ exist.
+    assert ratio != pytest.approx((32.0 - 12.0) / 12.0)
+    fallback = _inv(base_id=uuid4(), entry_size=32.0, prev=12.0)
+    assert DexExecutor._relative_add_ratio(fallback) == pytest.approx(
+        (32.0 - 12.0) / 12.0
+    )
+    assert (
+        DexExecutor._relative_add_ratio(
+            _inv(base_id=uuid4(), entry_size=1.0, prev=1.0, increase=False)
+        )
+        is None
+    )
+
+
+def test_size_add_is_pct_of_clip_not_pct_of_account(tmp_path) -> None:
+    """A +150% relative add grows the clip by 150%, not the account by 32%."""
+    _, db, exe = _exe(tmp_path)
+    equity = 10_000.0  # cap must not bind — isolate the ratio
+    mid = 60.0
+    current_ntl = 66.0
+    current_sz = current_ntl / mid
+    base_id = _seed_copy(
+        db, ticker="HYPE", size=current_sz, px=mid, leverage=10, side="short"
+    )
+    trader = _FakeTrader(
+        mid=mid, available=5_000.0, pos=(current_sz, False), coins={"HYPE"}
+    )
+    _sz, sub = exe._apply_size_increase(
+        trader,  # type: ignore[arg-type]
+        inv=_inv(
+            base_id=base_id,
+            ticker="HYPE",
+            entry_size=32.0,
+            prev=12.0,
+            leverage=10,
+            entry_price=mid,
+            long=False,
+            entry_sim=60.0,
+            prev_sim=24.0,
+            sim_difference=36.0,
+        ),
+        coin="HYPE",
+        is_long=False,
+        current_sz=current_sz,
+        equity=equity,
+    )
+    assert sub is not None
+    add_sz = trader.orders[0]["sz"]
+    final_ntl = current_sz * mid + add_sz * mid
+    want_add = current_ntl * (36.0 / 24.0)
+    assert add_sz * mid == pytest.approx(want_add, rel=1e-6)
+    assert final_ntl == pytest.approx(current_ntl + want_add, rel=1e-6)
+    # Old bug: 32.0% of $10k × 10x = $30,831.
+    assert final_ntl < 200.0
+    assert final_ntl * 50 < 32_000.0
+    db.close()
+
+
+def test_entry_size_30pct_does_not_retarget_our_book(tmp_path) -> None:
+    """Same 32% field without sim $ still scales the clip, not 30% of equity."""
+    _, db, exe = _exe(tmp_path)
+    mid = 60.0
+    current_ntl = 66.0
+    current_sz = current_ntl / mid
+    base_id = _seed_copy(
+        db, ticker="HYPE", size=current_sz, px=mid, leverage=10, side="short"
+    )
+    trader = _FakeTrader(
+        mid=mid, available=5_000.0, pos=(current_sz, False), coins={"HYPE"}
+    )
+    _sz, sub = exe._apply_size_increase(
+        trader,  # type: ignore[arg-type]
+        inv=_inv(
+            base_id=base_id,
+            ticker="HYPE",
+            entry_size=32.0,
+            prev=12.0,
+            leverage=10,
+            entry_price=mid,
+            long=False,
+        ),
+        coin="HYPE",
+        is_long=False,
+        current_sz=current_sz,
+        equity=10_000.0,
+    )
+    assert sub is not None
+    final_ntl = current_sz * mid + trader.orders[0]["sz"] * mid
+    want = current_ntl * (1.0 + (32.0 - 12.0) / 12.0)
+    assert final_ntl == pytest.approx(want, rel=1e-6)
+    assert final_ntl < 200.0
+    db.close()
+
+
+def test_pending_drain_does_not_reapply_ratio(tmp_path) -> None:
+    """Leftover $12 must fill $12, not another +137% of the current clip."""
+    _, db, exe = _exe(tmp_path)
+    mid = 60.0
+    current_sz = 66.0 / mid
+    base_id = _seed_copy(
+        db, ticker="HYPE", size=current_sz, px=mid, leverage=10, side="short"
+    )
+    db.set_pending_add_notional(base_id, 12.0, entry=mid, reason="margin")
+    trader = _FakeTrader(
+        mid=mid, available=5_000.0, pos=(current_sz, False), coins={"HYPE"}
+    )
+    _sz, sub = exe._apply_size_increase(
+        trader,  # type: ignore[arg-type]
+        inv=_inv(
+            base_id=base_id,
+            ticker="HYPE",
+            entry_size=32.0,
+            prev=12.0,
+            leverage=10,
+            entry_price=mid,
+            long=False,
+            prev_sim=25.344,
+            sim_difference=34.805,
+        ),
+        coin="HYPE",
+        is_long=False,
+        current_sz=current_sz,
+        equity=10_000.0,
+        pending_only=True,
+    )
+    assert sub is not None
+    assert trader.orders[0]["sz"] * mid == pytest.approx(12.0, rel=1e-6)
+    db.close()
+
+
 def test_sol_size_add_stops_at_the_per_copy_cap(tmp_path) -> None:
-    """Opened $10 / 0.1%. Later 25% must stop at 10% of $111 ($222), not $553+."""
+    """Opened $10 / 0.1%. A 250x relative add still stops at 10% of the book."""
     _, db, exe = _exe(tmp_path)
     equity = 100.0
     mid = 80.0

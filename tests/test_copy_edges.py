@@ -331,8 +331,8 @@ def test_size_cut_reduces_and_cancels_pending(tmp_path) -> None:
     )
     db.set_pending_add_notional(str(base_id), 25.0, reason="margin")
     exe = DexExecutor(settings, db=db)
-    trader = _FakeTrader(mid=0.20, available=80.0, pos=(200.0, True))
-    # size 600, mid 0.20 → $120. entrySize 10 = 10% → target $100. sell $20.
+    trader = _FakeTrader(mid=0.20, available=80.0, pos=(600.0, True))
+    # $120 clip. Cut 40% → 10% of their book = sell 75% of ours ($90), keep $30.
     db.set_open_copy_fill(
         str(base_id), our_entry_px=0.20, side="long", size=600.0, leverage=10
     )
@@ -489,7 +489,13 @@ def test_size_add_dust_leftover_stays(tmp_path) -> None:
             "leverage": 10,
             "entrySize": 2.8,
             "entryPrice": 0.20,
-            "changes": {"simIncrease": True, "entrySize": 0.16},
+            "entrySim": 28.0,
+            "changes": {
+                "simIncrease": True,
+                "entrySize": 1.6,
+                "entrySim": 16.0,
+                "simDifference": 12.0,
+            },
         }
     )
     sz, sub = exe._apply_size_increase(
