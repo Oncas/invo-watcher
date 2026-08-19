@@ -87,7 +87,8 @@ MAC_NOTIFY_SOUND=
 | `DRY_RUN` / `LIVE` | Keep `DRY_RUN=true` and `LIVE=false` until you’re ready |
 | `POSITION_PCT` | Fallback margin % if the source trade has no `entrySize` |
 | `HL_MIN_ORDER_USD` | Floor order notional (margin×leverage); default $10 for Hyperliquid |
-| `MAX_POSITION_PCT` | Cap each OPEN to this % of equity as margin (default 50) |
+| `MAX_POSITION_PCT` | Cap each copy to this % of equity as margin (default 10) |
+| `MAX_BOOK_MARGIN_PCT` | Cap the sum of open-copy margins + this order (default 40) |
 | `RECOVERY_ENABLED` | On startup, reconcile open copies vs Involio closes (default true) |
 | `RECOVERY_SL_PCT` | Parked SL as % of our margin (price move = this / leverage; default 3) |
 | `MIN_EQUITY_USD` | Skip trades if HL equity is below this |

@@ -763,6 +763,8 @@ def test_live_pending_reason_fat_vs_tiny(tmp_path) -> None:
         live=False,
         dry_run=True,
         hl_min_order_usd=10.0,
+        max_position_pct=10.0,
+        max_book_margin_pct=40.0,
     )
     db = AgentDB(settings.db_path)
     poller = NotificationPoller(
@@ -773,13 +775,14 @@ def test_live_pending_reason_fat_vs_tiny(tmp_path) -> None:
     )  # type: ignore[arg-type]
     poller.executor._trader = SimpleNamespace(
         cached_equity=lambda: 100.0,
-        cached_available=lambda: 18.0,
+        cached_available=lambda: 8.0,
         cached_mid=lambda coin: 2.0,
     )
     poller.executor.budget = lambda: SimpleNamespace(  # type: ignore[method-assign]
         can_spend=lambda n, essential=False: False
     )
-    assert poller._need_margin_usd(entry_size=20.0, leverage=10) == 20.0
+    # 20% of $100 is $20; per-copy cap is 10% → $10 cash.
+    assert poller._need_margin_usd(entry_size=20.0, leverage=10) == 10.0
     # 0.5% of $100 is $5 notional at 10x → bump to $10 → $1 cash.
     assert poller._need_margin_usd(entry_size=0.5, leverage=10) == 1.0
     assert poller._need_margin_usd(

@@ -40,8 +40,10 @@ class Settings(BaseSettings):
     poll_jitter_seconds: float = 1.0
     # Fallback margin % of our equity when the source trade has no entrySize.
     position_pct: float = 5.0
-    # Never allocate more than this % of our equity on one open (safety).
-    max_position_pct: float = 50.0
+    # Never allocate more than this % of our equity as margin on one copy.
+    max_position_pct: float = 10.0
+    # Sum of open-copy margins + this order cannot exceed this % of equity.
+    max_book_margin_pct: float = 40.0
     notification_page_size: int = 20
     min_equity_usd: float = 5.0
     # Hyperliquid rejects orders with notional (margin×leverage) below this.

@@ -85,6 +85,8 @@ def _settings(tmp_path, **extra) -> Settings:
         live=False,
         dry_run=True,
         hl_min_order_usd=10.0,
+        max_position_pct=10.0,
+        max_book_margin_pct=40.0,
         **extra,
     )
 
@@ -120,6 +122,196 @@ def test_entry_size_is_percent_not_fraction(tmp_path) -> None:
     tiny, tiny_meta = exe._resolve_margin(equity=100.0, leverage=20, entry_size=0.1)
     assert tiny == 0.5
     assert tiny_meta["order_notional_usd"] == 10.0
+    assert tiny_meta["capped"] is False
+    assert tiny_meta["final_pct"] != 10.0
+
+
+def test_live_27pct_capped_to_10pct_margin(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    exe = DexExecutor(settings)
+    margin, meta = exe._resolve_margin(equity=100.0, leverage=20, entry_size=27.0)
+    assert meta["trader_pct"] == 27.0
+    assert meta["capped"] is True
+    assert meta["final_pct"] == 10.0
+    assert abs(margin - 10.0) < 1e-9
+    assert abs(meta["order_notional_usd"] - 200.0) < 1e-9
+
+
+def test_size_add_from_min_clip_stops_at_per_copy_cap(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="adaShort",
+        ticker="ADA",
+        portfolio_id=None,
+        notification_id="n1",
+        side="long",
+        size=50.0,
+        leverage=20,
+        trader="alpha_trader",
+    )
+    db.set_open_copy_fill(
+        str(base_id), our_entry_px=0.20, side="long", size=50.0, leverage=20
+    )
+    exe = DexExecutor(settings, db=db)
+    trader = _FakeTrader(mid=0.20, available=80.0, pos=(50.0, True), coins={"ADA"})
+    logged: list[dict] = []
+
+    def _capture(name: str, **kwargs):
+        if name == "size_increase_hl":
+            logged.append(kwargs)
+
+    import invo_agent.dex.executor as exe_mod
+
+    original = exe_mod.log_event
+    exe_mod.log_event = lambda name, **kwargs: (  # type: ignore[method-assign]
+        _capture(name, **kwargs) if name == "size_increase_hl" else original(name, **kwargs)
+    )
+    try:
+        _sz, sub = exe._apply_size_increase(
+            trader,  # type: ignore[arg-type]
+            inv=_cut_inv(base_id=base_id, entry_size=25.0, prev=0.1, leverage=20),
+            coin="ADA",
+            is_long=True,
+            current_sz=50.0,
+            equity=100.0,
+        )
+    finally:
+        exe_mod.log_event = original
+    assert sub is not None
+    add_sz = trader.orders[0]["sz"]
+    # 0.1% clip is $10. 25% would be $500; 10% cap is $200 notional.
+    assert abs(50.0 * 0.20 + add_sz * 0.20 - 200.0) < 1e-6
+    assert logged
+    assert logged[0]["entry_size"] == 25.0
+    assert logged[0]["trader_pct"] == 25.0
+    assert logged[0]["final_pct"] == 10.0
+    assert logged[0]["equity"] == 100.0
+    assert logged[0]["target_notional"] == 200.0
+    db.close()
+
+
+def test_book_cap_refuses_second_copy(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    other = str(uuid4())
+    db.upsert_open_copy(
+        investment_base_id=other,
+        base_short_id="fatBook",
+        ticker="HYPE",
+        portfolio_id=None,
+        notification_id="n1",
+        side="short",
+        size=40.0,
+        leverage=1,
+        trader="delta_short",
+    )
+    db.set_open_copy_fill(
+        other, our_entry_px=1.0, side="short", size=40.0, leverage=1
+    )
+    exe = DexExecutor(settings, db=db)
+    margin, meta = exe._resolve_margin(equity=100.0, leverage=20, entry_size=5.0)
+    assert meta["book_capped"] is True
+    assert meta["book_used_usd"] == 40.0
+    assert margin == 0.0
+    assert meta["order_notional_usd"] < settings.hl_min_order_usd
+    db.close()
+
+
+def test_drain_does_not_open_queued_01_at_live_25(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    poller = _poller(settings, db)
+    now = datetime.now(UTC).isoformat()
+    base_id = uuid4()
+    db.upsert_pending_intent(
+        PendingIntent(
+            investment_base_id=str(base_id),
+            coin="SOL",
+            side="short",
+            reason="price",
+            created_at=now,
+            updated_at=now,
+            entry_size=0.1,
+            leverage=20,
+        )
+    )
+    intent = db.get_pending_intent(str(base_id))
+    assert intent is not None
+    live = InvestmentUpdate.model_validate(
+        {
+            "baseId": str(base_id),
+            "ticker": "SOL",
+            "directionLong": False,
+            "leverage": 20,
+            "entrySize": 25.0,
+            "entryPrice": 80.0,
+        }
+    )
+    action = poller._action_from_pending(intent, live)
+    assert action.investment is not None
+    assert action.investment.entry_size == 0.1
+    exe = DexExecutor(settings, db=db)
+    _margin, meta = exe._resolve_margin(
+        equity=100.0,
+        leverage=20,
+        entry_size=action.investment.entry_size,
+    )
+    assert meta["trader_pct"] == 0.1
+    assert meta["order_notional_usd"] == 10.0
+    db.close()
+
+
+def test_refresh_pending_does_not_raise_entry_size(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    now = datetime.now(UTC).isoformat()
+    base_id = uuid4()
+    db.upsert_pending_intent(
+        PendingIntent(
+            investment_base_id=str(base_id),
+            coin="SOL",
+            side="short",
+            reason="price",
+            created_at=now,
+            updated_at=now,
+            entry_size=0.1,
+            leverage=20,
+            trader_entry=80.0,
+            summary="OPEN SOL SHORT 20x @alpha_trader",
+        )
+    )
+    notif = Notification.model_validate(
+        {
+            "id": str(uuid4()),
+            "content": "x",
+            "notificationType": "user_updated_investment",
+            "createdAt": now,
+            "investmentBaseId": str(base_id),
+            "notifier": {"username": "alpha_trader"},
+        }
+    )
+    inv = InvestmentUpdate.model_validate(
+        {
+            "baseId": str(base_id),
+            "ticker": "SOL",
+            "directionLong": False,
+            "leverage": 20,
+            "entrySize": 25.0,
+            "entryPrice": 81.0,
+        }
+    )
+    poller = _poller(settings, db)
+    assert poller._refresh_pending_from_update(
+        TradeAction(action=ActionType.UPDATE, notification=notif, investment=inv)
+    )
+    row = db.get_pending_intent(str(base_id))
+    assert row is not None
+    assert row.entry_size == 0.1
+    assert row.trader_entry == 81.0
+    db.close()
 
 
 def test_size_cut_reduces_and_cancels_pending(tmp_path) -> None:
@@ -903,10 +1095,10 @@ def test_close_stub_from_copy(tmp_path) -> None:
     db.close()
 
 
-def test_queued_open_kept_when_shadow_still_open(tmp_path) -> None:
-    settings = _settings(tmp_path, pending_max_age_seconds=60)
+def test_queued_open_expires_even_if_shadow_still_open(tmp_path) -> None:
+    settings = _settings(tmp_path)
     db = AgentDB(settings.db_path)
-    stale = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    stale = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
     from invo_agent.db import PendingIntent
 
     base_id = str(uuid4())
@@ -919,6 +1111,7 @@ def test_queued_open_kept_when_shadow_still_open(tmp_path) -> None:
             created_at=stale,
             updated_at=stale,
             summary="OPEN DOT LONG 10x @gamma_trader Rq48",
+            resting_oid=4242,
         )
     )
     inv = InvestmentUpdate.model_validate(
@@ -935,8 +1128,13 @@ def test_queued_open_kept_when_shadow_still_open(tmp_path) -> None:
         settings=settings,
         session_store=SimpleNamespace(),
     )  # type: ignore[arg-type]
+    cancelled: list[int | None] = []
+    poller._cancel_pending_resting = (  # type: ignore[method-assign]
+        lambda intent: cancelled.append(intent.resting_oid)
+    )
     poller._expire_pending()
-    assert db.list_pending_intents()
+    assert db.list_pending_intents() == []
+    assert cancelled == [4242]
     db.close()
 
 

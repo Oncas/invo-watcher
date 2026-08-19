@@ -323,10 +323,38 @@ class DexExecutor:
             return None
         return float(entry_size)
 
+    @staticmethod
+    def _copy_margin_usd(copy: OpenCopy) -> float:
+        sz = float(copy.size or 0.0)
+        px = float(copy.our_entry_px or 0.0)
+        if sz <= 0 or px <= 0:
+            return 0.0
+        lev = max(1.0, float(copy.leverage or 1.0))
+        return sz * px / lev
+
+    def _book_margin_used_usd(self, *, exclude_base_id: str | None = None) -> float:
+        if self.db is None:
+            return 0.0
+        total = 0.0
+        for row in self.db.list_open_copies():
+            if exclude_base_id and row.investment_base_id == exclude_base_id:
+                continue
+            total += self._copy_margin_usd(row)
+        return total
+
     def _resolve_margin(
-        self, *, equity: float, leverage: int, entry_size: float | None
+        self,
+        *,
+        equity: float,
+        leverage: int,
+        entry_size: float | None,
+        exclude_base_id: str | None = None,
     ) -> tuple[float, dict[str, Any]]:
-        """Copy trader % of our equity; bump up if HL $min notional wouldn't clear."""
+        """Copy trader % of our equity; bump up if HL $min notional wouldn't clear.
+
+        Then cap per-copy margin % and the book's used+this-order margin %.
+        Caps can shrink below the $10 floor — caller skips / queues.
+        """
         trader_pct = self._trader_allocation_pct(entry_size)
         if trader_pct is not None:
             target_pct = trader_pct
@@ -343,10 +371,23 @@ class DexExecutor:
         final_pct = max(target_pct, min_pct)
         bumped = final_pct > target_pct + 1e-9
         capped = False
+        book_capped = False
         max_pct = float(self.settings.max_position_pct)
         if final_pct > max_pct:
             final_pct = max_pct
             capped = True
+
+        book_max_pct = float(self.settings.max_book_margin_pct)
+        book_used = self._book_margin_used_usd(exclude_base_id=exclude_base_id)
+        room_usd = 0.0
+        room_pct = 0.0
+        if equity > 0:
+            room_usd = max(0.0, equity * book_max_pct / 100.0 - book_used)
+            room_pct = (room_usd / equity) * 100.0
+            if final_pct > room_pct + 1e-9:
+                final_pct = room_pct
+                book_capped = True
+                capped = True
 
         margin = max(0.0, equity * final_pct / 100.0)
         order_notional = margin * lev
@@ -358,6 +399,10 @@ class DexExecutor:
             "final_pct": final_pct,
             "bumped_to_hl_min": bumped and not capped,
             "capped": capped,
+            "book_capped": book_capped,
+            "book_used_usd": book_used,
+            "book_room_usd": room_usd,
+            "max_book_margin_pct": book_max_pct,
             "margin_usd": margin,
             "order_notional_usd": order_notional,
             "hl_min_order_usd": hl_min,
@@ -402,7 +447,10 @@ class DexExecutor:
         )
         leverage = int(inv.leverage or 1)
         margin, size_meta = self._resolve_margin(
-            equity=equity, leverage=leverage, entry_size=inv.entry_size
+            equity=equity,
+            leverage=leverage,
+            entry_size=inv.entry_size,
+            exclude_base_id=str(inv.base_id) if inv.base_id is not None else None,
         )
         available = trader.available_margin()
         size_meta["available_margin_usd"] = available
@@ -1289,7 +1337,10 @@ class DexExecutor:
         mid = trader.mid_price(coin)
         current_notional = float(current_sz) * mid
         _margin, meta = self._resolve_margin(
-            equity=equity, leverage=leverage, entry_size=inv.entry_size
+            equity=equity,
+            leverage=leverage,
+            entry_size=inv.entry_size,
+            exclude_base_id=str(inv.base_id) if inv.base_id is not None else None,
         )
         target_notional = float(meta["order_notional_usd"])
         hl_min = float(self.settings.hl_min_order_usd)
@@ -1406,11 +1457,16 @@ class DexExecutor:
             f"(~${add_sz * mid:.2f} notional; {current_sz} → ~{current_sz + add_sz})"
         )
         logger.info(
-            "SIZE INCREASE %s add_sz=%s current=%s target_notional=%.4f "
-            "delta_notional=%.4f cloid=%s",
+            "SIZE INCREASE %s add_sz=%s current=%s entry_size=%s trader_pct=%s "
+            "final_pct=%s equity=%.4f target_notional=%.4f delta_notional=%.4f "
+            "cloid=%s",
             coin,
             add_sz,
             current_sz,
+            inv.entry_size,
+            meta.get("trader_pct"),
+            meta.get("final_pct"),
+            equity,
             target_notional,
             delta_notional,
             cloid.to_raw() if cloid else None,
@@ -1528,6 +1584,9 @@ class DexExecutor:
             price_gap_pct=price_gap_pct,
             roe_gap_pct=roe_gap_pct,
             hl_response=hl_resp,
+            entry_size=inv.entry_size,
+            equity=equity,
+            target_notional=target_notional,
             **{k: v for k, v in meta.items() if k not in {"margin_usd", "order_notional_usd"}},
         )
         return new_sz, {
@@ -2431,7 +2490,10 @@ class DexExecutor:
         leverage = int(inv.leverage or 1)
         equity = trader.account_value()
         margin, size_meta = self._resolve_margin(
-            equity=equity, leverage=leverage, entry_size=inv.entry_size
+            equity=equity,
+            leverage=leverage,
+            entry_size=inv.entry_size,
+            exclude_base_id=str(inv.base_id) if inv.base_id is not None else None,
         )
         available = trader.available_margin()
         if margin > available:

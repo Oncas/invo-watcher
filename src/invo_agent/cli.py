@@ -135,6 +135,8 @@ def status_cmd() -> None:
     table.add_row("alerter", find_alerter() or "(missing — will auto-download)")
     table.add_row("poll_interval_seconds", str(settings.poll_interval_seconds))
     table.add_row("position_pct", str(settings.position_pct))
+    table.add_row("max_position_pct", str(settings.max_position_pct))
+    table.add_row("max_book_margin_pct", str(settings.max_book_margin_pct))
     allow = ", ".join(sorted(settings.portfolio_ids)) or "(all trade notifs)"
     table.add_row("portfolio_allowlist", allow)
     table.add_row("catchup_completed_at", db.get_meta(CATCHUP_META) or "(not yet)")

@@ -84,6 +84,17 @@ QUEUED_MAX_ADDS_PER_POLL = 2
 HL_RATE_LIMIT_COOLDOWN_SECONDS = 120.0
 
 
+def locked_queued_entry_size(
+    queued: float | None, live: float | None
+) -> float | None:
+    """Drain/refresh size: never raise above the first queued entrySize."""
+    if queued is None:
+        return live
+    if live is None:
+        return queued
+    return min(float(queued), float(live))
+
+
 class NotificationPoller:
     def __init__(
         self,
@@ -800,7 +811,10 @@ class NotificationPoller:
             return None
         lev = int(inv.leverage or copy.leverage or 1)
         _, meta = self.executor._resolve_margin(
-            equity=float(equity), leverage=lev, entry_size=inv.entry_size
+            equity=float(equity),
+            leverage=lev,
+            entry_size=inv.entry_size,
+            exclude_base_id=copy.investment_base_id,
         )
         current = float(copy.size or 0) * float(mid)
         return max(0.0, float(meta["order_notional_usd"]) - current)
@@ -1382,6 +1396,9 @@ class NotificationPoller:
         if refreshed is None:
             return False
         refreshed.reason = existing.reason
+        refreshed.entry_size = locked_queued_entry_size(
+            existing.entry_size, refreshed.entry_size
+        )
         entry_moved = (
             existing.trader_entry is not None
             and refreshed.trader_entry is not None
@@ -1471,38 +1488,19 @@ class NotificationPoller:
                 shadow_ok = True
                 if inv is not None and not self._investment_closed(inv):
                     still_open = True
-                elif inv is not None and self._investment_closed(inv):
-                    self._cancel_pending_resting(intent)
-                    self.db.delete_pending_intent(intent.investment_base_id)
-                    log_event(
-                        "pending_cancel",
-                        base_id=intent.investment_base_id,
-                        coin=intent.coin,
-                        reason="trader_closed_on_expire",
-                    )
-                    continue
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "pending expire shadow failed base_id=%s: %s",
                     intent.investment_base_id,
                     exc,
                 )
-            if still_open:
-                logger.info(
-                    "keep pending %s age=%.0fs — still open on Involio",
-                    intent.summary or intent.investment_base_id,
-                    age,
-                )
-                continue
-            if shadow_ok and not still_open:
-                # No post and not explicitly closed — treat as gone.
-                pass
             self._cancel_pending_resting(intent)
             self.db.delete_pending_intent(intent.investment_base_id)
             logger.warning(
-                "expired pending %s age=%.0fs shadow_ok=%s",
+                "expired pending %s age=%.0fs still_open=%s shadow_ok=%s",
                 intent.summary or intent.investment_base_id,
                 age,
+                still_open,
                 shadow_ok,
             )
             log_event(
@@ -1510,6 +1508,7 @@ class NotificationPoller:
                 base_id=intent.investment_base_id,
                 coin=intent.coin,
                 age_seconds=age,
+                still_open=still_open,
                 shadow_ok=shadow_ok,
             )
             notify_mac(
@@ -2254,6 +2253,9 @@ class NotificationPoller:
             return False
         refreshed = self._intent_from_action(action, reason)
         if refreshed is not None:
+            refreshed.entry_size = locked_queued_entry_size(
+                intent.entry_size, refreshed.entry_size
+            )
             self.db.upsert_pending_intent(refreshed)
         else:
             intent.reason = reason
@@ -2291,6 +2293,9 @@ class NotificationPoller:
                 "notifier": {"username": intent.trader} if intent.trader else None,
             }
         )
+        locked = locked_queued_entry_size(intent.entry_size, inv.entry_size)
+        if locked != inv.entry_size:
+            inv = inv.model_copy(update={"entry_size": locked})
         return TradeAction(
             action=ActionType.OPEN,
             notification=notification,
