@@ -1172,11 +1172,15 @@ class DexExecutor:
     def _close_size_for_copy(
         self, copy: OpenCopy, *, coin: str, hl_sz: float
     ) -> float:
-        """Size to reduce on CLOSE — never more than this copy's stored slice."""
-        if copy.size is not None and float(copy.size) > 0:
-            return min(float(copy.size), hl_sz)
+        """Size to reduce on CLOSE.
+
+        Only copy on the coin → flatten live HL (leftover GTC fills can sit
+        above stored size). Shared coin → never more than this copy's slice.
+        """
         others = self._other_open_copies_for_coin(coin, copy.investment_base_id)
         if others:
+            if copy.size is not None and float(copy.size) > 0:
+                return min(float(copy.size), hl_sz)
             raise HlTraderError(
                 f"CLOSE {coin}: open_copy has no stored size and other copies "
                 f"exist ({[o.base_short_id or o.investment_base_id for o in others]}) "
@@ -1877,9 +1881,13 @@ class DexExecutor:
         if self.db is None or inv.base_id is None:
             return
         entry_px = mid
-        # Keep the order size we just submitted — never replace with net HL size.
-        # Net size includes other same-coin copies and would break partial closes.
+        # Grow this copy as leftover GTC fills land. Never shrink here — a
+        # later stale 0.6 snapshot must not overwrite 1.1. Net HL from *other*
+        # copies is not passed in (adopt only sends this order's held size).
         fill_sz = float(sz)
+        existing = self.db.get_open_copy(str(inv.base_id))
+        if existing is not None and existing.size is not None:
+            fill_sz = max(fill_sz, float(existing.size))
         try:
             trader = self._ensure_trader()
             detail = trader.position_detail(coin)
@@ -2062,14 +2070,15 @@ class DexExecutor:
                 reason="side_mismatch",
                 message=msg,
             )
-        if our_size is not None and float(our_size) > 0:
-            sz = min(float(our_size), hl_sz)
-        elif shared:
-            raise HlTraderError(
-                f"RECOVERY {coin}: no stored size and other same-coin copies exist "
-                f"({[o.base_short_id or o.investment_base_id for o in shared]}) "
-                f"— refuse full flatten"
-            )
+        if shared:
+            if our_size is not None and float(our_size) > 0:
+                sz = min(float(our_size), hl_sz)
+            else:
+                raise HlTraderError(
+                    f"RECOVERY {coin}: no stored size and other same-coin copies exist "
+                    f"({[o.base_short_id or o.investment_base_id for o in shared]}) "
+                    f"— refuse full flatten"
+                )
         else:
             sz = hl_sz
         entry = our_entry_px or detail.get("entry_px")

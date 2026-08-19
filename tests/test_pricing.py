@@ -2,6 +2,7 @@ from invo_agent.dex.pricing import (
     extract_avg_px,
     fill_gaps,
     ioc_unfilled_message,
+    plan_resting_adopt,
     price_is_at_or_better,
 )
 
@@ -44,3 +45,52 @@ def test_ioc_unfilled_message() -> None:
         "Order could not immediately match against any resting orders."
     )
     assert not ioc_unfilled_message("Insufficient margin")
+
+
+def test_plan_resting_adopt_keeps_link_partial() -> None:
+    held, keep = plan_resting_adopt(
+        posted_sz=1.1,
+        filled_sz=0.6,
+        booked_sz=0.0,
+        hl_sz=0.6,
+        only_copy=True,
+    )
+    assert held == 0.6
+    assert keep is True
+
+
+def test_plan_resting_adopt_grows_after_leftover_fill() -> None:
+    held, keep = plan_resting_adopt(
+        posted_sz=1.1,
+        filled_sz=0.6,
+        booked_sz=0.6,
+        hl_sz=1.1,
+        only_copy=True,
+    )
+    assert held == 1.1
+    assert keep is False
+
+
+def test_plan_resting_adopt_ignores_hl_when_shared() -> None:
+    held, keep = plan_resting_adopt(
+        posted_sz=1.1,
+        filled_sz=0.6,
+        booked_sz=0.6,
+        hl_sz=2.0,
+        only_copy=False,
+    )
+    assert held == 0.6
+    assert keep is True
+
+
+def test_plan_resting_adopt_does_not_trust_shrunk_posted() -> None:
+    """Old bug: resting_sz was rewritten to leftover 0.5, then 0.6 fills looked done."""
+    held, keep = plan_resting_adopt(
+        posted_sz=1.1,
+        filled_sz=0.6,
+        booked_sz=0.6,
+        hl_sz=0.6,
+        only_copy=True,
+    )
+    assert held == 0.6
+    assert keep is True

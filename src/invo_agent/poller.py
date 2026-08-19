@@ -28,7 +28,11 @@ from invo_agent.dex.hl_trader import (
     SameCoinOpenError,
     SideMismatchError,
 )
-from invo_agent.dex.pricing import classify_pending_wait, queued_ready_locally
+from invo_agent.dex.pricing import (
+    classify_pending_wait,
+    plan_resting_adopt,
+    queued_ready_locally,
+)
 from invo_agent.dex.session import (
     DexSessionError,
     DexSessionStore,
@@ -1609,11 +1613,7 @@ class NotificationPoller:
                 )
             ]
             pos = book.position(intent.coin)
-            still_resting = any(
-                int(order.get("oid") or 0) == int(intent.resting_oid or 0)
-                for order in book.open_orders
-            )
-            if not matched and not (pos is not None and not still_resting):
+            if not matched and pos is None:
                 continue
             try:
                 resp = self.client.get_current_shadow_post_by_investment_base_id(
@@ -1630,37 +1630,58 @@ class NotificationPoller:
             if inv is None:
                 continue
             if matched:
-                sz = sum(fill.sz for fill in matched)
+                filled = sum(fill.sz for fill in matched)
                 notional = sum(fill.sz * fill.px for fill in matched)
-                px = notional / sz if sz else float(intent.resting_px or 0)
+                px = notional / filled if filled else float(intent.resting_px or 0)
             else:
-                sz = float(pos.sz) if pos else float(intent.resting_sz or 0)
+                filled = float(pos.sz) if pos else 0.0
                 px = float(pos.entry_px) if pos and pos.entry_px else float(
                     intent.resting_px or 0
                 )
-            if sz <= 0 or px <= 0:
+            copy = self.db.get_open_copy(intent.investment_base_id)
+            booked = float(copy.size) if copy and copy.size else 0.0
+            hl_sz = float(pos.sz) if pos else 0.0
+            others = self.executor._other_open_copies_for_coin(
+                intent.coin, intent.investment_base_id
+            )
+            held, keep_pending = plan_resting_adopt(
+                posted_sz=float(intent.resting_sz or 0),
+                filled_sz=filled,
+                booked_sz=booked,
+                hl_sz=hl_sz,
+                only_copy=not others,
+            )
+            if held <= 0 or px <= 0:
                 continue
             is_long = intent.side.lower() == "long"
-            try:
-                self.executor.adopt_open_fill(
-                    inv=inv,
-                    coin=intent.coin,
-                    is_long=is_long,
-                    sz=sz,
-                    px=px,
-                    leverage=int(intent.leverage or 1),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("adopt fill failed %s: %s", intent.coin, exc)
-                continue
-            leftover = max(0.0, float(intent.resting_sz or 0) - sz)
-            if leftover > 1e-9 and still_resting:
+            if copy is None or held + 1e-9 > booked:
+                try:
+                    self.executor.adopt_open_fill(
+                        inv=inv,
+                        coin=intent.coin,
+                        is_long=is_long,
+                        sz=held,
+                        px=px,
+                        leverage=int(intent.leverage or 1),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("adopt fill failed %s: %s", intent.coin, exc)
+                    continue
+            if keep_pending:
+                # Keep the original posted size — shrinking it to leftover made
+                # cumulative fills look complete (0.6 of 0.5 leftover).
                 self.db.set_pending_resting(
                     intent.investment_base_id,
                     oid=intent.resting_oid,
                     cloid=intent.resting_cloid,
                     px=intent.resting_px,
-                    sz=leftover,
+                    sz=float(intent.resting_sz or held),
+                )
+                logger.info(
+                    "resting OPEN %s filled %s/%s — keep leftover GTC",
+                    intent.summary or intent.coin,
+                    held,
+                    intent.resting_sz,
                 )
                 continue
             action = self._action_from_pending(intent, inv)
@@ -1676,13 +1697,13 @@ class NotificationPoller:
                 dry_run=False,
             )
             self._notify_action(action)
-            logger.info("adopted resting OPEN %s sz=%s px=%s", action.summary, sz, px)
+            logger.info("adopted resting OPEN %s sz=%s px=%s", action.summary, held, px)
             log_event(
                 "pending_fill",
                 via="resting",
                 base_id=intent.investment_base_id,
                 coin=intent.coin,
-                sz=sz,
+                sz=held,
                 px=px,
             )
 
@@ -1801,6 +1822,10 @@ class NotificationPoller:
         return budget.can_spend(1, essential=False)
 
     def _live_pending_reason(self, intent: PendingIntent) -> str:
+        if intent.resting_oid:
+            # Own GTC still working — a partial fill already in open_copies
+            # must not rebrand this row as same_coin and hide the leftover.
+            return intent.reason or "price"
         trader = getattr(self.executor, "_trader", None)
         return classify_pending_wait(
             coin_free=self._coin_is_free(intent.coin),
@@ -2000,6 +2025,8 @@ class NotificationPoller:
                     )
                     continue
             filled_sz = placed.get("filled_sz")
+            posted_sz = float(placed.get("sz") or 0)
+            oid = placed.get("oid")
             if filled_sz and float(filled_sz) > 0:
                 try:
                     self.executor.adopt_open_fill(
@@ -2012,6 +2039,23 @@ class NotificationPoller:
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("immediate rest fill adopt failed: %s", exc)
+                leftover = max(0.0, posted_sz - float(filled_sz))
+                if leftover > 1e-9 and oid is not None:
+                    self.db.set_pending_resting(
+                        intent.investment_base_id,
+                        oid=int(oid),
+                        cloid=placed.get("cloid"),
+                        px=placed.get("px"),
+                        sz=posted_sz,
+                    )
+                    logger.info(
+                        "resting OPEN %s partial fill sz=%s/%s oid=%s — keep leftover",
+                        action.summary,
+                        filled_sz,
+                        posted_sz,
+                        oid,
+                    )
+                    continue
                 self.db.delete_pending_intent(intent.investment_base_id)
                 self.db.delete_pending_for_coin(
                     intent.coin, exclude_base_id=intent.investment_base_id

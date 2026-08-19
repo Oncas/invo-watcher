@@ -10,6 +10,9 @@ from invo_agent.db import AgentDB, PendingIntent
 from invo_agent.dex.executor import DexExecutor, RecoveryResult
 from invo_agent.dex.hl_trader import (
     GhostCopyError,
+    HlBookSnapshot,
+    HlFill,
+    HlPosition,
     HlTraderError,
     RecoveryParkedError,
     SideMismatchError,
@@ -993,4 +996,254 @@ def test_catchup_leaves_update_on_open_copy(tmp_path) -> None:
     assert poller._tracked_followup(notif) is True
     poller.catch_up(pages=1)
     assert db.is_processed(nid) is False
+    db.close()
+
+
+def test_close_size_only_copy_uses_hl(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    base_id = str(uuid4())
+    db.upsert_open_copy(
+        investment_base_id=base_id,
+        base_short_id="ShortIdA01",
+        ticker="LINK",
+        portfolio_id=None,
+        notification_id="n1",
+        side="short",
+        size=0.25,
+        trader="gamma_trader",
+    )
+    exe = DexExecutor(settings, db=db)
+    copy = db.get_open_copy(base_id)
+    assert copy is not None
+    assert exe._close_size_for_copy(copy, coin="LINK", hl_sz=1.125) == 1.125
+    db.close()
+
+
+def test_close_size_shared_copy_uses_stored(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    ours = str(uuid4())
+    other = str(uuid4())
+    db.upsert_open_copy(
+        investment_base_id=ours,
+        base_short_id="ShortIdA01",
+        ticker="LINK",
+        portfolio_id=None,
+        notification_id="n1",
+        side="short",
+        size=0.25,
+        trader="gamma_trader",
+    )
+    db.upsert_open_copy(
+        investment_base_id=other,
+        base_short_id="otherLink",
+        ticker="LINK",
+        portfolio_id=None,
+        notification_id="n2",
+        side="short",
+        size=0.875,
+        trader="delta_trader",
+    )
+    exe = DexExecutor(settings, db=db)
+    copy = db.get_open_copy(ours)
+    assert copy is not None
+    assert exe._close_size_for_copy(copy, coin="LINK", hl_sz=1.125) == 0.25
+    db.close()
+
+
+def test_recovery_only_copy_flattens_hl_not_stored(tmp_path) -> None:
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=True,
+        dry_run=False,
+        hl_min_order_usd=10.0,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="ShortIdA01",
+        ticker="LINK",
+        portfolio_id=None,
+        notification_id="n1",
+        side="short",
+        size=0.25,
+        trader="gamma_trader",
+    )
+    inv = InvestmentUpdate.model_validate(
+        {
+            "baseId": str(base_id),
+            "baseShortId": "ShortIdA01",
+            "ticker": "LINK",
+            "directionLong": False,
+            "isOpen": False,
+            "closingPrice": 9.9,
+            "entryPrice": 10.0,
+        }
+    )
+    exe = DexExecutor(settings, client=SimpleNamespace(), db=db)  # type: ignore[arg-type]
+    trader = _FakeTrader(mid=9.9, available=20.0, pos=(1.125, False), coins={"LINK"})
+    exe._ensure_trader = lambda: trader  # type: ignore[method-assign,assignment]
+    exe._record_recovery_close = lambda **kwargs: None  # type: ignore[method-assign]
+    result = exe.recover_missed_close(
+        coin="LINK",
+        inv=inv,
+        our_entry_px=10.0,
+        our_side="short",
+        our_size=0.25,
+        copy_base_id=str(base_id),
+        our_leverage=10,
+    )
+    assert result.status == "closed"
+    assert trader.orders
+    assert trader.orders[0]["sz"] == 1.125
+    db.close()
+
+
+def test_adopt_keeps_leftover_gtc_then_grows_copy(tmp_path) -> None:
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=True,
+        dry_run=False,
+        hl_min_order_usd=10.0,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = str(uuid4())
+    now = datetime.now(UTC).isoformat()
+    db.upsert_pending_intent(
+        PendingIntent(
+            investment_base_id=base_id,
+            coin="LINK",
+            side="short",
+            reason="price",
+            created_at=now,
+            updated_at=now,
+            base_short_id="ShortIdA01",
+            notification_id=str(uuid4()),
+            leverage=10,
+            trader_entry=10.0,
+            summary="OPEN LINK SHORT 10x @gamma_trader ShortIdA01",
+            trader="gamma_trader",
+            resting_oid=424242,
+            resting_cloid="abc",
+            resting_px=10.0,
+            resting_sz=1.125,
+        )
+    )
+    inv = InvestmentUpdate.model_validate(
+        {
+            "baseId": base_id,
+            "baseShortId": "ShortIdA01",
+            "ticker": "LINK",
+            "directionLong": False,
+            "leverage": 10,
+            "entryPrice": 10.0,
+        }
+    )
+    exe = DexExecutor(settings, db=db)
+    exe._sync_tpsl = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    class _BookTrader:
+        def __init__(self) -> None:
+            self._book = HlBookSnapshot(
+                mids={"LINK": 10.0},
+                available=20.0,
+                equity=110.0,
+                positions={
+                    "LINK": HlPosition(
+                        coin="LINK",
+                        sz=0.25,
+                        is_long=False,
+                        entry_px=10.0,
+                        leverage=10,
+                    )
+                },
+                open_orders=[],
+                fills=[
+                    HlFill(
+                        coin="LINK",
+                        px=10.0,
+                        sz=0.25,
+                        side="A",
+                        time_ms=1,
+                        oid=424242,
+                    )
+                ],
+                at=0.0,
+            )
+
+        def position_detail(self, coin: str):
+            pos = self._book.position(coin)
+            if pos is None:
+                return None
+            return {
+                "sz": pos.sz,
+                "is_long": pos.is_long,
+                "entry_px": pos.entry_px,
+                "leverage": pos.leverage,
+            }
+
+    trader = _BookTrader()
+    exe._trader = trader  # type: ignore[assignment]
+    poller = NotificationPoller(
+        client=SimpleNamespace(
+            get_current_shadow_post_by_investment_base_id=lambda bid: SimpleNamespace(
+                post=SimpleNamespace(update=inv)
+            )
+        ),
+        db=db,
+        settings=settings,
+        session_store=SimpleNamespace(),
+    )  # type: ignore[arg-type]
+    poller.executor = exe
+    poller._adopt_resting_fills()
+    copy = db.get_open_copy(base_id)
+    pending = db.get_pending_intent(base_id)
+    assert copy is not None
+    assert copy.size == 0.25
+    assert pending is not None
+    assert pending.resting_sz == 1.125
+
+    trader._book = HlBookSnapshot(
+        mids={"LINK": 10.0},
+        available=20.0,
+        equity=110.0,
+        positions={
+            "LINK": HlPosition(
+                coin="LINK",
+                sz=1.125,
+                is_long=False,
+                entry_px=10.0,
+                leverage=10,
+            )
+        },
+        open_orders=[],
+        fills=[
+            HlFill(
+                coin="LINK",
+                px=10.0,
+                sz=0.25,
+                side="A",
+                time_ms=1,
+                oid=424242,
+            ),
+            HlFill(
+                coin="LINK",
+                px=10.0,
+                sz=0.875,
+                side="A",
+                time_ms=2,
+                oid=424242,
+            ),
+        ],
+        at=0.0,
+    )
+    poller._adopt_resting_fills()
+    copy = db.get_open_copy(base_id)
+    assert copy is not None
+    assert copy.size == 1.125
+    assert db.get_pending_intent(base_id) is None
     db.close()

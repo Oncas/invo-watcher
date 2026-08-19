@@ -149,6 +149,29 @@ def flatten_limit_px(
     return px
 
 
+def plan_resting_adopt(
+    *,
+    posted_sz: float,
+    filled_sz: float,
+    booked_sz: float,
+    hl_sz: float,
+    only_copy: bool,
+) -> tuple[float, bool]:
+    """Size to store for a resting GTC, and whether leftover can still fill.
+
+    Never shrink ``posted_sz`` — leftover is posted minus held. Held is the
+    best of oid fills and the booked copy; when this is the only copy on the
+    coin, also take live HL (the rest of our GTC may have filled untracked).
+    Keep pending while held is short of posted. Do not trust a missing
+    open-orders row: that is how LINK 0.6/1.1 finalized early.
+    """
+    held = max(float(filled_sz or 0.0), float(booked_sz or 0.0), 0.0)
+    if only_copy:
+        held = max(held, float(hl_sz or 0.0))
+    leftover = max(0.0, float(posted_sz or 0.0) - held)
+    return held, leftover > 1e-9
+
+
 def price_is_at_or_better(
     *,
     mid: float,
