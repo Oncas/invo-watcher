@@ -110,6 +110,35 @@ def size_clearing_min_notional(
     return sz
 
 
+def sell_close_top_up_sz(
+    *,
+    mid: float,
+    sz: float,
+    slippage: float,
+    min_notional: float,
+    sz_decimals: int,
+) -> float:
+    """Coins to buy so an IoC sell at ``mid*(1-slip)`` still clears HL's min.
+
+    The add is itself an HL order, so it must also clear ``min_notional``. A
+    $1 dust buy is rejected. Buffer above $10 so coins×limit cannot land on
+    $9.999 after rounding.
+    """
+    if mid <= 0 or sz <= 0:
+        return 0.0
+    sell_px = mid * (1.0 - max(0.0, float(slippage)))
+    if sell_px <= 0:
+        return 0.0
+    if sz * sell_px + 1e-9 >= float(min_notional):
+        return 0.0
+    return size_clearing_min_notional(
+        mid=mid,
+        notional=max(float(min_notional) * 1.2, 12.0),
+        min_notional=float(min_notional),
+        sz_decimals=sz_decimals,
+    )
+
+
 def flatten_limit_px(
     *,
     mid: float,
@@ -119,12 +148,15 @@ def flatten_limit_px(
     min_notional: float = 10.0,
     round_price: Callable[[float], float],
 ) -> float:
-    """IoC cap for a flatten: SDK 5% slip, then raise until sz×px clears $10.
+    """IoC cap for a flatten: SDK 5% slip, then raise *buys* until sz×px ≥ $10.
 
     HL scores the ticket as coins × this limit, not entry notional. A winning
     min-clip short (0.57 COMP @ 17.20) is ~$9.81 at mid and can sit under $10
-    at 2% slip. The website Close button uses a fatter cap and fills.
-    Higher px always increases notional (buy = more aggressive; sell = less).
+    at 2% slip. Raising the buy cap is more aggressive and still fills.
+
+    Do not raise a sell the same way. ``$10/sz`` on a losing min-clip long sits
+    above mid (and above the bid), so IoC cannot match. ``close_position``
+    tops up size first; this then keeps the crossing slip price.
     """
     if mid <= 0 or sz <= 0:
         return float(mid) if mid > 0 else 0.0
@@ -132,6 +164,8 @@ def flatten_limit_px(
     px = float(round_price(px))
     floor = float(min_notional)
     if floor <= 0 or sz * px + 1e-9 >= floor:
+        return px
+    if not is_buy:
         return px
     need = floor / sz
     px = max(px, need)

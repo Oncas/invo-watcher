@@ -623,6 +623,56 @@ def test_flatten_limit_px_clears_comp_dust_short() -> None:
     assert 0.8 * comp + 1e-9 >= 10.0
 
 
+def test_flatten_limit_px_does_not_lift_losing_long_above_mid() -> None:
+    from invo_agent.dex.pricing import flatten_limit_px
+
+    mid = 0.0045
+    sz = 2000.0
+    # Old bug: $10/sz sits above mid, so IoC sell cannot hit the bid.
+    assert 10.0 / sz > mid
+
+    def _rnd(px: float) -> float:
+        return round(float(px), 6)
+
+    px = flatten_limit_px(
+        mid=mid,
+        sz=sz,
+        is_buy=False,
+        slippage=0.05,
+        min_notional=10.0,
+        round_price=_rnd,
+    )
+    assert px <= mid
+    assert px == _rnd(mid * 0.95)
+
+
+def test_sell_close_top_up_buys_full_min_clip() -> None:
+    from invo_agent.dex.pricing import sell_close_top_up_sz
+
+    mid = 0.0045
+    sz = 2000.0
+    add = sell_close_top_up_sz(
+        mid=mid,
+        sz=sz,
+        slippage=0.05,
+        min_notional=10.0,
+        sz_decimals=0,
+    )
+    assert add >= 1
+    assert add * mid + 1e-9 >= 10.0
+    assert (sz + add) * mid * 0.95 + 1e-9 >= 10.0
+    assert (
+        sell_close_top_up_sz(
+            mid=0.005,
+            sz=3000.0,
+            slippage=0.05,
+            min_notional=10.0,
+            sz_decimals=0,
+        )
+        == 0.0
+    )
+
+
 def test_size_clearing_min_notional_adds_a_lot() -> None:
     from invo_agent.dex.pricing import size_clearing_min_notional
 

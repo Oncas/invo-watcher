@@ -24,7 +24,12 @@ from invo_agent.dex.budget import (
     action_leg_count,
     parse_rate_limit_message,
 )
-from invo_agent.dex.pricing import HL_MARKET_CLOSE_SLIPPAGE, flatten_limit_px
+from invo_agent.dex.pricing import (
+    HL_MARKET_CLOSE_SLIPPAGE,
+    flatten_limit_px,
+    ioc_unfilled_message,
+    sell_close_top_up_sz,
+)
 from invo_agent.dex.turnkey_client import TurnkeySigner
 
 
@@ -702,6 +707,21 @@ class HlTrader:
         )
         return hl_order, response, nonce
 
+    def _raise_if_order_error(self, resp: dict[str, Any], label: str) -> None:
+        if resp.get("status") != "ok":
+            raise HlTraderError(f"HL {label} not ok: {resp}")
+        data = resp.get("response", {}).get("data", {})
+        for st in data.get("statuses") or []:
+            if not isinstance(st, dict):
+                continue
+            err = st.get("error")
+            if not err:
+                continue
+            err_s = str(err)
+            if ioc_unfilled_message(err_s):
+                raise IocUnfilledError(f"HL {label} IoC unfilled: {err_s}")
+            raise HlTraderError(f"HL {label} order error: {err_s}")
+
     def close_position(
         self,
         coin: str,
@@ -716,6 +736,35 @@ class HlTrader:
         is_buy = not is_long
         sz = self.round_size(coin, sz)
         mid = self.mid_price(coin)
+        if not is_buy:
+            add = self.round_size(
+                coin,
+                sell_close_top_up_sz(
+                    mid=mid,
+                    sz=sz,
+                    slippage=slippage,
+                    min_notional=min_notional,
+                    sz_decimals=self.sz_decimals(coin),
+                ),
+            )
+            if add > 0:
+                _, topup_resp, _ = self.market_order(
+                    coin,
+                    is_buy=True,
+                    sz=add,
+                    reduce_only=False,
+                    slippage=0.05,
+                    essential=True,
+                )
+                self._raise_if_order_error(topup_resp, "close top-up")
+                self._stale_book()
+                detail = self.position_detail(coin)
+                if detail is None:
+                    raise HlTraderError(f"HL {coin} vanished after close top-up")
+                sz = self.round_size(coin, float(detail["sz"]))
+                is_long = bool(detail["is_long"])
+                is_buy = not is_long
+                mid = self.mid_price(coin)
         limit_px = flatten_limit_px(
             mid=mid,
             sz=sz,
