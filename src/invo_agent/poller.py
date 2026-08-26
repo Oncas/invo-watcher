@@ -292,6 +292,8 @@ class NotificationPoller:
 
         closed_n = sum(1 for r in results if r.status in {"closed", "already_flat"})
         parked_n = sum(1 for r in results if r.status == "parked")
+        # Skips left HL exactly as it was — the copy is still ours to watch.
+        skipped_n = sum(1 for r in results if r.status == "skipped")
         # Parks that were already resting changed nothing — don't re-alert.
         changed = [r for r in results if r.changed]
         log_event(
@@ -300,6 +302,7 @@ class NotificationPoller:
             results=len(results),
             closed=closed_n,
             parked=parked_n,
+            skipped=skipped_n,
             changed=len(changed),
         )
         if changed:
@@ -313,9 +316,14 @@ class NotificationPoller:
                 enabled=self.settings.mac_notify,
                 sticky=self.settings.mac_notify_sticky,
             )
-        elif results:
+        elif parked_n:
             console.print(
-                f"[dim]Missed-close reconcile: {len(results)} park(s) still resting[/dim]"
+                f"[dim]Missed-close reconcile: {parked_n} park(s) still resting[/dim]"
+            )
+        elif skipped_n:
+            console.print(
+                f"[yellow]Missed-close reconcile:[/yellow] {skipped_n} skipped — "
+                "HL untouched, copy kept"
             )
         else:
             console.print("[green]Missed-close reconcile:[/green] nothing to recover")

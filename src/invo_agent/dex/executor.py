@@ -2306,11 +2306,13 @@ class DexExecutor:
                 hl_side="long" if is_long else "short",
                 base_id=exclude_id,
             )
+            # Not a close: HL still holds this size, so the copy must survive.
             return RecoveryResult(
-                status="already_flat",
+                status="skipped",
                 coin=coin,
                 reason="side_mismatch",
                 message=msg,
+                changed=False,
             )
         if shared:
             if our_size is not None and float(our_size) > 0:

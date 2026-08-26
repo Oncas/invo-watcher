@@ -1451,3 +1451,65 @@ def test_adopt_keeps_leftover_gtc_then_grows_copy(tmp_path) -> None:
     assert copy.size == 1.125
     assert db.get_pending_intent(base_id) is None
     db.close()
+
+
+def test_recovery_side_mismatch_keeps_copy(tmp_path) -> None:
+    """A side-mismatch skip is not a close — HL still holds the copy we own."""
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=True,
+        dry_run=False,
+        hl_min_order_usd=10.0,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="adaShort",
+        ticker="ADA",
+        portfolio_id=None,
+        notification_id="n1",
+        side="long",
+        size=80.0,
+        trader="alpha_trader",
+    )
+    inv = InvestmentUpdate.model_validate(
+        {
+            "baseId": str(base_id),
+            "baseShortId": "adaShort",
+            "ticker": "ADA",
+            "directionLong": True,
+            "entryPrice": 0.20,
+            "closingPrice": 0.22,
+            "isOpen": False,
+        }
+    )
+    exe = DexExecutor(settings, client=SimpleNamespace(), db=db)
+    # HL is net short while our copy is long — recovery must not trade here.
+    exe._trader = _FakeTrader(mid=0.20, available=80.0, pos=(80.0, False), coins={"ADA"})
+
+    result = exe.recover_missed_close(
+        coin="ADA",
+        inv=inv,
+        our_entry_px=0.20,
+        our_side="long",
+        our_size=80.0,
+        copy_base_id=str(base_id),
+        our_leverage=1,
+    )
+    assert result.reason == "side_mismatch"
+    # "already_flat" would tell the poller to forget a position we still hold.
+    assert result.status == "skipped"
+    assert not result.changed
+
+    poller = _poller(settings, db)
+    poller.executor = exe
+    poller.client = SimpleNamespace(
+        get_current_shadow_post_by_investment_base_id=lambda base: SimpleNamespace(
+            post=SimpleNamespace(update=inv)
+        )
+    )
+    poller._reconcile_one_copy(db.list_open_copies()[0])
+    assert db.get_open_copy(str(base_id)) is not None
+    db.close()
