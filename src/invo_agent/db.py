@@ -367,6 +367,18 @@ class AgentDB:
         row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return None if row is None else str(row["value"])
 
+    def delete_meta(self, key: str) -> bool:
+        cur = self._conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def meta_keys_with_prefix(self, prefix: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT key FROM meta WHERE key LIKE ? ORDER BY key",
+            (f"{prefix}%",),
+        ).fetchall()
+        return [str(row["key"]) for row in rows]
+
     def delete_meta_prefix(self, prefix: str) -> int:
         cur = self._conn.execute("DELETE FROM meta WHERE key LIKE ?", (f"{prefix}%",))
         self._conn.commit()

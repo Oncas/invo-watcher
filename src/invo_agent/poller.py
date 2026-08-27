@@ -82,6 +82,10 @@ QUEUED_MAX_ADDS_PER_POLL = 2
 # When HL says "too many requests", stop opportunistic queue work for a while so
 # the remaining budget goes to closes.
 HL_RATE_LIMIT_COOLDOWN_SECONDS = 120.0
+# An untracked HL position we have already shouted about. Keyed by coin, the
+# value is the first time we saw it. A pending intent created *after* this is a
+# different trade and must not adopt the stranger sitting on the book.
+GHOST_SEEN_META_PREFIX = "ghost_seen:"
 
 
 def locked_queued_entry_size(
@@ -1715,18 +1719,71 @@ class NotificationPoller:
                 px=px,
             )
 
+    def _ghost_seen_key(self, coin: str) -> str:
+        return f"{GHOST_SEEN_META_PREFIX}{coin.upper()}"
+
+    def _ghost_first_seen(self, coin: str) -> datetime | None:
+        raw = self.db.get_meta(self._ghost_seen_key(coin))
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def _mark_ghost_seen(self, coin: str) -> None:
+        if self._ghost_first_seen(coin) is None:
+            self.db.set_meta(self._ghost_seen_key(coin), datetime.now(UTC).isoformat())
+
+    def _clear_ghost_seen(self, coin: str) -> None:
+        self.db.delete_meta(self._ghost_seen_key(coin))
+
+    def _known_ghosts(self) -> set[str]:
+        return {
+            key[len(GHOST_SEEN_META_PREFIX) :]
+            for key in self.db.meta_keys_with_prefix(GHOST_SEEN_META_PREFIX)
+        }
+
+    def _ghost_adopt_block(self, coin: str, pending: PendingIntent, pos) -> str | None:
+        """Why this untracked position must not be adopted by ``pending``."""
+        want_long = pending.side == "long"
+        if bool(pos.is_long) is not want_long:
+            return "side"
+        first_seen = self._ghost_first_seen(coin)
+        if first_seen is None:
+            return None
+        try:
+            created = datetime.fromisoformat(pending.created_at)
+        except ValueError:
+            return None
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        if first_seen.tzinfo is None:
+            first_seen = first_seen.replace(tzinfo=UTC)
+        # The stranger was on the book before this intent was ever queued, so
+        # it cannot be that intent's fill.
+        return "predates" if first_seen < created else None
+
     def _reconcile_inverse_ghosts(self) -> None:
         try:
             coins = self.executor.untracked_hl_coins()
         except Exception as exc:  # noqa: BLE001
             logger.warning("inverse ghost scan failed: %s", exc)
             return
+        live = {coin.upper() for coin in coins}
+        for stale in self._known_ghosts() - live:
+            self._clear_ghost_seen(stale)
         trader = getattr(self.executor, "_trader", None)
         book = getattr(trader, "_book", None) if trader is not None else None
         for coin in coins:
             pending = self.db.get_pending_for_coin(coin)
             pos = book.position(coin) if book is not None else None
-            if pending is not None and pos is not None:
+            block = (
+                self._ghost_adopt_block(coin, pending, pos)
+                if pending is not None and pos is not None
+                else None
+            )
+            if pending is not None and pos is not None and block is None:
                 logger.info(
                     "inverse ghost %s: adopting pending %s",
                     coin,
@@ -1756,14 +1813,28 @@ class NotificationPoller:
                         notification_id=pending.notification_id,
                         dry_run=False,
                     )
+                    self._clear_ghost_seen(coin)
                     continue
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("inverse ghost adopt failed %s: %s", coin, exc)
+            if block is not None:
+                logger.error(
+                    "inverse ghost %s: refusing to adopt pending %s (%s)",
+                    coin,
+                    pending.base_short_id or pending.investment_base_id,
+                    block,
+                )
             logger.error(
                 "HL holds %s with no open_copy — not flattening (external?)",
                 coin,
             )
-            log_event("inverse_ghost", coin=coin, pending=pending is not None)
+            self._mark_ghost_seen(coin)
+            log_event(
+                "inverse_ghost",
+                coin=coin,
+                pending=pending is not None,
+                adopt_block=block,
+            )
             notify_mac(
                 "invo-agent · WARN",
                 f"HL holds {coin} with no tracked copy",
