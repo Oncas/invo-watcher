@@ -1,24 +1,49 @@
 from __future__ import annotations
 
+from invo_agent.allowlist import PortfolioAllowlist
 from invo_agent.api.client import InvolioClient
 from invo_agent.api.models import ActionType, InvestmentUpdate, Notification, TradeAction
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB
+from invo_agent.events import log_event_throttled
 from invo_agent.labels import trader_from_action
 
 
 class CopyEngine:
     """Maps notifications → trade actions and tracks idempotency."""
 
-    def __init__(self, client: InvolioClient, db: AgentDB, settings: Settings):
+    def __init__(
+        self,
+        client: InvolioClient,
+        db: AgentDB,
+        settings: Settings,
+        allowlist: PortfolioAllowlist | None = None,
+    ):
         self.client = client
         self.db = db
         self.settings = settings
+        self.allowlist = allowlist
+
+    @property
+    def allowed_portfolio_ids(self) -> set[str]:
+        if self.allowlist is not None:
+            return self.allowlist.ids
+        return self.settings.portfolio_ids
 
     def should_consider(self, notification: Notification) -> bool:
         if notification.action_type is ActionType.IGNORE:
             return False
-        allow = self.settings.portfolio_ids
+        # A sync we attempted but could not complete leaves us with no list at
+        # all. Empty means "copy everyone" below, so refuse instead of copying
+        # every trader on Involio until the next sync lands.
+        if self.allowlist is not None and not self.allowlist.usable:
+            log_event_throttled(
+                "allowlist_unavailable_skip",
+                key="allowlist",
+                error=self.allowlist.last_error,
+            )
+            return False
+        allow = self.allowed_portfolio_ids
         if not allow:
             return True
         if notification.portfolio_id is None:

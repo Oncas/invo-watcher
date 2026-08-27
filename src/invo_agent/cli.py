@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from invo_agent import service as launchd_service
+from invo_agent.allowlist import SYNCED_AT_META, PortfolioAllowlist
 from invo_agent.api.client import InvolioClient
 from invo_agent.auth.email_otp import LoginError, login_with_otp
 from invo_agent.auth.session import SessionStore
@@ -140,8 +141,16 @@ def status_cmd() -> None:
     table.add_row("position_pct", str(settings.position_pct))
     table.add_row("max_position_pct", str(settings.max_position_pct))
     table.add_row("max_book_margin_pct", str(settings.max_book_margin_pct))
-    allow = ", ".join(sorted(settings.portfolio_ids)) or "(all trade notifs)"
-    table.add_row("portfolio_allowlist", allow)
+    allowlist = PortfolioAllowlist(settings, db=db)
+    allow = str(len(allowlist.ids)) if allowlist.ids else "(all trade notifs)"
+    table.add_row("portfolio_allowlist", f"{allow} [{allowlist.source}]")
+    table.add_row(
+        "portfolio_sync",
+        f"every {settings.portfolio_sync_interval_seconds:.0f}s"
+        if settings.portfolio_sync
+        else "off (.env only)",
+    )
+    table.add_row("portfolio_synced_at", db.get_meta(SYNCED_AT_META) or "(never)")
     table.add_row("catchup_completed_at", db.get_meta(CATCHUP_META) or "(not yet)")
     table.add_row(
         "launchd",
@@ -161,6 +170,24 @@ def status_cmd() -> None:
     table.add_row("last_unseen_count", db.get_meta("last_unseen_count") or "-")
     table.add_row("processed_notifications", str(db.processed_count()))
     console.print(table)
+
+    if allowlist.portfolios:
+        pf = Table(title="Followed portfolios (allowlist)")
+        pf.add_column("Manager")
+        pf.add_column("Portfolio")
+        pf.add_column("Id")
+        for record in allowlist.portfolios:
+            pf.add_row(
+                f"@{record.manager}" if record.manager else (record.manager_name or "?"),
+                record.title or "?",
+                record.portfolio_id,
+            )
+        console.print(pf)
+    elif allowlist.ids:
+        console.print(
+            f"[dim]allowlist from .env ({len(allowlist.ids)} ids) — "
+            "run: invo-agent portfolios[/dim]"
+        )
 
     copies = db.list_open_copies()
     if copies:
@@ -257,6 +284,60 @@ def status_cmd() -> None:
             )
         console.print(lt)
 
+    db.close()
+
+
+@app.command("portfolios")
+def portfolios_cmd(
+    show_raw: bool = typer.Option(False, "--raw", help="Print the API payload as-is"),
+) -> None:
+    """Refresh the allowlist from the portfolios this account follows."""
+    settings, session, db = _bootstrap()
+    session_data = session.load()
+    if session_data is None:
+        console.print("[red]Not logged in.[/red] Run: invo-agent login")
+        db.close()
+        raise typer.Exit(1)
+
+    with InvolioClient(settings, session) as client:
+        allowlist = PortfolioAllowlist(settings, client, db=db)
+        before = sorted(allowlist.ids)
+        if show_raw:
+            console.print(client.get_followed_portfolios(session_data.user_id))
+        allowlist.refresh()
+        after = sorted(allowlist.ids)
+
+    table = Table(title=f"Allowlist ({allowlist.source})")
+    table.add_column("Manager")
+    table.add_column("Portfolio")
+    table.add_column("Id")
+    table.add_column("Change")
+    for record in allowlist.portfolios:
+        table.add_row(
+            f"@{record.manager}" if record.manager else (record.manager_name or "?"),
+            record.title or "?",
+            record.portfolio_id,
+            "new" if record.portfolio_id not in before else "",
+        )
+    if not allowlist.portfolios:
+        for pid in after:
+            table.add_row("?", "?", pid, "")
+    for pid in before:
+        if pid not in after:
+            table.add_row("?", "?", pid, "dropped")
+    console.print(table)
+    # A cached list already reads as "followed", so source alone cannot tell us
+    # the refresh failed — only last_error can.
+    if allowlist.last_error:
+        console.print(
+            f"[yellow]Sync did not take ({allowlist.last_error}) — "
+            f"still using the {allowlist.source} list.[/yellow]"
+        )
+    if not settings.portfolio_sync:
+        console.print(
+            "[dim]PORTFOLIO_SYNC=false — the running agent keeps using "
+            "PORTFOLIO_ALLOWLIST from .env.[/dim]"
+        )
     db.close()
 
 
@@ -550,6 +631,7 @@ def once_cmd(
             DexExecutor(settings, client=client, db=db),
             session_store=session,
         )
+        poller._maybe_sync_allowlist()  # noqa: SLF001
         if skip_catchup:
             poller._watch_started_at = datetime.min.replace(tzinfo=UTC)  # noqa: SLF001
         else:

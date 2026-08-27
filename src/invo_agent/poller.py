@@ -10,6 +10,7 @@ from uuid import UUID
 import httpx
 from rich.console import Console
 
+from invo_agent.allowlist import PortfolioAllowlist
 from invo_agent.api.client import InvolioAPIError, InvolioClient
 from invo_agent.api.models import ActionType, InvestmentUpdate, Notification, TradeAction
 from invo_agent.auth.email_otp import login_with_otp
@@ -112,11 +113,13 @@ class NotificationPoller:
         settings: Settings,
         executor: DexExecutor | None = None,
         session_store: SessionStore | None = None,
+        allowlist: PortfolioAllowlist | None = None,
     ):
         self.client = client
         self.db = db
         self.settings = settings
-        self.engine = CopyEngine(client, db, settings)
+        self.allowlist = allowlist or PortfolioAllowlist(settings, client, db=db)
+        self.engine = CopyEngine(client, db, settings, allowlist=self.allowlist)
         self.executor = executor or DexExecutor(settings, client=client, db=db)
         if self.executor.db is None:
             self.executor.db = db
@@ -2473,6 +2476,19 @@ class NotificationPoller:
         except Exception as exc:  # noqa: BLE001
             logger.warning("missed-close reconcile failed: %s", exc)
 
+    def _maybe_sync_allowlist(self) -> None:
+        try:
+            changed = self.allowlist.maybe_refresh()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("allowlist sync failed: %s", exc)
+            return
+        if changed:
+            console.print(f"[dim]allowlist → {self.allowlist.describe(limit=2)}[/dim]")
+        elif not self.allowlist.usable:
+            logger.warning(
+                "copying still paused — no allowlist (%s)", self.allowlist.last_error
+            )
+
     def _maybe_prune_logs(self) -> None:
         now = time.monotonic()
         if self._last_log_prune and now - self._last_log_prune < 3600:
@@ -2492,12 +2508,21 @@ class NotificationPoller:
 
     def run_forever(self, *, stop_fn: Callable[[], bool] | None = None) -> None:
         mode = "LIVE" if self.settings.live and not self.settings.dry_run else "DRY-RUN"
-        allow = ", ".join(sorted(self.settings.portfolio_ids)[:2]) or "all"
+        self._maybe_sync_allowlist()
+        allow = self.allowlist.describe(limit=2)
         console.print(
             f"[bold]invo-agent[/bold] polling every "
             f"{self.settings.poll_interval_seconds}s ([cyan]{mode}[/cyan]) "
             f"portfolios={allow}"
         )
+        if not self.allowlist.usable:
+            console.print(
+                "[bold red]No portfolio allowlist.[/bold red] The follows sync "
+                f"failed ({self.allowlist.last_error}) and PORTFOLIO_ALLOWLIST is "
+                "empty, so copying is paused until a sync lands. Set "
+                "PORTFOLIO_ALLOWLIST in .env to copy a fixed list instead."
+            )
+            log_event("allowlist_unavailable", error=self.allowlist.last_error)
         logger.info("polling start mode=%s interval=%s", mode, self.settings.poll_interval_seconds)
         log_event(
             "poller_start",
@@ -2506,7 +2531,8 @@ class NotificationPoller:
             position_pct=self.settings.position_pct,
             live=self.settings.live,
             dry_run=self.settings.dry_run,
-            portfolios=sorted(self.settings.portfolio_ids),
+            portfolios=sorted(self.allowlist.ids),
+            portfolio_source=self.allowlist.source,
         )
         notify_mac(
             "invo-agent",
@@ -2525,6 +2551,7 @@ class NotificationPoller:
             try:
                 actions = self.poll_once()
                 self._maybe_proactive_dex_renew()
+                self._maybe_sync_allowlist()
                 self._maybe_prune_logs()
                 self._maybe_reconcile_missed_closes()
                 self._transient_failures = 0

@@ -234,14 +234,16 @@ class InvolioClient:
         self._raise_for_status(response, "get shadow post by investment base id")
         return PostResponse.model_validate(response.json())
 
-    def get_followed_portfolios(self, user_id: UUID | str) -> dict[str, Any]:
+    def get_followed_portfolios(
+        self, user_id: UUID | str, *, page: int = 1, size: int = 50
+    ) -> dict[str, Any]:
         response = self._request(
             "POST",
             self._social("/portfolios/get_users_followed_portfolios"),
             json={
                 "context": {"filterType": "all"},
                 "userId": str(user_id),
-                "params": {"page": 1, "size": 50},
+                "params": {"page": page, "size": size},
             },
         )
         self._raise_for_status(response, "followed portfolios")

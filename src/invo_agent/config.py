@@ -67,7 +67,11 @@ class Settings(BaseSettings):
     # Re-assert coin leverage if our cache is older than this.
     hl_leverage_stale_seconds: float = 3 * 3600
 
+    # Fallback / seed list. Live runs refresh this from followed portfolios.
     portfolio_allowlist: str = ""
+    # Pull the allowlist from the Involio account's followed portfolios.
+    portfolio_sync: bool = True
+    portfolio_sync_interval_seconds: float = 900.0
 
     social_api_base: str = "https://api.involio.com/v1_0"
     dex_api_base: str = "https://api.involio.com"

@@ -74,8 +74,13 @@ LIVE=false
 POLL_INTERVAL_SECONDS=4
 POSITION_PCT=5
 
-# Only copy these portfolios (comma-separated UUIDs)
+# Fallback allowlist (comma-separated UUIDs). With PORTFOLIO_SYNC=true this list
+# is REPLACED by every portfolio the account follows on the first successful
+# sync -- a hand-picked subset here widens to all your follows. Set
+# PORTFOLIO_SYNC=false to pin exactly this list.
 PORTFOLIO_ALLOWLIST=<portfolio-id-1>,<portfolio-id-2>
+PORTFOLIO_SYNC=true
+PORTFOLIO_SYNC_INTERVAL_SECONDS=900
 
 MAC_NOTIFY=true
 MAC_NOTIFY_STICKY=true
@@ -92,7 +97,10 @@ MAC_NOTIFY_SOUND=
 | `RECOVERY_ENABLED` | On startup, reconcile open copies vs Involio closes (default true) |
 | `RECOVERY_SL_PCT` | Parked SL as % of our margin (price move = this / leverage; default 3) |
 | `MIN_EQUITY_USD` | Skip trades if HL equity is below this |
-| `PORTFOLIO_ALLOWLIST` | Only act on these followed portfolios |
+| `PORTFOLIO_ALLOWLIST` | Fallback list, used until the first successful follows sync |
+| `PORTFOLIO_SYNC` | Replace the allowlist with the account's followed portfolios (default true; **widens** a hand-picked `PORTFOLIO_ALLOWLIST` to all follows) |
+| `PORTFOLIO_SYNC_INTERVAL_SECONDS` | How often to re-read follows while running (default 900) |
+| | If `PORTFOLIO_SYNC=true` and the sync fails with no `PORTFOLIO_ALLOWLIST` fallback, copying **pauses** rather than copying every trader |
 | `MAC_NOTIFY` | macOS notifications on actions/errors (Mac sidecar; set `false` on the VPS) |
 | `MAC_NOTIFY_STICKY` | Stay until **Dismiss** (Slack-style via `alerter`) |
 | `HUD_TOKEN` | Shared bearer token. Set on the VPS to enable `GET /v1/*`; same value on the Mac |
@@ -201,6 +209,7 @@ Useful:
 
 ```bash
 invo-agent status           # last poll, open copies, recent actions
+invo-agent portfolios       # re-read follows: manager, portfolio name, id
 invo-agent reset-state -y   # clear DB + re-catch-up (keeps login)
 ```
 

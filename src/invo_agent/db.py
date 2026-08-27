@@ -58,6 +58,28 @@ class PendingIntent:
 
 
 @dataclass
+class FollowedPortfolio:
+    portfolio_id: str
+    title: str | None = None
+    manager: str | None = None
+    manager_name: str | None = None
+    manager_id: str | None = None
+    synced_at: str | None = None
+
+    @property
+    def label(self) -> str:
+        """`@manager · Title`, falling back to whatever we actually know."""
+        parts = []
+        if self.manager:
+            parts.append(f"@{self.manager}")
+        elif self.manager_name:
+            parts.append(self.manager_name)
+        if self.title:
+            parts.append(self.title)
+        return " · ".join(parts) if parts else self.portfolio_id
+
+
+@dataclass
 class ActionLogRow:
     id: int
     created_at: str
@@ -143,6 +165,15 @@ class AgentDB:
                 date TEXT PRIMARY KEY,
                 usd REAL NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS followed_portfolios (
+                portfolio_id TEXT PRIMARY KEY,
+                title TEXT,
+                manager TEXT,
+                manager_name TEXT,
+                manager_id TEXT,
+                synced_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS pending_intents (
@@ -887,6 +918,43 @@ class AgentDB:
         row = self._conn.execute("SELECT COUNT(*) AS c FROM processed_notifications").fetchone()
         return int(row["c"])
 
+    def replace_followed_portfolios(self, portfolios: list[FollowedPortfolio]) -> None:
+        """Swap in one sync's worth of follows — unfollowed rows disappear.
+
+        All-or-nothing: a half-done write must not leave the cache empty, or the
+        next start falls back to .env and silently widens the allowlist.
+        """
+        now = datetime.now(UTC).isoformat()
+        with self._conn:  # commits on success, rolls the DELETE back on error
+            self._conn.execute("DELETE FROM followed_portfolios")
+            self._conn.executemany(
+                """
+                INSERT OR REPLACE INTO followed_portfolios
+                (portfolio_id, title, manager, manager_name, manager_id, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (p.portfolio_id, p.title, p.manager, p.manager_name, p.manager_id, now)
+                    for p in portfolios
+                ],
+            )
+
+    def list_followed_portfolios(self) -> list[FollowedPortfolio]:
+        rows = self._conn.execute(
+            "SELECT * FROM followed_portfolios ORDER BY manager, title"
+        ).fetchall()
+        return [
+            FollowedPortfolio(
+                portfolio_id=row["portfolio_id"],
+                title=row["title"],
+                manager=row["manager"],
+                manager_name=row["manager_name"],
+                manager_id=row["manager_id"],
+                synced_at=row["synced_at"],
+            )
+            for row in rows
+        ]
+
     def reset_runtime_state(self) -> None:
         """Clear processed/open/action state so catch-up can re-run. Keeps nothing."""
         self._conn.executescript(
@@ -895,6 +963,7 @@ class AgentDB:
             DELETE FROM open_copies;
             DELETE FROM pending_intents;
             DELETE FROM action_log;
+            DELETE FROM followed_portfolios;
             DELETE FROM meta;
             """
         )
