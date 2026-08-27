@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from datetime import UTC, datetime
 
@@ -21,6 +22,7 @@ from invo_agent.dex.session import (
     establish_dex_session,
     load_signer,
     refresh_dex_session,
+    session_is_expired,
     session_ttl_remaining_seconds,
 )
 from invo_agent.hud import (
@@ -36,6 +38,7 @@ from invo_agent.poller import CATCHUP_META, NotificationPoller
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Involio copy-trade agent")
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _bootstrap(*, with_logging: bool = False) -> tuple[Settings, SessionStore, AgentDB]:
@@ -456,14 +459,38 @@ def _run_poll_loop(*, force_dry_run: bool) -> None:
         executor = DexExecutor(settings, client=client, db=db)
         if settings.live and not settings.dry_run:
             dex_store = DexSessionStore(settings.dex_session_path)
-            if dex_store.load() is None:
+            dex_data = dex_store.load()
+            if dex_data is None:
                 console.print("[red]LIVE mode needs DEX session.[/red] Run: invo-agent dex-login")
                 db.close()
                 raise typer.Exit(1)
+            # An expired key cannot be refreshed (it signs its own refresh), so
+            # going LIVE on one means every open AND every close 401s until a
+            # human runs dex-login. Refuse rather than trade blind.
+            if session_is_expired(dex_data):
+                remaining = session_ttl_remaining_seconds(dex_data)
+                console.print(
+                    f"[red]DEX key is expired "
+                    f"(remaining={remaining:.0f}s) — refusing to start LIVE.[/red] "
+                    "Run: invo-agent dex-login, then start within its TTL."
+                )
+                logger.error("refusing LIVE start on expired DEX key remaining_s=%s", remaining)
+                db.close()
+                raise typer.Exit(1)
+            dex_remaining = session_ttl_remaining_seconds(dex_data)
             console.print(
                 f"[bold red]LIVE TRADING ENABLED[/bold red] "
-                f"position_pct={settings.position_pct}%"
+                f"position_pct={settings.position_pct}% "
+                f"dex_key_ttl={dex_remaining:.0f}s"
             )
+            # A fresh OTP key is minted ~5 min; the first refresh upgrades it to
+            # 30 days. Say so, so a short number here does not read as a fault.
+            if dex_remaining is not None and dex_remaining < 900:
+                console.print(
+                    "[yellow]DEX key is short-lived — it must renew within "
+                    f"{dex_remaining:.0f}s. Watch for "
+                    "'DEX renew succeeded' before leaving this unattended.[/yellow]"
+                )
 
         if settings.hud_token:
             from invo_agent.server import start_hud_server

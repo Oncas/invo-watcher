@@ -425,6 +425,19 @@ def refresh_dex_session(
         signer.close()
 
 
+def session_issued_ttl_seconds(data: DexSessionData) -> float | None:
+    """How long this key was granted for, not how long is left.
+
+    Involio's OTP login mints a ~5 minute key; the first successful refresh
+    upgrades it to 30 days. Backoffs have to scale to this, or a retry lands
+    after the key it was meant to save has already died.
+    """
+    if data.updated_at is None or data.expires_at_ms is None:
+        return None
+    issued = (int(data.expires_at_ms) / 1000.0) - data.updated_at.timestamp()
+    return issued if issued > 0 else None
+
+
 def session_should_proactive_renew(
     data: DexSessionData,
     *,
@@ -440,11 +453,9 @@ def session_should_proactive_renew(
         return False
     if remaining <= 0:
         return True
-    issued: float | None = None
-    if data.updated_at is not None and data.expires_at_ms is not None:
-        issued = (int(data.expires_at_ms) / 1000.0) - data.updated_at.timestamp()
+    issued = session_issued_ttl_seconds(data)
     lead = float(renew_before_seconds)
-    if issued is not None and issued > 0:
+    if issued is not None:
         lead = min(lead, max(90.0, issued * 0.25))
     else:
         lead = max(90.0, lead)

@@ -14,6 +14,10 @@ from urllib.parse import parse_qs, urlparse
 
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB
+from invo_agent.dex.session import (
+    DexSessionStore,
+    session_ttl_remaining_seconds,
+)
 from invo_agent.hud import HudSnapshot, collect_hud, write_hud_file
 
 logger = logging.getLogger(__name__)
@@ -51,6 +55,28 @@ def _hud_loop(settings: Settings, stop: threading.Event) -> None:
         except Exception:  # noqa: BLE001
             logger.exception("hud snapshot refresh failed")
         stop.wait(HUD_REFRESH_SECONDS)
+
+
+def _dex_key_state(settings: Settings) -> tuple[float | None, bool]:
+    """(ttl_seconds, ok). Only gates health on a LIVE run.
+
+    In dry-run an expired key costs nothing, so it must not fail the probe and
+    train people to ignore it.
+    """
+    if not (settings.live and not settings.dry_run):
+        return None, True
+    try:
+        data = DexSessionStore(settings.dex_session_path).load()
+    except Exception:  # noqa: BLE001
+        logger.exception("health: dex session read failed")
+        return None, False
+    if data is None:
+        return None, False
+    remaining = session_ttl_remaining_seconds(data)
+    if remaining is None:
+        # No expiry recorded — can't prove it's dead, don't cry wolf.
+        return None, True
+    return round(remaining, 1), remaining > 0
 
 
 def _authorized(handler: BaseHTTPRequestHandler, token: str) -> bool:
@@ -167,7 +193,16 @@ def _make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                 if poll_dt is not None:
                     age = (datetime.now(UTC) - poll_dt.astimezone(UTC)).total_seconds()
             stale_after = max(30.0, settings.poll_interval_seconds * 4)
-            ok = age is not None and age <= stale_after
+            poll_ok = age is not None and age <= stale_after
+            # A live agent polling happily with a dead signing key cannot open
+            # OR close. That has to fail the probe, not read as healthy.
+            dex_ttl, dex_ok = _dex_key_state(settings)
+            ok = poll_ok and dex_ok
+            reason = None
+            if not poll_ok:
+                reason = "poll_stale"
+            elif not dex_ok:
+                reason = "dex_key_expired"
             _json(
                 self,
                 200 if ok else 503,
@@ -176,6 +211,10 @@ def _make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                     "last_poll_at": last_poll,
                     "poll_age_seconds": age,
                     "stale_after": stale_after,
+                    "poll_ok": poll_ok,
+                    "dex_key_ok": dex_ok,
+                    "dex_key_ttl_seconds": dex_ttl,
+                    "reason": reason,
                 },
             )
 

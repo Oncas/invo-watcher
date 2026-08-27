@@ -40,6 +40,7 @@ from invo_agent.dex.session import (
     refresh_dex_session,
     refresh_failed_because_key_dead,
     session_is_expired,
+    session_issued_ttl_seconds,
     session_should_proactive_renew,
     session_ttl_remaining_seconds,
 )
@@ -61,6 +62,10 @@ CATCHUP_META = "catchup_completed_at"
 HEARTBEAT_EVERY = 8  # polls between "still alive" lines when idle
 # Don't hammer Turnkey OTP if auto dex-login keeps failing.
 DEX_RECOVER_COOLDOWN_SECONDS = 10 * 60
+# ...but never back off past a short key's own lifetime. An OTP login mints a
+# ~5 min key, so a flat 10 min cooldown guarantees it dies before the retry.
+DEX_RECOVER_COOLDOWN_MIN_SECONDS = 20.0
+DEX_RECOVER_COOLDOWN_TTL_FRACTION = 0.1
 # Transient network / 5xx: log quietly until this many in a row.
 TRANSIENT_NOTIFY_AFTER = 5
 # Live market-close retry after a transient HL failure. After this, recovery
@@ -1279,6 +1284,22 @@ class NotificationPoller:
         console.print("[yellow]DEX key near expiry — background refresh...[/yellow]")
         self._recover_dex_session()
 
+    def _dex_cooldown_seconds(self) -> float:
+        """Back off proportionally to the key we actually hold.
+
+        A 30-day key can wait the full 10 minutes. A 5-minute key cannot —
+        it would expire inside its own cooldown and need a manual dex-login.
+        """
+        data = self.executor.dex_store.load()
+        issued = session_issued_ttl_seconds(data) if data is not None else None
+        if issued is None:
+            return float(DEX_RECOVER_COOLDOWN_SECONDS)
+        scaled = issued * DEX_RECOVER_COOLDOWN_TTL_FRACTION
+        return min(
+            float(DEX_RECOVER_COOLDOWN_SECONDS),
+            max(DEX_RECOVER_COOLDOWN_MIN_SECONDS, scaled),
+        )
+
     def _mark_dex_renewed(self, *, via: str, remaining: float | None) -> bool:
         self.executor.invalidate_trader()
         if remaining is not None and remaining < 120:
@@ -1287,7 +1308,7 @@ class NotificationPoller:
                 via,
                 remaining,
             )
-            self._dex_recover_after = time.monotonic() + DEX_RECOVER_COOLDOWN_SECONDS
+            self._dex_recover_after = time.monotonic() + self._dex_cooldown_seconds()
         else:
             self._dex_recover_after = 0.0
         self._dex_dead_notified = False
@@ -1331,13 +1352,13 @@ class NotificationPoller:
                 current is None or session_is_expired(current)
             )
             if not key_dead:
-                self._dex_recover_after = now + DEX_RECOVER_COOLDOWN_SECONDS
+                self._dex_recover_after = now + self._dex_cooldown_seconds()
                 console.print(f"[red]DEX refresh failed:[/red] {refresh_exc}")
                 return False
 
         if not self.settings.imap_configured:
             console.print("[red]DEX key dead and IMAP not configured — cannot OTP.[/red]")
-            self._dex_recover_after = now + DEX_RECOVER_COOLDOWN_SECONDS
+            self._dex_recover_after = now + self._dex_cooldown_seconds()
             return False
 
         console.print("[yellow]DEX key dead — auto dex-login via Turnkey OTP...[/yellow]")
@@ -1348,7 +1369,7 @@ class NotificationPoller:
             remaining = session_ttl_remaining_seconds(new) if new else None
             return self._mark_dex_renewed(via="otp", remaining=remaining)
         except Exception as exc:  # noqa: BLE001
-            self._dex_recover_after = now + DEX_RECOVER_COOLDOWN_SECONDS
+            self._dex_recover_after = now + self._dex_cooldown_seconds()
             console.print(f"[red]Auto dex-login failed:[/red] {exc}")
             logger.error("auto dex-login failed: %s", exc)
             log_event("dex_auto_login", ok=False, via="otp", error=str(exc))
