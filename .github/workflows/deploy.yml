@@ -9,7 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: PROD
     steps:
-      - name: SSH and deploy
+      - uses: actions/checkout@v4
+
+      - name: Push code and deploy
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
@@ -29,6 +31,21 @@ jobs:
           chmod 700 ~/.ssh
           printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
-            "${user}@${VPS_HOST}" \
+          ssh_opts="-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+
+          # The VPS holds no repo credentials and never fetches: CI ships the
+          # tree. Excludes keep runtime state and secrets out of the payload.
+          echo "==> push tree to ${user}@${VPS_HOST}:/opt/invo-agent"
+          tar -cz \
+            --exclude=.git \
+            --exclude=.venv \
+            --exclude=.env \
+            --exclude=captures \
+            --exclude=.pytest_cache \
+            -f - . \
+            | ssh $ssh_opts "${user}@${VPS_HOST}" \
+              'mkdir -p /opt/invo-agent && tar -xz -C /opt/invo-agent'
+
+          echo "==> run deploy"
+          ssh $ssh_opts "${user}@${VPS_HOST}" \
             '/opt/invo-agent/scripts/vps-deploy.sh'

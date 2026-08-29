@@ -1,6 +1,8 @@
 #!/bin/bash
-# Pull origin/main, reinstall the venv, restart systemd, wait for /v1/health.
-# Secrets live outside the repo (EnvironmentFile + /var/lib/invo-agent). Never wipe those.
+# Reinstall the venv, migrate, restart systemd, wait for /v1/health.
+# Code is PUSHED here by CI over SSH -- this box has no repo credentials and
+# never fetches. Secrets live outside the repo (EnvironmentFile +
+# /var/lib/invo-agent). Never wipe those.
 set -euo pipefail
 
 ROOT="${INVO_AGENT_ROOT:-/opt/invo-agent}"
@@ -9,15 +11,11 @@ HEALTH_TRIES="${INVO_AGENT_HEALTH_TRIES:-30}"
 HEALTH_SLEEP="${INVO_AGENT_HEALTH_SLEEP:-2}"
 
 if [[ "$(id -u)" -eq 0 ]]; then
-  echo "Run as the invo user (not root) so git/.venv stay owned by invo." >&2
+  echo "Run as the invo user (not root) so .venv stays owned by invo." >&2
   exit 1
 fi
 
 cd "$ROOT"
-
-echo "==> fetch origin/main"
-git fetch origin
-git reset --hard origin/main
 
 if [[ ! -d .venv ]]; then
   echo "==> create venv"
