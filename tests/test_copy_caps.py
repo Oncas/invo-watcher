@@ -19,6 +19,7 @@ from invo_agent.config import Settings
 from invo_agent.db import AgentDB, PendingIntent
 from invo_agent.dex.executor import DexExecutor
 from invo_agent.dex.hl_trader import HlTraderError, InsufficientMarginError
+from invo_agent.dex.pricing import min_notional_target, size_clearing_min_notional
 from invo_agent.poller import NotificationPoller, locked_queued_entry_size
 
 
@@ -213,12 +214,12 @@ def test_entry_size_stays_percent(tmp_path, raw, expect) -> None:
 @pytest.mark.parametrize(
     "equity,lev,entry,want_ntl,capped,bumped",
     [
-        # 0.1% clip on the $111 book — bump to HL $10, never to 10%.
-        (100.0, 20, 0.1, 10.0, False, True),
-        (100.0, 20, 0.1, 10.0, False, True),
-        (80.0, 20, 0.1, 10.0, False, True),
-        # 0.8% at 5x also needs the $10 bump (0.8% of $100 * 5 = $4).
-        (100.0, 5, 0.801, 10.0, False, True),
+        # A 0.1% clip — bump over HL's $10 floor, never all the way to 10%.
+        (120.0, 20, 0.1, 12.0, False, True),
+        (100.0, 20, 0.1, 12.0, False, True),
+        (80.0, 20, 0.1, 12.0, False, True),
+        # 0.8% at 5x also needs the bump (0.8% of $100 * 5 = $4).
+        (100.0, 5, 0.801, 12.0, False, True),
         # True 5% fallback-sized clip at 10x is $50, no bump, under cap.
         (100.0, 10, 5.0, 50.0, False, False),
         # Exactly the per-copy cap.
@@ -688,7 +689,7 @@ def test_need_margin_20pct_is_capped_to_10(tmp_path) -> None:
         cached_mid=lambda coin: 2.0,
     )
     assert poller._need_margin_usd(entry_size=20.0, leverage=10) == pytest.approx(10.0)
-    assert poller._need_margin_usd(entry_size=0.1, leverage=20) == pytest.approx(0.5)
+    assert poller._need_margin_usd(entry_size=0.1, leverage=20) == pytest.approx(0.6)
     db.close()
 
 
@@ -746,7 +747,7 @@ def test_drain_action_keeps_queued_01_against_live_25(tmp_path) -> None:
     _m, meta = exe._resolve_margin(
         equity=100.0, leverage=20, entry_size=action.investment.entry_size
     )
-    assert meta["order_notional_usd"] == pytest.approx(10.0)
+    assert meta["order_notional_usd"] == pytest.approx(12.0)
     assert meta["trader_pct"] == 0.1
     db.close()
 
@@ -1111,4 +1112,36 @@ def test_whale_cluster_cannot_rebuild_on_one_book(tmp_path) -> None:
     assert extra["capped"] is True
     assert extra["final_pct"] <= 10.0
     assert extra["order_notional_usd"] < 500.0
+    db.close()
+
+
+def test_btc_40x_bump_clears_hl_min(tmp_path) -> None:
+    """A 0.10% BTC clip at 40x must clear HL's $10 floor with room to spare.
+
+    Aiming at exactly $10 lets lot rounding land ~$10.16 — about 1.6% of
+    headroom — and HL still rejects with "Order must have minimum value of
+    $10". The open path now uses the buffered target the close path had.
+    """
+    _, db, exe = _exe(tmp_path)
+    _margin, meta = exe._resolve_margin(
+        equity=200.0, leverage=40, entry_size=0.10
+    )
+    assert meta["bumped_to_hl_min"] is True
+    assert meta["capped"] is False
+    ntl = float(meta["order_notional_usd"])
+    assert ntl == pytest.approx(min_notional_target(10.0))
+    sz = size_clearing_min_notional(
+        mid=78188.5, notional=ntl, min_notional=10.0, sz_decimals=5
+    )
+    # The old $10 aim produced 0.00013 / $10.16 here — the value HL rejected.
+    assert sz * 78188.5 > 11.0
+    db.close()
+
+
+def test_bump_still_yields_to_the_per_copy_cap(tmp_path) -> None:
+    """Buffering the floor must not let a clip climb past MAX_POSITION_PCT."""
+    _, db, exe = _exe(tmp_path, max_position_pct=0.2)
+    _margin, meta = exe._resolve_margin(equity=100.0, leverage=40, entry_size=0.01)
+    assert meta["capped"] is True
+    assert meta["final_pct"] == pytest.approx(0.2)
     db.close()

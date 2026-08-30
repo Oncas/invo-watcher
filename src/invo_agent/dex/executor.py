@@ -38,6 +38,7 @@ from invo_agent.dex.pricing import (
     extract_avg_px,
     fill_gaps,
     ioc_unfilled_message,
+    min_notional_target,
     price_is_at_or_better,
     size_clearing_min_notional,
 )
@@ -541,7 +542,8 @@ class DexExecutor:
 
         lev = max(1, int(leverage or 1))
         hl_min = float(self.settings.hl_min_order_usd)
-        min_margin = hl_min / lev
+        # Aim over HL's floor, not at it — the close path already does.
+        min_margin = min_notional_target(hl_min) / lev
         min_pct = (min_margin / equity) * 100.0 if equity > 0 else target_pct
 
         final_pct = max(target_pct, min_pct)

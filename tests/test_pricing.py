@@ -2,8 +2,10 @@ from invo_agent.dex.pricing import (
     extract_avg_px,
     fill_gaps,
     ioc_unfilled_message,
+    min_notional_target,
     plan_resting_adopt,
     price_is_at_or_better,
+    size_clearing_min_notional,
 )
 
 
@@ -94,3 +96,27 @@ def test_plan_resting_adopt_does_not_trust_shrunk_posted() -> None:
     )
     assert held == 0.6
     assert keep is True
+
+
+def test_min_notional_target_buffers_over_the_floor() -> None:
+    """Open and close paths must aim over HL's floor, never at it."""
+    assert min_notional_target(10.0) == 12.0
+    assert min_notional_target(20.0) == 24.0
+    # A floor below $10 still gets the $12 aim the close path always used.
+    assert min_notional_target(5.0) == 12.0
+
+
+def test_btc_40x_clip_survives_lot_rounding() -> None:
+    """0.00013 BTC at mid 78188.5 is $10.16 — over the floor, still rejected.
+
+    Flooring the lot at the buffered target has to leave real headroom, not
+    land a few cents over the floor for HL to disagree with.
+    """
+    mid = 78188.5
+    sz = size_clearing_min_notional(
+        mid=mid,
+        notional=min_notional_target(10.0),
+        min_notional=10.0,
+        sz_decimals=5,
+    )
+    assert sz * mid > 11.0

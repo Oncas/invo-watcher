@@ -8,6 +8,17 @@ from typing import Any
 HL_MARKET_CLOSE_SLIPPAGE = 0.05
 
 
+def min_notional_target(min_notional: float) -> float:
+    """Notional to aim for when an order would otherwise sit on HL's floor.
+
+    HL rejects below ``min_notional``, and it judges the order with its own
+    price, not the mid we sized against. Targeting the floor exactly leaves
+    nothing for that disagreement or for lot rounding, so a $10.16 clip comes
+    back "Order must have minimum value of $10". Aim over it instead.
+    """
+    return max(float(min_notional) * 1.2, 12.0)
+
+
 def queued_ready_locally(
     *,
     reason: str,
@@ -133,7 +144,7 @@ def sell_close_top_up_sz(
         return 0.0
     return size_clearing_min_notional(
         mid=mid,
-        notional=max(float(min_notional) * 1.2, 12.0),
+        notional=min_notional_target(min_notional),
         min_notional=float(min_notional),
         sz_decimals=sz_decimals,
     )

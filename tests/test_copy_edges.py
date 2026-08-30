@@ -117,11 +117,11 @@ def test_entry_size_is_percent_not_fraction(tmp_path) -> None:
     _margin, meta = exe._resolve_margin(equity=100.0, leverage=5, entry_size=0.801)
     assert meta["trader_pct"] == 0.801
     assert meta["bumped_to_hl_min"] is True
-    assert meta["order_notional_usd"] == 10.0
+    assert meta["order_notional_usd"] == 12.0
     assert meta["capped"] is False
     tiny, tiny_meta = exe._resolve_margin(equity=100.0, leverage=20, entry_size=0.1)
-    assert tiny == 0.5
-    assert tiny_meta["order_notional_usd"] == 10.0
+    assert tiny == 0.6
+    assert tiny_meta["order_notional_usd"] == 12.0
     assert tiny_meta["capped"] is False
     assert tiny_meta["final_pct"] != 10.0
 
@@ -260,7 +260,7 @@ def test_drain_does_not_open_queued_01_at_live_25(tmp_path) -> None:
         entry_size=action.investment.entry_size,
     )
     assert meta["trader_pct"] == 0.1
-    assert meta["order_notional_usd"] == 10.0
+    assert meta["order_notional_usd"] == 12.0
     db.close()
 
 

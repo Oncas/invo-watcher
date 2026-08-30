@@ -834,8 +834,8 @@ def test_live_pending_reason_fat_vs_tiny(tmp_path) -> None:
     )
     # 20% of $100 is $20; per-copy cap is 10% → $10 cash.
     assert poller._need_margin_usd(entry_size=20.0, leverage=10) == 10.0
-    # 0.5% of $100 is $5 notional at 10x → bump to $10 → $1 cash.
-    assert poller._need_margin_usd(entry_size=0.5, leverage=10) == 1.0
+    # 0.5% of $100 is $5 notional at 10x → bump over $10 → $1.20 cash.
+    assert poller._need_margin_usd(entry_size=0.5, leverage=10) == 1.2
     assert poller._need_margin_usd(
         entry_size=None, leverage=10, leftover_notional=3.0
     ) == 1.0
