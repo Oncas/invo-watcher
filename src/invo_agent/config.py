@@ -83,6 +83,7 @@ class Settings(BaseSettings):
     log_dir: Path = Field(default_factory=lambda: _default_home() / "logs")
     research_enabled: bool = True
     research_db_path: Path = Field(default_factory=lambda: _default_home() / "research.db")
+    market_db_path: Path = Field(default_factory=lambda: _default_home() / "market.db")
 
     mac_notify: bool = True
     # Empty = silent banners (still shown). Set Glass/Basso to restore a sound.

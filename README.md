@@ -13,6 +13,9 @@ Watches Involio portfolio trade notifications and copies **OPEN / UPDATE / CLOSE
 Portfolio history and ongoing signal/decision capture are stored in a separate
 SQLite research database. See [Research data collection](docs/research-data.md)
 for backfill commands, SQL queries, coverage, and training-data limitations.
+Market bars for joining those signals to conditions at the time live in a third
+SQLite file. See [Market data](docs/market-data.md) — note that minute-level
+history expires within days, so forward capture has to start before analysis.
 
 ```
 Involio / Hyperliquid  →  VPS poller + agent.db + logs

@@ -37,10 +37,12 @@ from invo_agent.logging_setup import setup_logging
 from invo_agent.notify import ensure_alerter, find_alerter, notify_mac
 from invo_agent.poller import CATCHUP_META, NotificationPoller
 from invo_agent.research import BufferedResearch, validate_archive_path
+from invo_agent.market_cli import market_app
 from invo_agent.research_cli import research_app
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Involio copy-trade agent")
 app.add_typer(research_app, name="research")
+app.add_typer(market_app, name="market")
 console = Console()
 logger = logging.getLogger(__name__)
 
