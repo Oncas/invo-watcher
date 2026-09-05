@@ -101,9 +101,7 @@ def install_launchd(*, mode: str, log_dir: Path) -> Path:
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            result.stderr.strip() or result.stdout.strip() or "launchctl load failed"
-        )
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "launchctl load failed")
     return path
 
 
@@ -188,9 +186,7 @@ def _load_plist(path: Path) -> None:
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            result.stderr.strip() or result.stdout.strip() or "launchctl load failed"
-        )
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "launchctl load failed")
 
 
 def install_hud_launchd(*, log_dir: Path) -> Path:

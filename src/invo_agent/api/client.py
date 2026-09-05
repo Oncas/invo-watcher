@@ -29,10 +29,12 @@ _BROWSER_UA = (
 
 
 class InvolioAPIError(RuntimeError):
-    def __init__(self, message: str, *, status_code: int | None = None, body: Any = None):
+    def __init__(self, message: str, *, status_code: int | None = None, body: Any = None,
+                 retry_after: str | None = None):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+        self.retry_after = retry_after
 
 
 class InvolioClient:
@@ -41,6 +43,8 @@ class InvolioClient:
     def __init__(self, settings: Settings, session: SessionStore):
         self.settings = settings
         self.session = session
+        # Installed only by the trading CLI; never observes authentication requests.
+        self.research = None
         self._client = httpx.Client(
             timeout=httpx.Timeout(30.0, connect=10.0),
             headers={
@@ -130,6 +134,7 @@ class InvolioClient:
             f"{action} failed ({response.status_code}){hint}",
             status_code=response.status_code,
             body=body,
+            retry_after=response.headers.get("Retry-After"),
         )
 
     # --- auth ---
@@ -211,7 +216,11 @@ class InvolioClient:
             json={"page": page, "size": size},
         )
         self._raise_for_status(response, "get notifications")
-        return NotificationsResponse.model_validate(response.json())
+        body = response.json()
+        if isinstance(body, dict) and isinstance(body.get("items"), list):
+            for item in body["items"]:
+                self._observe("notification", item)
+        return NotificationsResponse.model_validate(body)
 
     def get_post_by_id(self, post_id: UUID | str) -> PostResponse:
         response = self._request(
@@ -220,7 +229,9 @@ class InvolioClient:
             json={"postId": str(post_id)},
         )
         self._raise_for_status(response, "get post")
-        return PostResponse.model_validate(response.json())
+        body = response.json()
+        self._observe("post", body.get("post"))
+        return PostResponse.model_validate(body)
 
     def get_current_shadow_post_by_investment_base_id(
         self, base_id: UUID | str
@@ -232,7 +243,60 @@ class InvolioClient:
             json={"baseId": str(base_id)},
         )
         self._raise_for_status(response, "get shadow post by investment base id")
-        return PostResponse.model_validate(response.json())
+        body = response.json()
+        self._observe("latest_post", body.get("post"), entity_id=str(base_id))
+        return PostResponse.model_validate(body)
+
+    def _observe(self, kind: str, payload: Any, *, entity_id: str | None = None) -> None:
+        if self.research is None or not isinstance(payload, dict):
+            return
+        try:
+            update = payload.get("update")
+            update = update if isinstance(update, dict) else {}
+            portfolio = update.get("portfolio")
+            portfolio_id = payload.get("portfolioId")
+            if portfolio_id is None and isinstance(portfolio, dict):
+                portfolio_id = portfolio.get("id")
+            # Key posts by the investment base id, like the backfill does, so
+            # entity_id joins across live and historical records. A post's own
+            # id is not a join key for anything else we store.
+            identity = (
+                entity_id or update.get("baseId")
+                or payload.get("baseId") or payload.get("id")
+            )
+            self.research.record(
+                kind, payload, entity_id=None if identity is None else str(identity),
+                portfolio_id=portfolio_id,
+                source_at=payload.get("createdAt"), deduplicate=True,
+            )
+        except Exception:
+            # Research must not change execution behavior, including on malformed data.
+            pass
+
+    def get_portfolio_investments(
+        self, portfolio_id: UUID | str, *, is_open: bool, page: int = 1, size: int = 10,
+    ) -> dict[str, Any]:
+        """Contract verified against the public Involio web app (2026-09-05)."""
+        response = self._request(
+            "POST", self._social("/investments/get_investments"),
+            json={"portfolioId": str(portfolio_id), "isOpen": is_open,
+                  "params": {"page": page, "size": size}},
+        )
+        self._raise_for_status(response, "portfolio investments")
+        return response.json()
+
+    def get_investment_history(
+        self, base_id: UUID | str, *, page: int = 1, size: int = 20,
+    ) -> dict[str, Any]:
+        """Available investment posts; these may themselves have been edited."""
+        response = self._request(
+            "POST", self._social("/posts/get_investment_history"),
+            json={"investmentBaseId": str(base_id), "params": {
+                "page": page, "size": size, "shadowInvestmentsOnly": False,
+            }},
+        )
+        self._raise_for_status(response, "investment history")
+        return response.json()
 
     def get_followed_portfolios(
         self, user_id: UUID | str, *, page: int = 1, size: int = 50
@@ -247,7 +311,9 @@ class InvolioClient:
             },
         )
         self._raise_for_status(response, "followed portfolios")
-        return response.json()
+        body = response.json()
+        self._observe("followed_portfolios", body)
+        return body
 
     # --- dex (raw for now) ---
 

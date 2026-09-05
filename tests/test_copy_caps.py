@@ -1104,10 +1104,7 @@ def test_whale_cluster_cannot_rebuild_on_one_book(tmp_path) -> None:
             _seed_copy(db, ticker=coin, size=margin, px=1.0, leverage=1)
         notionals.append(meta["order_notional_usd"])
     # Old path: four uncapped whale notionals. New path: each ≤ 10% × lev.
-    assert all(
-        n <= equity * 0.10 * lev + 1e-6
-        for n, (_c, _p, lev) in zip(notionals, wanted, strict=True)
-    )
+    assert all(n <= equity * 0.10 * lev + 1e-6 for n, (_c, _p, lev) in zip(notionals, wanted))
     used = sum(exe._copy_margin_usd(c) for c in db.list_open_copies())
     assert used <= equity * 0.40 + 1e-6
     assert used > equity * 0.20

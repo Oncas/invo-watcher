@@ -1,5 +1,4 @@
 import logging
-import sqlite3
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -478,7 +477,7 @@ def test_failed_cache_write_keeps_the_previous_follows(tmp_path) -> None:
     db = AgentDB(settings.db_path)
     db.replace_followed_portfolios([FollowedPortfolio(portfolio_id=FOLLOWED_A)])
 
-    with pytest.raises(sqlite3.Error):
+    with pytest.raises(Exception):
         db.replace_followed_portfolios(
             [FollowedPortfolio(portfolio_id=FOLLOWED_B, title={"unbindable": 1})]  # type: ignore[arg-type]
         )

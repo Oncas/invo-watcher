@@ -13,6 +13,8 @@ dex-session.json
 # Runtime (also lives under ~/.invo-agent/)
 data/
 *.db
+*.db-wal
+*.db-shm
 *.sqlite3
 hud.json
 pnl-cache.json

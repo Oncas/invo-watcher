@@ -81,6 +81,8 @@ class Settings(BaseSettings):
     dex_session_path: Path = Field(default_factory=lambda: _default_home() / "dex-session.json")
     db_path: Path = Field(default_factory=lambda: _default_home() / "agent.db")
     log_dir: Path = Field(default_factory=lambda: _default_home() / "logs")
+    research_enabled: bool = True
+    research_db_path: Path = Field(default_factory=lambda: _default_home() / "research.db")
 
     mac_notify: bool = True
     # Empty = silent banners (still shown). Set Glass/Basso to restore a sound.

@@ -36,8 +36,11 @@ from invo_agent.labels import tags_from_summary
 from invo_agent.logging_setup import setup_logging
 from invo_agent.notify import ensure_alerter, find_alerter, notify_mac
 from invo_agent.poller import CATCHUP_META, NotificationPoller
+from invo_agent.research import BufferedResearch, validate_archive_path
+from invo_agent.research_cli import research_app
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Involio copy-trade agent")
+app.add_typer(research_app, name="research")
 console = Console()
 logger = logging.getLogger(__name__)
 
@@ -582,11 +585,35 @@ def _run_poll_loop(*, force_dry_run: bool) -> None:
             )
 
         poller = NotificationPoller(client, db, settings, executor, session_store=session)
+        research = None
         try:
+            if settings.research_enabled:
+                try:
+                    validate_archive_path(
+                        settings.research_db_path, settings.db_path, settings.log_dir
+                    )
+                    research = BufferedResearch(settings.research_db_path)
+                except Exception as exc:  # noqa: BLE001 — research never blocks trading
+                    logger.exception("research capture disabled")
+                    console.print(f"[yellow]research capture disabled: {exc}[/yellow]")
+                    research = None
+            if research is not None:
+                client.research = db.research = research
+                research.record("capture_started", {
+                    "dry_run": poller.is_dry_run,
+                    "collector_version": 2,
+                    "configured_portfolio_ids": sorted(settings.portfolio_ids),
+                    "portfolio_sync": settings.portfolio_sync,
+                    "coverage": ["notifications", "requested_posts", "decision_inputs",
+                                 "notification_dispositions", "action_results"],
+                })
             poller.run_forever()
         except KeyboardInterrupt:
             console.print("\n[dim]stopped[/dim]")
         finally:
+            client.research = db.research = None
+            if research is not None:
+                research.close()
             db.close()
 
 

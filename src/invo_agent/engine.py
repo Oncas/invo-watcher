@@ -63,12 +63,25 @@ class CopyEngine:
             except Exception as exc:  # noqa: BLE001 — keep loop alive in dry-run
                 reason = f"enrich failed: {exc}"
 
-        return TradeAction(
+        action = TradeAction(
             action=notification.action_type,
             notification=notification,
             investment=investment,
             reason=reason,
         )
+        if self.db.research is not None:
+            self.db.record_research("decision_inputs", {
+                "signal": action.model_dump(mode="json", by_alias=True),
+                "allowed_portfolio_ids": sorted(self.allowed_portfolio_ids),
+                "risk": {
+                    name: getattr(self.settings, name) for name in (
+                        "dry_run", "live", "position_pct", "max_position_pct",
+                        "max_book_margin_pct", "min_equity_usd", "hl_min_order_usd",
+                    )
+                },
+            }, entity_id=str(notification.id),
+                portfolio_id=str(notification.portfolio_id) if notification.portfolio_id else None)
+        return action
 
     def stub_close_from_copy(self, notification: Notification) -> TradeAction | None:
         """CLOSE with ticker/side from our open_copy when the post is missing."""

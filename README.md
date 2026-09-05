@@ -10,6 +10,10 @@ Watches Involio portfolio trade notifications and copies **OPEN / UPDATE / CLOSE
 
 ## Architecture
 
+Portfolio history and ongoing signal/decision capture are stored in a separate
+SQLite research database. See [Research data collection](docs/research-data.md)
+for backfill commands, SQL queries, coverage, and training-data limitations.
+
 ```
 Involio / Hyperliquid  →  VPS poller + agent.db + logs
                               ↓  GET /v1/hud|events|logs  (Tailscale, HUD_TOKEN)

@@ -128,6 +128,7 @@ _PENDING_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
 
 class AgentDB:
     def __init__(self, path: Path):
+        self.research = None
         self.path = path.expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path)
@@ -136,6 +137,13 @@ class AgentDB:
 
     def close(self) -> None:
         self._conn.close()
+
+    def record_research(self, kind: str, payload: dict, **metadata) -> None:
+        if self.research is not None:
+            try:
+                self.research.record(kind, payload, **metadata)
+            except Exception:
+                pass  # Archival failures must not affect operational state.
 
     def _migrate(self) -> None:
         self._conn.executescript(
@@ -245,6 +253,9 @@ class AgentDB:
             (notification_id, action, datetime.now(UTC).isoformat(), summary),
         )
         self._conn.commit()
+        self.record_research("notification_disposition", {
+            "notification_id": notification_id, "action": action, "summary": summary,
+        }, entity_id=notification_id)
 
     def unmark_processed(self, notification_id: str) -> bool:
         cur = self._conn.execute(
@@ -326,6 +337,10 @@ class AgentDB:
             ),
         )
         self._conn.commit()
+        self.record_research("action_result", {
+            "action": action, "summary": summary,
+            "notification_id": notification_id, "dry_run": dry_run,
+        }, entity_id=notification_id)
 
     def actions_after(self, after_id: int, *, limit: int = 50) -> list[ActionLogRow]:
         rows = self._conn.execute(
