@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from rich.console import Console
@@ -54,6 +55,24 @@ from invo_agent.labels import merge_update_tags, update_labels
 
 console = Console()
 logger = logging.getLogger(__name__)
+
+# A copy this young is not evidence of a ghost: HL can still be showing the
+# pre-fill book, so "flat" means "not visible yet", not "never opened".
+GHOST_CLEAR_GRACE_SECONDS = 60.0
+
+
+def _copy_age_seconds(copy: OpenCopy, *, now: datetime | None = None) -> float | None:
+    """Seconds since ``copy`` was opened, or None when the stamp is unusable."""
+    raw = copy.opened_at
+    if not raw:
+        return None
+    try:
+        opened = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=UTC)
+    return ((now or datetime.now(UTC)) - opened).total_seconds()
 
 
 @dataclass(frozen=True)
@@ -1471,14 +1490,39 @@ class DexExecutor:
         if self.db is None:
             return []
         try:
+            # Never judge "flat" from the cached book. A resting order that
+            # filled seconds ago is absent from a snapshot taken before the
+            # fill, and clearing on that reads as "we never opened this".
+            trader.refresh_book()
             held = trader.open_coins()
         except Exception as exc:  # noqa: BLE001
             logger.warning("ghost reconcile skipped (HL read failed): %s", exc)
             return []
         cleared: list[str] = []
+        now = datetime.now(UTC)
         for copy in self.db.list_open_copies():
             coin = (copy.ticker or "").upper()
             if not coin or coin in held:
+                continue
+            age = _copy_age_seconds(copy, now=now)
+            if age is not None and age < GHOST_CLEAR_GRACE_SECONDS:
+                # Too young to trust a flat read: the fill may not have landed
+                # in HL's own view yet. It stays clearable on a later pass.
+                logger.info(
+                    "ghost clear deferred coin=%s base_id=%s age=%.1fs grace=%.0fs",
+                    coin,
+                    copy.investment_base_id,
+                    age,
+                    GHOST_CLEAR_GRACE_SECONDS,
+                )
+                log_event(
+                    "ghost_clear_deferred",
+                    coin=coin,
+                    base_id=copy.investment_base_id,
+                    base_short_id=copy.base_short_id,
+                    age_seconds=round(age, 1),
+                    grace_seconds=GHOST_CLEAR_GRACE_SECONDS,
+                )
                 continue
             self._clear_ghost_copy(copy, coin=coin, reason="poll_flat")
             cleared.append(coin)

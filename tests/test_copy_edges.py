@@ -7,7 +7,11 @@ import pytest
 from invo_agent.api.models import ActionType, InvestmentUpdate, Notification, TradeAction
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB, PendingIntent
-from invo_agent.dex.executor import DexExecutor, RecoveryResult
+from invo_agent.dex.executor import (
+    GHOST_CLEAR_GRACE_SECONDS,
+    DexExecutor,
+    RecoveryResult,
+)
 from invo_agent.dex.hl_trader import (
     GhostCopyError,
     HlBookSnapshot,
@@ -40,6 +44,10 @@ class _FakeTrader:
 
     def mid_price(self, coin: str) -> float:
         return self._mid
+
+    def refresh_book(self) -> None:
+        """Ghost reconcile re-reads the book before trusting a flat result."""
+        return None
 
     def available_margin(self) -> float:
         return self._available
@@ -548,6 +556,16 @@ def test_ghost_update_clears_copy(tmp_path) -> None:
     db.close()
 
 
+def _backdate_open_copy(db: AgentDB, base_id: str, *, seconds: float) -> None:
+    """Age a copy past the ghost grace window so a flat read is trusted."""
+    opened = (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+    db._conn.execute(
+        "UPDATE open_copies SET opened_at = ? WHERE investment_base_id = ?",
+        (opened, base_id),
+    )
+    db._conn.commit()
+
+
 def test_ghost_reconcile_frees_coin(tmp_path) -> None:
     settings = _settings(tmp_path)
     db = AgentDB(settings.db_path)
@@ -560,11 +578,33 @@ def test_ghost_reconcile_frees_coin(tmp_path) -> None:
         side="long",
         trader="x",
     )
+    _backdate_open_copy(db, "ghost-1", seconds=GHOST_CLEAR_GRACE_SECONDS + 30.0)
     exe = DexExecutor(settings, db=db)
     trader = _FakeTrader(mid=1.0, available=10.0, pos=None, coins=set())
     cleared = exe.reconcile_ghost_copies(trader)  # type: ignore[arg-type]
     assert "ETH" in cleared
     assert db.get_open_copy("ghost-1") is None
+    db.close()
+
+
+def test_ghost_reconcile_spares_a_just_opened_copy(tmp_path) -> None:
+    """Inside the grace window a flat read is not yet evidence of a ghost."""
+    settings = _settings(tmp_path)
+    db = AgentDB(settings.db_path)
+    db.upsert_open_copy(
+        investment_base_id="fresh-1",
+        base_short_id="freshShort",
+        ticker="ETH",
+        portfolio_id=None,
+        notification_id="n1",
+        side="long",
+        trader="x",
+    )
+    exe = DexExecutor(settings, db=db)
+    trader = _FakeTrader(mid=1.0, available=10.0, pos=None, coins=set())
+    cleared = exe.reconcile_ghost_copies(trader)  # type: ignore[arg-type]
+    assert cleared == []
+    assert db.get_open_copy("fresh-1") is not None
     db.close()
 
 
