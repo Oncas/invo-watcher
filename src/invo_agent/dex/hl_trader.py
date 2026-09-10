@@ -31,6 +31,7 @@ from invo_agent.dex.pricing import (
     sell_close_top_up_sz,
 )
 from invo_agent.dex.turnkey_client import TurnkeySigner
+from invo_agent.events import log_event
 
 
 class HlTraderError(RuntimeError):
@@ -39,6 +40,22 @@ class HlTraderError(RuntimeError):
 
 # Returned by sync_position_tpsl when resting TP/SL already match — no HL write.
 TPSL_UNCHANGED = "unchanged"
+
+
+def first_order_error(resp: dict[str, Any] | None) -> str | None:
+    """The first per-order error string in an HL response, if any.
+
+    HL returns ``status: ok`` at the envelope level and reports a rejected
+    order inside ``response.data.statuses``, so a rejection is not an HTTP
+    error and is invisible unless the statuses are read.
+    """
+    if not isinstance(resp, dict):
+        return None
+    data = (resp.get("response") or {}).get("data") or {}
+    for st in data.get("statuses") or []:
+        if isinstance(st, dict) and st.get("error"):
+            return str(st["error"])
+    return None
 
 
 def _order_tpsl_kind(order: dict[str, Any]) -> str | None:
@@ -668,6 +685,28 @@ class HlTrader:
         response = self.post_action(
             action, signature, nonce, legs=1, essential=is_essential
         )
+        err = first_order_error(response)
+        if err is not None:
+            # The caller only sees the parsed message, which is not enough to
+            # tell why HL scored the ticket as it did. Record what we actually
+            # sent alongside what came back.
+            mid = self.cached_mid(coin)
+            log_event(
+                "hl_order_rejected",
+                coin=coin,
+                error=err,
+                is_buy=is_buy,
+                sz=sz,
+                limit_px=limit_px,
+                reduce_only=reduce_only,
+                ticket_notional=round(sz * limit_px, 6),
+                mid=mid,
+                mid_notional=None if mid is None else round(sz * mid, 6),
+                asset_index=self.asset_index(coin),
+                sz_decimals=self.sz_decimals(coin),
+                action=action,
+                response=response,
+            )
         return hl_order, response, nonce
 
     def limit_order(
