@@ -16,7 +16,13 @@ from invo_agent.api.models import ActionType, InvestmentUpdate, Notification, Tr
 from invo_agent.auth.email_otp import login_with_otp
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings
-from invo_agent.db import AgentDB, OpenCopy, PendingIntent
+from invo_agent.db import (
+    GHOST_SEEN_META_PREFIX,
+    UNTRACKED_REPORTED_META_PREFIX,
+    AgentDB,
+    OpenCopy,
+    PendingIntent,
+)
 from invo_agent.dex.budget import BudgetDeniedError
 from invo_agent.dex.executor import DexExecutor, RecoveryResult
 from invo_agent.dex.hl_trader import (
@@ -47,6 +53,7 @@ from invo_agent.dex.session import (
 )
 from invo_agent.engine import CopyEngine
 from invo_agent.events import log_event, log_event_throttled
+from invo_agent.hud import format_age
 from invo_agent.labels import (
     format_action_summary,
     merge_update_tags,
@@ -88,10 +95,11 @@ QUEUED_MAX_ADDS_PER_POLL = 2
 # When HL says "too many requests", stop opportunistic queue work for a while so
 # the remaining budget goes to closes.
 HL_RATE_LIMIT_COOLDOWN_SECONDS = 120.0
-# An untracked HL position we have already shouted about. Keyed by coin, the
-# value is the first time we saw it. A pending intent created *after* this is a
-# different trade and must not adopt the stranger sitting on the book.
-GHOST_SEEN_META_PREFIX = "ghost_seen:"
+# An untracked HL position sits on the book until someone closes it by hand, so
+# every poll finds it again. Report on the first sighting, then at this interval,
+# rather than once per poll — the old behaviour buried the sighting that mattered
+# under thousands of identical lines.
+UNTRACKED_REPORT_INTERVAL_SECONDS = 900.0
 
 
 def locked_queued_entry_size(
@@ -1761,6 +1769,29 @@ class NotificationPoller:
 
     def _clear_ghost_seen(self, coin: str) -> None:
         self.db.delete_meta(self._ghost_seen_key(coin))
+        # Drop the throttle with the sighting: if this coin turns up untracked
+        # again it is a new event and must report immediately, not sit out the
+        # remainder of an interval started by the previous one.
+        self.db.delete_meta(self._untracked_reported_key(coin))
+
+    def _untracked_reported_key(self, coin: str) -> str:
+        return f"{UNTRACKED_REPORTED_META_PREFIX}{coin.upper()}"
+
+    def _should_report_untracked(self, coin: str, *, now: datetime) -> bool:
+        """True on the first sighting and once per report interval after it."""
+        raw = self.db.get_meta(self._untracked_reported_key(coin))
+        if raw:
+            try:
+                last = datetime.fromisoformat(raw)
+            except ValueError:
+                last = None
+            if last is not None:
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=UTC)
+                if (now - last).total_seconds() < UNTRACKED_REPORT_INTERVAL_SECONDS:
+                    return False
+        self.db.set_meta(self._untracked_reported_key(coin), now.isoformat())
+        return True
 
     def _known_ghosts(self) -> set[str]:
         return {
@@ -1841,6 +1872,17 @@ class NotificationPoller:
                     continue
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("inverse ghost adopt failed %s: %s", coin, exc)
+            # Stamp before reporting so the first report can already date it.
+            self._mark_ghost_seen(coin)
+            now = datetime.now(UTC)
+            if not self._should_report_untracked(coin, now=now):
+                continue
+            first_seen = self._ghost_first_seen(coin)
+            if first_seen is not None and first_seen.tzinfo is None:
+                # A stamp written before these were tz-aware would otherwise
+                # raise here and take the whole reconcile pass down with it.
+                first_seen = first_seen.replace(tzinfo=UTC)
+            age = (now - first_seen).total_seconds() if first_seen else 0.0
             if block is not None:
                 logger.error(
                     "inverse ghost %s: refusing to adopt pending %s (%s)",
@@ -1849,20 +1891,22 @@ class NotificationPoller:
                     block,
                 )
             logger.error(
-                "HL holds %s with no open_copy — not flattening (external?)",
+                "HL holds %s with no open_copy for %s — not flattening (external?). "
+                "Close it by hand if it is ours.",
                 coin,
+                format_age(age),
             )
-            self._mark_ghost_seen(coin)
             log_event(
                 "inverse_ghost",
                 coin=coin,
                 pending=pending is not None,
                 adopt_block=block,
+                untracked_for_seconds=age,
             )
             notify_mac(
                 "invo-agent · WARN",
-                f"HL holds {coin} with no tracked copy",
-                subtitle="Not flattening",
+                f"HL holds {coin} with no tracked copy ({format_age(age)})",
+                subtitle="Not flattening — close by hand if it is ours",
                 sound=self.settings.mac_notify_sound or None,
                 enabled=self.settings.mac_notify,
                 sticky=self.settings.mac_notify_sticky,

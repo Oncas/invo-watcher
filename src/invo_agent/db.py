@@ -5,6 +5,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+# When an untracked HL position was first seen. Written by the poller, read by
+# the HUD to date the position it is flagging.
+GHOST_SEEN_META_PREFIX = "ghost_seen:"
+# When we last reported that untracked position. Separate from the first-seen
+# stamp so throttling the report can never move the age we report.
+UNTRACKED_REPORTED_META_PREFIX = "untracked_reported:"
+
 
 @dataclass
 class OpenCopy:

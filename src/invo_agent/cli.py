@@ -856,17 +856,26 @@ def watch_cmd(
                 pt.add_column("uPnL")
                 pt.add_column("ROE")
                 pt.add_column("Open for")
+                pt.add_column("Tracked")
                 for p in snap.positions:
                     style = "green" if p.unrealized_pnl >= 0 else "red"
+                    untracked = getattr(p, "untracked", False)
                     pt.add_row(
-                        p.coin,
+                        f"[yellow]{p.coin}[/yellow]" if untracked else p.coin,
                         p.side,
                         f"{p.leverage}x",
                         f"[{style}]{format_pnl(p.unrealized_pnl)}[/{style}]",
                         f"[{style}]{format_roe(p.return_on_equity)}[/{style}]",
                         format_age(getattr(p, "open_age_s", None)),
+                        "[yellow]UNTRACKED[/yellow]" if untracked else "yes",
                     )
                 console.print(pt)
+                if getattr(snap, "untracked", 0):
+                    console.print(
+                        f"[yellow]{snap.untracked} untracked position(s): HL holds "
+                        "them, no copy tracks them. The trader's CLOSE will not "
+                        "reach them — close by hand.[/yellow]"
+                    )
             else:
                 console.print("[dim]No open HL positions[/dim]")
 

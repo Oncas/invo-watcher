@@ -9,7 +9,7 @@ from pathlib import Path
 from invo_agent import service as launchd_service
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import Settings
-from invo_agent.db import AgentDB, OpenCopy
+from invo_agent.db import GHOST_SEEN_META_PREFIX, AgentDB, OpenCopy
 from invo_agent.labels import tags_from_summary, trader_from_summary
 
 # How often to refresh Hyperliquid mark/PnL (network call).
@@ -30,6 +30,10 @@ class PositionRow:
     return_on_equity: float  # fraction, e.g. -0.029
     trader: str | None = None
     open_age_s: float | None = None
+    # HL holds this coin but no open_copy tracks it, so no signal from the
+    # trader will move or close it. It needs closing by hand.
+    untracked: bool = False
+    untracked_since: str | None = None
 
 
 @dataclass
@@ -45,6 +49,8 @@ class HudSnapshot:
     recent: list[dict]
     logged_in: bool
     position_pct: float
+    # Positions HL holds that no open_copy tracks. Zero is the healthy case.
+    untracked: int = 0
     equity: float | None = None
     pnl_24h: float | None = None
     pnl_24h_pct: float | None = None  # percent points, e.g. 11.6
@@ -504,6 +510,13 @@ def collect_hud(
     open_copies = len(copies)
     trader_by_coin = _traders_by_coin(copies)
     opened_at_by_coin = _opened_at_by_coin(copies)
+    tracked_coins = {(c.ticker or "").upper() for c in copies if c.ticker}
+    # Read the poller's first-seen stamps while the handle is still open — the
+    # positions they annotate are only fetched after ``db`` is closed below.
+    untracked_since_by_coin = {
+        key[len(GHOST_SEEN_META_PREFIX) :]: db.get_meta(key)
+        for key in db.meta_keys_with_prefix(GHOST_SEEN_META_PREFIX)
+    }
     now_hud = datetime.now(UTC)
     pending_rows: list[dict] = []
     for intent in db.list_pending_intents():
@@ -590,6 +603,11 @@ def collect_hud(
             coin = str(payload.get("coin") or "").upper()
             payload["trader"] = trader_by_coin.get(coin)
             payload["open_age_s"] = _age_seconds(opened_at_by_coin.get(coin), now_hud)
+            # No open_copy for the coin means nothing will act on it again —
+            # the trader's own CLOSE is skipped as "not our copy".
+            if coin and coin not in tracked_coins:
+                payload["untracked"] = True
+                payload["untracked_since"] = untracked_since_by_coin.get(coin)
             try:
                 positions.append(PositionRow(**payload))
             except TypeError:
@@ -602,6 +620,7 @@ def collect_hud(
         poll_age_seconds=age,
         healthy=healthy,
         open_copies=open_copies,
+        untracked=sum(1 for p in positions if p.untracked),
         last_action=(last["summary"] if last else None),
         last_action_at=(last["at"] if last else None),
         recent=recent,
