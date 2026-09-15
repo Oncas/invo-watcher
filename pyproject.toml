@@ -45,3 +45,8 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# Typer declares CLI options as call-valued defaults. B008 exempts str/int/bool
+# annotations already, so this only ever bit the Path and list options.
+extend-immutable-calls = ["typer.Option", "typer.Argument"]

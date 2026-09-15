@@ -34,10 +34,10 @@ from invo_agent.hud import (
 )
 from invo_agent.labels import tags_from_summary
 from invo_agent.logging_setup import setup_logging
+from invo_agent.market_cli import market_app
 from invo_agent.notify import ensure_alerter, find_alerter, notify_mac
 from invo_agent.poller import CATCHUP_META, NotificationPoller
 from invo_agent.research import BufferedResearch, validate_archive_path
-from invo_agent.market_cli import market_app
 from invo_agent.research_cli import research_app
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Involio copy-trade agent")
