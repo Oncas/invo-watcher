@@ -335,7 +335,12 @@ class PortfolioAllowlist:
         except Exception as exc:  # noqa: BLE001 — never kill the poll loop
             self.last_error = str(exc)
             logger.warning("allowlist sync failed: %s — keeping %s", exc, self._kept())
-            log_event("allowlist_sync_failed", error=str(exc), source=self.source, usable=self.usable)
+            log_event(
+                "allowlist_sync_failed",
+                error=str(exc),
+                source=self.source,
+                usable=self.usable,
+            )
             return False
 
         if not fresh:

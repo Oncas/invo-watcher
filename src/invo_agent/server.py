@@ -288,7 +288,9 @@ def start_hud_server(settings: Settings) -> tuple[ThreadingHTTPServer, threading
         refresh_snapshot(settings)
     except Exception:  # noqa: BLE001
         logger.exception("initial hud snapshot failed")
-    threading.Thread(target=_hud_loop, args=(settings, stop), name="hud-refresh", daemon=True).start()
+    threading.Thread(
+        target=_hud_loop, args=(settings, stop), name="hud-refresh", daemon=True
+    ).start()
     handler = _make_handler(settings)
     httpd = ThreadingHTTPServer((settings.hud_bind, settings.hud_port), handler)
     threading.Thread(target=httpd.serve_forever, name="hud-http", daemon=True).start()

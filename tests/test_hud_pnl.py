@@ -1,7 +1,7 @@
 from invo_agent.hud import (
+    _PNL_BASELINE_MAX_LAG_MS,
     PNL_RULE,
     RollingPnl,
-    _PNL_BASELINE_MAX_LAG_MS,
     _account_value_samples,
     _baseline_at_window_start,
     _usable_baseline,

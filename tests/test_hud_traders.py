@@ -3,7 +3,6 @@ from pathlib import Path
 
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB, OpenCopy, PendingIntent
-from invo_agent.migrate import migrate_state
 from invo_agent.hud import (
     PositionRow,
     _opened_at_by_coin,
@@ -15,6 +14,7 @@ from invo_agent.hud import (
     pending_kind,
     pending_last_tried_age,
 )
+from invo_agent.migrate import migrate_state
 
 
 def test_pending_kind() -> None:
