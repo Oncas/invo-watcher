@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 from invo_agent import service as launchd_service
 from invo_agent.auth.session import SessionStore
@@ -14,6 +16,9 @@ from invo_agent.labels import tags_from_summary, trader_from_summary
 
 # How often to refresh Hyperliquid mark/PnL (network call).
 PNL_CACHE_SECONDS = 5.0
+# The 24h baseline costs two heavy info reads (portfolio + ledger) and barely
+# moves. Refresh it on its own clock and recompute PnL from live equity.
+PNL_BASELINE_CACHE_SECONDS = 60.0
 # Involio PnlService.getBaselineAtWindowStart — do not pin or 6h-lag-pick.
 PNL_RULE = "first_at_or_after"
 
@@ -289,19 +294,19 @@ def _ledger_flow_usd(delta: dict, address: str) -> tuple[float, float]:
     return 0.0, 0.0
 
 
-def _involio_rolling_24h_pnl(
-    trader: object,
-    address: str,
-    equity: float,
-) -> RollingPnl | None:
-    """Match Involio AccountHeader rolling-24h PnL.
+class RollingBaseline(NamedTuple):
+    """The slow half of the 24h window: where it starts and what crossed it."""
 
-    pnl = equity − baseline − net_external_flows
-    pct = pnl / (baseline + gross_inflows) × 100
-    """
-    info = trader.info  # type: ignore[attr-defined]
+    baseline_ms: int
+    baseline_equity: float
+    net_flow: float
+    gross_in: float
+
+
+def _fetch_rolling_baseline(info: object, address: str) -> RollingBaseline | None:
+    """The two heavy info reads behind the 24h window (portfolio + ledger)."""
     try:
-        portfolio = info.portfolio(address)
+        portfolio = info.portfolio(address)  # type: ignore[attr-defined]
     except Exception:
         return None
     samples = _account_value_samples(portfolio)
@@ -314,7 +319,7 @@ def _involio_rolling_24h_pnl(
     net_flow = 0.0
     gross_in = 0.0
     try:
-        updates = info.user_non_funding_ledger_updates(
+        updates = info.user_non_funding_ledger_updates(  # type: ignore[attr-defined]
             address, startTime=baseline_ms + 1
         )
     except Exception:
@@ -328,19 +333,41 @@ def _involio_rolling_24h_pnl(
         net, gin = _ledger_flow_usd(delta, address)
         net_flow += net
         gross_in += gin
+    return RollingBaseline(baseline_ms, baseline_equity, net_flow, gross_in)
 
-    pnl = equity - baseline_equity - net_flow
-    denom = baseline_equity + gross_in
+
+def rolling_pnl_from_baseline(
+    baseline: RollingBaseline, equity: float
+) -> RollingPnl | None:
+    """The cheap half: pure math, so live equity can move without a refetch."""
+    pnl = equity - baseline.baseline_equity - baseline.net_flow
+    denom = baseline.baseline_equity + baseline.gross_in
     if abs(denom) <= 1e-9:
         return None
     return RollingPnl(
         pnl=pnl,
         pct=(pnl / denom) * 100.0,
-        baseline_ms=baseline_ms,
-        baseline_equity=baseline_equity,
-        net_flow=net_flow,
-        gross_in=gross_in,
+        baseline_ms=baseline.baseline_ms,
+        baseline_equity=baseline.baseline_equity,
+        net_flow=baseline.net_flow,
+        gross_in=baseline.gross_in,
     )
+
+
+def _involio_rolling_24h_pnl(
+    info: object,
+    address: str,
+    equity: float,
+) -> RollingPnl | None:
+    """Match Involio AccountHeader rolling-24h PnL.
+
+    pnl = equity − baseline − net_external_flows
+    pct = pnl / (baseline + gross_inflows) × 100
+    """
+    baseline = _fetch_rolling_baseline(info, address)
+    if baseline is None:
+        return None
+    return rolling_pnl_from_baseline(baseline, equity)
 
 
 def pnl_served_matches_fresh(
@@ -369,7 +396,8 @@ def pnl_served_matches_fresh(
     return None
 
 
-def _load_pnl_cache(settings: Settings) -> dict | None:
+def _read_pnl_cache(settings: Settings) -> dict | None:
+    """The cache file as written, however old. None if unreadable or stale-ruled."""
     path = _pnl_cache_path(settings)
     if not path.exists():
         return None
@@ -377,12 +405,63 @@ def _load_pnl_cache(settings: Settings) -> dict | None:
         data = json.loads(path.read_text())
     except Exception:
         return None
-    fetched = float(data.get("fetched_at") or 0)
-    if time.time() - fetched > PNL_CACHE_SECONDS:
-        return None
     if data.get("pnl_rule") != PNL_RULE:
         return None
     return data
+
+
+def _load_pnl_cache(settings: Settings) -> dict | None:
+    data = _read_pnl_cache(settings)
+    if data is None:
+        return None
+    fetched = float(data.get("fetched_at") or 0)
+    if time.time() - fetched > PNL_CACHE_SECONDS:
+        return None
+    return data
+
+
+def _cached_rolling_baseline(settings: Settings) -> tuple[RollingBaseline, float] | None:
+    """A still-warm baseline plus the time it was fetched, or None to refetch."""
+    data = _read_pnl_cache(settings)
+    if data is None:
+        return None
+    at = float(data.get("baseline_fetched_at") or 0)
+    if at <= 0 or time.time() - at > PNL_BASELINE_CACHE_SECONDS:
+        return None
+    try:
+        return (
+            RollingBaseline(
+                baseline_ms=int(data["pnl_baseline_ms"]),
+                baseline_equity=float(data["pnl_baseline_equity"]),
+                net_flow=float(data["pnl_net_flow"]),
+                gross_in=float(data["pnl_gross_in"]),
+            ),
+            at,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+_info_lock = threading.Lock()
+_info_client: object | None = None
+
+
+def read_only_info() -> object:
+    """One shared, read-only Hyperliquid ``Info`` client.
+
+    Constructing ``Info`` costs a ``spotMeta`` + ``meta`` fetch (40 of the
+    1200/min IP weight budget). Rebuilding one per HUD refresh made the display
+    the single heaviest consumer of that budget, ahead of the trader itself.
+    None of the HUD's reads sign anything, so no Turnkey signer is needed.
+    """
+    global _info_client
+    with _info_lock:
+        if _info_client is None:
+            from hyperliquid.info import Info
+            from hyperliquid.utils import constants
+
+            _info_client = Info(constants.MAINNET_API_URL, skip_ws=True)
+        return _info_client
 
 
 def _fetch_hl_pnl(settings: Settings) -> dict:
@@ -391,8 +470,7 @@ def _fetch_hl_pnl(settings: Settings) -> dict:
     if cached is not None:
         return cached
 
-    from invo_agent.dex.hl_trader import HlTrader
-    from invo_agent.dex.session import DexSessionError, DexSessionStore, load_signer
+    from invo_agent.dex.session import DexSessionError, DexSessionStore
 
     out: dict = {
         "fetched_at": time.time(),
@@ -400,15 +478,21 @@ def _fetch_hl_pnl(settings: Settings) -> dict:
         "pnl_24h": None,
         "pnl_24h_pct": None,
         "pnl_baseline_ms": None,
+        "pnl_baseline_equity": None,
+        "pnl_net_flow": None,
+        "pnl_gross_in": None,
+        "baseline_fetched_at": None,
         "pnl_rule": PNL_RULE,
         "positions": [],
         "error": None,
     }
     try:
-        store = DexSessionStore(settings.dex_session_path)
-        data, signer = load_signer(store)
-        trader = HlTrader(signer, data.master_address)
-        state = trader.info.user_state(data.master_address)
+        data = DexSessionStore(settings.dex_session_path).load()
+        if data is None:
+            raise DexSessionError("No DEX session. Run: invo-agent dex-login")
+        address = data.master_address
+        info = read_only_info()
+        state = info.user_state(address)  # type: ignore[attr-defined]
         summary = state.get("marginSummary") or state.get("crossMarginSummary") or {}
         equity = float(summary.get("accountValue") or 0)
         out["equity"] = equity
@@ -432,13 +516,25 @@ def _fetch_hl_pnl(settings: Settings) -> dict:
                 }
             )
         out["positions"] = rows
-        rolling = _involio_rolling_24h_pnl(trader, data.master_address, equity)
+        warm = _cached_rolling_baseline(settings)
+        if warm is not None:
+            baseline, baseline_at = warm
+        else:
+            baseline = _fetch_rolling_baseline(info, address)
+            baseline_at = time.time()
+        rolling = (
+            rolling_pnl_from_baseline(baseline, equity)
+            if baseline is not None
+            else None
+        )
         if rolling is not None:
             out["pnl_24h"] = rolling.pnl
             out["pnl_24h_pct"] = rolling.pct
             out["pnl_baseline_ms"] = rolling.baseline_ms
-        trader.close()
-        signer.close()
+            out["pnl_baseline_equity"] = rolling.baseline_equity
+            out["pnl_net_flow"] = rolling.net_flow
+            out["pnl_gross_in"] = rolling.gross_in
+            out["baseline_fetched_at"] = baseline_at
     except DexSessionError as exc:
         out["error"] = str(exc)
     except Exception as exc:  # noqa: BLE001
@@ -709,8 +805,7 @@ def check_local_hud_pnl(settings: Settings) -> str | None:
     import urllib.error
     import urllib.request
 
-    from invo_agent.dex.hl_trader import HlTrader
-    from invo_agent.dex.session import DexSessionStore, load_signer
+    from invo_agent.dex.session import DexSessionStore
 
     if not settings.hud_token:
         return "HUD_TOKEN unset"
@@ -726,17 +821,14 @@ def check_local_hud_pnl(settings: Settings) -> str | None:
     if not isinstance(served, dict):
         return "hud payload is not an object"
 
-    store = DexSessionStore(settings.dex_session_path)
-    data, signer = load_signer(store)
-    trader = HlTrader(signer, data.master_address)
-    try:
-        state = trader.info.user_state(data.master_address)
-        summary = state.get("marginSummary") or state.get("crossMarginSummary") or {}
-        equity = float(summary.get("accountValue") or 0)
-        fresh = _involio_rolling_24h_pnl(trader, data.master_address, equity)
-    finally:
-        trader.close()
-        signer.close()
+    data = DexSessionStore(settings.dex_session_path).load()
+    if data is None:
+        return "no DEX session"
+    info = read_only_info()
+    state = info.user_state(data.master_address)  # type: ignore[attr-defined]
+    summary = state.get("marginSummary") or state.get("crossMarginSummary") or {}
+    equity = float(summary.get("accountValue") or 0)
+    fresh = _involio_rolling_24h_pnl(info, data.master_address, equity)
     if fresh is None:
         return "fresh Involio 24h PnL unavailable"
     raw_base = served.get("pnl_baseline_ms")
@@ -744,10 +836,23 @@ def check_local_hud_pnl(settings: Settings) -> str | None:
         served_baseline_ms = int(raw_base) if raw_base is not None else None
     except (TypeError, ValueError):
         served_baseline_ms = None
-    return pnl_served_matches_fresh(
+    verdict = pnl_served_matches_fresh(
         served_equity=served.get("equity"),
         served_pnl=served.get("pnl_24h"),
         served_baseline_ms=served_baseline_ms,
         served_rule=served.get("pnl_rule"),
         fresh=fresh,
     )
+    if (
+        verdict is not None
+        and served_baseline_ms is not None
+        and served_baseline_ms != fresh.baseline_ms
+    ):
+        # The server holds its baseline for PNL_BASELINE_CACHE_SECONDS, so the
+        # 24h window can roll between its fetch and ours. That is the cache
+        # working, not a wrong number — say which one it is.
+        return (
+            f"{verdict} — window rolled; served baseline is up to "
+            f"{PNL_BASELINE_CACHE_SECONDS:.0f}s old, rerun to confirm"
+        )
+    return verdict

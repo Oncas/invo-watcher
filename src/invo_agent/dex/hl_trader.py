@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -424,28 +425,65 @@ class HlTrader:
             )
         return fills
 
+    def _info_post(self, payload: dict[str, Any]) -> Any:
+        """One read against ``/info``. Thread-safe: httpx.Client is, by design."""
+        response = self._http.post(f"{self.base_url}/info", json=payload)
+        response.raise_for_status()
+        return response.json()
+
     def refresh_book(self, *, fills_since_ms: int | None = None) -> HlBookSnapshot:
-        """One info pass: mids + user_state + open orders (+ optional fills)."""
-        raw_mids = self.info.all_mids() or {}
+        """One info pass: mids + user_state + open orders (+ optional fills).
+
+        The four reads are independent, so they go out together. Run back to
+        back they cost ~1.2s of the poll loop's wall time; in parallel they
+        cost one round trip. Same requests, same rate-limit weight.
+        """
+        now_ms = int(time.time() * 1000)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            f_mids = pool.submit(self._info_post, {"type": "allMids", "dex": ""})
+            f_state = pool.submit(
+                self._info_post,
+                {"type": "clearinghouseState", "user": self.address, "dex": ""},
+            )
+            f_orders = pool.submit(
+                self._info_post,
+                {"type": "frontendOpenOrders", "user": self.address, "dex": ""},
+            )
+            f_fills = (
+                pool.submit(
+                    self._info_post,
+                    {
+                        "type": "userFillsByTime",
+                        "user": self.address,
+                        "startTime": int(fills_since_ms),
+                        "endTime": now_ms,
+                        "aggregateByTime": False,
+                    },
+                )
+                if fills_since_ms is not None
+                else None
+            )
+
+            # Mids and state are load-bearing: let their failures propagate, as
+            # they did when this ran in sequence. Orders and fills degrade.
+            raw_mids = f_mids.result() or {}
+            state = f_state.result()
+            try:
+                open_orders = list(f_orders.result() or [])
+            except Exception:
+                open_orders = []
+            fills: list[HlFill] = []
+            if f_fills is not None:
+                try:
+                    fills = self._parse_fills(f_fills.result())
+                except Exception:
+                    fills = []
+
         mids = {str(k).upper(): float(v) for k, v in raw_mids.items() if v is not None}
-        state = self.info.user_state(self.address)
         summary = state.get("crossMarginSummary") or state.get("marginSummary") or {}
         equity = float(summary.get("accountValue") or 0)
         used = float(summary.get("totalMarginUsed") or 0)
         positions = self._parse_positions(state)
-        try:
-            open_orders = list(self.info.frontend_open_orders(self.address) or [])
-        except Exception:
-            open_orders = []
-        fills: list[HlFill] = []
-        if fills_since_ms is not None:
-            try:
-                raw_fills = self.info.user_fills_by_time(
-                    self.address, int(fills_since_ms), int(time.time() * 1000)
-                )
-                fills = self._parse_fills(raw_fills)
-            except Exception:
-                fills = []
         now = time.monotonic()
         for coin, pos in positions.items():
             if pos.leverage is not None:
