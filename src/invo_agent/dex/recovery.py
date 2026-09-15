@@ -79,7 +79,15 @@ def decide_missed_close(
     recovery_sl_pct: float,
     leverage: float = 1.0,
 ) -> RecoveryDecision:
-    """Decide flatten-now vs park reduce-only TP/SL for a missed Involio close."""
+    """Decide flatten-now vs park reduce-only TP/SL for a missed Involio close.
+
+    ``trader_entry`` must be the trader's entry *as of when we copied*, not their
+    average entry at close. A trader who scales into a loser walks their average
+    toward the price, so their loss at exit shrinks while ours cannot -- we hold
+    the one clip. Measuring them from the moved average makes us look redder than
+    them on nothing but the scale-in, which parks a position that should have
+    followed them out.
+    """
     our_pnl = unrealized_pnl_pct(our_entry, mid, is_long)
     sl = adverse_sl_price(mid, recovery_sl_pct, is_long, leverage)
 

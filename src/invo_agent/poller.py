@@ -386,6 +386,7 @@ class NotificationPoller:
             parked_tp=copy.recovery_tp if copy.recovery_pending else None,
             parked_sl=copy.recovery_sl if copy.recovery_pending else None,
             our_leverage=copy.leverage,
+            trader_entry_at_copy=copy.trader_entry_px,
         )
         if result.status in {"closed", "already_flat"}:
             self.db.close_copy(copy.investment_base_id)

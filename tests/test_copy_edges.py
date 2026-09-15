@@ -45,7 +45,7 @@ class _FakeTrader:
     def mid_price(self, coin: str) -> float:
         return self._mid
 
-    def refresh_book(self) -> None:
+    def refresh_book(self, *, fills_since_ms: int | None = None) -> None:
         """Ghost reconcile re-reads the book before trusting a flat result."""
         return None
 

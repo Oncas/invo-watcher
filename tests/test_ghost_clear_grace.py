@@ -33,7 +33,7 @@ class _FakeTrader:
         self._after = held_after_refresh
         self.refreshed = 0
 
-    def refresh_book(self) -> None:
+    def refresh_book(self, *, fills_since_ms: int | None = None) -> None:
         self.refreshed += 1
         if self._after is not None:
             self._held = self._after
@@ -134,7 +134,7 @@ def test_hl_read_failure_clears_nothing(tmp_path):
     """A failed HL read must never be mistaken for a flat book."""
 
     class _Broken(_FakeTrader):
-        def refresh_book(self) -> None:
+        def refresh_book(self, *, fills_since_ms: int | None = None) -> None:
             raise RuntimeError("HL unreachable")
 
     age = GHOST_CLEAR_GRACE_SECONDS + 30.0

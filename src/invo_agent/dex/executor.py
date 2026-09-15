@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from rich.console import Console
@@ -23,6 +23,7 @@ from invo_agent.dex.cloid import (
 from invo_agent.dex.hl_trader import (
     TPSL_UNCHANGED,
     GhostCopyError,
+    HlFill,
     HlTrader,
     HlTraderError,
     InsufficientMarginError,
@@ -73,6 +74,64 @@ def _copy_age_seconds(copy: OpenCopy, *, now: datetime | None = None) -> float |
     if opened.tzinfo is None:
         opened = opened.replace(tzinfo=UTC)
     return ((now or datetime.now(UTC)) - opened).total_seconds()
+
+
+@dataclass(frozen=True)
+class GhostExit:
+    """What actually closed a position we only ever saw go flat.
+
+    A parked TP/SL fills on the exchange, not through us, so the first the agent
+    hears of it is an empty book. Without attributing that flat read to the fills
+    behind it the row is deleted with no exit price and no PnL, and the trade
+    leaves no record at all.
+    """
+
+    px: float
+    sz: float
+    closed_pnl: float | None
+    at_ms: int
+
+
+def _attribute_ghost_exit(
+    copy: OpenCopy,
+    coin: str,
+    fills: list[HlFill],
+) -> GhostExit | None:
+    """Weighted exit across the fills that flattened ``copy``, if any are ours."""
+    side = (copy.side or "").lower()
+    if side not in {"long", "short"}:
+        return None
+    # A long is closed by a sell, a short by a buy.
+    closing_side = "A" if side == "long" else "B"
+    opened_ms: int | None = None
+    if copy.opened_at:
+        try:
+            opened = datetime.fromisoformat(copy.opened_at)
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=UTC)
+            opened_ms = int(opened.timestamp() * 1000)
+        except ValueError:
+            opened_ms = None
+    ours = [
+        f
+        for f in fills
+        if f.coin == coin
+        and f.side == closing_side
+        and (opened_ms is None or f.time_ms >= opened_ms)
+    ]
+    if not ours:
+        return None
+    total_sz = sum(f.sz for f in ours)
+    if total_sz <= 0:
+        return None
+    px = sum(f.px * f.sz for f in ours) / total_sz
+    pnls = [f.closed_pnl for f in ours if f.closed_pnl is not None]
+    return GhostExit(
+        px=px,
+        sz=total_sz,
+        closed_pnl=sum(pnls) if pnls else None,
+        at_ms=max(f.time_ms for f in ours),
+    )
 
 
 @dataclass(frozen=True)
@@ -1463,7 +1522,46 @@ class DexExecutor:
     def _should_increase_size(self, inv: InvestmentUpdate) -> bool:
         return self._size_direction(inv) == "up"
 
-    def _clear_ghost_copy(self, copy: OpenCopy, *, coin: str, reason: str) -> None:
+    def _clear_ghost_copy(
+        self,
+        copy: OpenCopy,
+        *,
+        coin: str,
+        reason: str,
+        exit_fill: GhostExit | None = None,
+    ) -> None:
+        if exit_fill is not None:
+            # The row is about to go. Write the exit down first, or the trade
+            # leaves no price and no PnL behind it anywhere.
+            log_event(
+                "ghost_close_recorded",
+                coin=coin,
+                base_id=copy.investment_base_id,
+                base_short_id=copy.base_short_id,
+                side=copy.side,
+                our_entry_px=copy.our_entry_px,
+                exit_px=exit_fill.px,
+                sz=exit_fill.sz,
+                closed_pnl=exit_fill.closed_pnl,
+                via="exchange_fill",
+                parked_tp=copy.recovery_tp if copy.recovery_pending else None,
+                parked_sl=copy.recovery_sl if copy.recovery_pending else None,
+            )
+            if self.db is not None:
+                pnl = (
+                    f" pnl={exit_fill.closed_pnl:+.4f}"
+                    if exit_fill.closed_pnl is not None
+                    else ""
+                )
+                self.db.log_action(
+                    action="GHOST_CLOSE",
+                    summary=(
+                        f"GHOST close {coin} sz={exit_fill.sz:g} "
+                        f"exit={exit_fill.px:g}{pnl}"
+                    ),
+                    notification_id=None,
+                    dry_run=False,
+                )
         if self.db is not None:
             self.db.close_copy(copy.investment_base_id)
         console.print(
@@ -1471,11 +1569,12 @@ class DexExecutor:
             f"({reason})[/yellow]"
         )
         logger.info(
-            "ghost clear coin=%s base_id=%s shortId=%s reason=%s",
+            "ghost clear coin=%s base_id=%s shortId=%s reason=%s exit=%s",
             coin,
             copy.investment_base_id,
             copy.base_short_id,
             reason,
+            f"{exit_fill.px:g}" if exit_fill is not None else "unattributed",
         )
         log_event(
             "ghost_clear",
@@ -1483,24 +1582,57 @@ class DexExecutor:
             base_id=copy.investment_base_id,
             base_short_id=copy.base_short_id,
             reason=reason,
+            exit_attributed=exit_fill is not None,
         )
+
+    @staticmethod
+    def _ghost_fills_since_ms(
+        copies: list[OpenCopy], *, max_lookback_hours: float = 24.0
+    ) -> int:
+        """Oldest of ``copies``, floored at ``max_lookback_hours``.
+
+        Wide enough to cover a position parked overnight, bounded so the fills
+        query stays one cheap read rather than the whole account history.
+        """
+        now = datetime.now(UTC)
+        floor = now - timedelta(hours=max_lookback_hours)
+        oldest = now
+        for copy in copies:
+            if not copy.opened_at:
+                continue
+            try:
+                opened = datetime.fromisoformat(copy.opened_at)
+            except ValueError:
+                continue
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=UTC)
+            oldest = min(oldest, opened)
+        return int(max(oldest, floor).timestamp() * 1000)
 
     def reconcile_ghost_copies(self, trader: HlTrader) -> list[str]:
         """Drop open_copies whose coin is flat on HL. Empty held set is OK."""
         if self.db is None:
             return []
+        copies = self.db.list_open_copies()
+        if not copies:
+            return []
+        # Ask for fills alongside the book so a position that went flat on a
+        # parked trigger can be attributed to the fill that closed it.
+        since_ms = self._ghost_fills_since_ms(copies)
+        book = None
         try:
             # Never judge "flat" from the cached book. A resting order that
             # filled seconds ago is absent from a snapshot taken before the
             # fill, and clearing on that reads as "we never opened this".
-            trader.refresh_book()
+            book = trader.refresh_book(fills_since_ms=since_ms)
             held = trader.open_coins()
         except Exception as exc:  # noqa: BLE001
             logger.warning("ghost reconcile skipped (HL read failed): %s", exc)
             return []
         cleared: list[str] = []
         now = datetime.now(UTC)
-        for copy in self.db.list_open_copies():
+        fills = book.fills if book is not None else []
+        for copy in copies:
             coin = (copy.ticker or "").upper()
             if not coin or coin in held:
                 continue
@@ -1524,7 +1656,12 @@ class DexExecutor:
                     grace_seconds=GHOST_CLEAR_GRACE_SECONDS,
                 )
                 continue
-            self._clear_ghost_copy(copy, coin=coin, reason="poll_flat")
+            self._clear_ghost_copy(
+                copy,
+                coin=coin,
+                reason="poll_flat",
+                exit_fill=_attribute_ghost_exit(copy, coin, fills),
+            )
             cleared.append(coin)
         return cleared
 
@@ -2196,6 +2333,7 @@ class DexExecutor:
             else None,
             notification_id=None,
             our_entry_px=entry_px,
+            trader_entry_px=inv.entry_price,
             side="long" if is_long else "short",
             size=fill_sz,
             leverage=float(leverage),
@@ -2225,6 +2363,7 @@ class DexExecutor:
         parked_tp: float | None = None,
         parked_sl: float | None = None,
         our_leverage: float | None = None,
+        trader_entry_at_copy: float | None = None,
     ) -> RecoveryResult:
         """Flatten or park TP/SL after detecting Involio closed while we were offline."""
         coin = coin.upper()
@@ -2277,7 +2416,7 @@ class DexExecutor:
                     our_entry=float(entry),
                     mid=mid,
                     is_long=is_long,
-                    trader_entry=inv.entry_price,
+                    trader_entry=trader_entry_at_copy or inv.entry_price,
                     trader_close=inv.closing_price,
                     recovery_sl_pct=self.settings.recovery_sl_pct,
                     leverage=max(1, int(our_leverage or 1)),
@@ -2385,7 +2524,7 @@ class DexExecutor:
             our_entry=entry,
             mid=mid,
             is_long=is_long,
-            trader_entry=inv.entry_price,
+            trader_entry=trader_entry_at_copy or inv.entry_price,
             trader_close=inv.closing_price,
             recovery_sl_pct=self.settings.recovery_sl_pct,
             leverage=lev,
@@ -2449,6 +2588,8 @@ class DexExecutor:
             our_pnl_pct=decision.our_pnl_pct,
             trader_pnl_pct=decision.trader_pnl_pct,
             trader_closing_px=inv.closing_price,
+            trader_entry_used=trader_entry_at_copy or inv.entry_price,
+            trader_entry_basis="copy" if trader_entry_at_copy else "live",
             base_id=str(inv.base_id) if inv.base_id else None,
             close_sz=sz,
             hl_sz=hl_sz,

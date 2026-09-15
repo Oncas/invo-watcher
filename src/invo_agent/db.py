@@ -22,6 +22,7 @@ class OpenCopy:
     opened_at: str
     last_notification_id: str | None
     our_entry_px: float | None = None
+    trader_entry_px: float | None = None
     side: str | None = None
     size: float | None = None
     leverage: float | None = None
@@ -98,6 +99,7 @@ class ActionLogRow:
 
 _OPEN_COPY_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("our_entry_px", "REAL"),
+    ("trader_entry_px", "REAL"),
     ("side", "TEXT"),
     ("size", "REAL"),
     ("leverage", "REAL"),
@@ -453,6 +455,7 @@ class AgentDB:
         portfolio_id: str | None,
         notification_id: str | None,
         our_entry_px: float | None = None,
+        trader_entry_px: float | None = None,
         side: str | None = None,
         size: float | None = None,
         leverage: float | None = None,
@@ -476,12 +479,12 @@ class AgentDB:
             INSERT OR REPLACE INTO open_copies (
                 investment_base_id, base_short_id, ticker, portfolio_id,
                 opened_at, last_notification_id,
-                our_entry_px, side, size, leverage,
+                our_entry_px, trader_entry_px, side, size, leverage,
                 recovery_pending, recovery_tp, recovery_sl, trader_closing_px,
                 pending_add_notional, trader,
                 pending_add_entry, pending_add_at, pending_add_tried_at,
                 pending_add_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 investment_base_id,
@@ -495,6 +498,7 @@ class AgentDB:
                 opened_at,
                 notification_id,
                 _keep(our_entry_px, "our_entry_px"),
+                _keep(trader_entry_px, "trader_entry_px"),
                 _keep(side, "side"),
                 _keep(size, "size"),
                 _keep(leverage, "leverage"),
@@ -597,6 +601,7 @@ class AgentDB:
             opened_at=row["opened_at"],
             last_notification_id=row["last_notification_id"],
             our_entry_px=row["our_entry_px"] if "our_entry_px" in keys else None,
+            trader_entry_px=row["trader_entry_px"] if "trader_entry_px" in keys else None,
             side=row["side"] if "side" in keys else None,
             size=row["size"] if "size" in keys else None,
             leverage=row["leverage"] if "leverage" in keys else None,
