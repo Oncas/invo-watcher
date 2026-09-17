@@ -269,6 +269,15 @@ def extract_avg_px(hl_resp: dict[str, Any] | None) -> float | None:
     return None
 
 
+def min_notional_message(error: str) -> bool:
+    """True for HL's floor on order value ("Order must have minimum value of $10").
+
+    The reject is recoverable: the clip was too small, not wrong. Callers keep
+    it queued so a later drain can send it fattened.
+    """
+    return "minimum value" in error.lower()
+
+
 def ioc_unfilled_message(error: str) -> bool:
     msg = error.lower()
     return (

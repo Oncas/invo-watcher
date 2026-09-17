@@ -7,6 +7,7 @@ from invo_agent.config import Settings
 from invo_agent.db import AgentDB, PendingIntent
 from invo_agent.dex.budget import BudgetDeniedError
 from invo_agent.dex.executor import DexExecutor
+from invo_agent.dex.pricing import min_notional_target
 from invo_agent.poller import NotificationPoller
 
 
@@ -916,4 +917,121 @@ def test_should_attempt_queued_local_or_fallback(tmp_path) -> None:
     assert poller._should_attempt_queued(
         reason="margin", last_tried_at=stale, local_ok=False
     )
+    db.close()
+
+
+def _min_value_reject(*args, **kwargs):
+    return (
+        {},
+        {
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [
+                        {"error": "Order must have minimum value of $10. asset=163"}
+                    ]
+                },
+            },
+        },
+        1,
+    )
+
+
+def _small_add_inv(base_id):
+    """A scale-in worth ~10% of the clip we already hold — under HL's floor."""
+    return InvestmentUpdate.model_validate(
+        {
+            "baseId": str(base_id),
+            "baseShortId": "adaShort",
+            "ticker": "ADA",
+            "directionLong": True,
+            "leverage": 10,
+            "entrySize": 4.0,
+            "entryPrice": 0.20,
+            "changes": {"simDifference": 1.0, "entrySim": 10.0},
+        }
+    )
+
+
+def _open_copy_for_add(db, base_id) -> None:
+    db.upsert_open_copy(
+        investment_base_id=str(base_id),
+        base_short_id="adaShort",
+        ticker="ADA",
+        portfolio_id=None,
+        notification_id="n1",
+        side="long",
+        size=80.0,
+        leverage=10,
+        trader="alpha_trader",
+    )
+
+
+def test_size_increase_min_notional_reject_keeps_add_queued(tmp_path) -> None:
+    """HL rejecting the clip must not drop the trader's scale-in.
+
+    The reject used to raise, log ERROR_UPDATE and lose the leg, so the copy
+    stopped averaging down with the trader and carried the older, worse entry.
+    """
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=False,
+        dry_run=True,
+        hl_min_order_usd=10.0,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    _open_copy_for_add(db, base_id)
+    exe = DexExecutor(settings, db=db)
+    trader = _FakeTrader(mid=0.20, available=50.0)
+    trader.market_order = _min_value_reject  # type: ignore[method-assign]
+
+    sz, sub = exe._apply_size_increase(
+        trader,  # type: ignore[arg-type]
+        inv=_small_add_inv(base_id),
+        coin="ADA",
+        is_long=True,
+        current_sz=80.0,
+        equity=100.0,
+    )
+
+    assert sub is None
+    assert sz == 80.0
+    copy = db.get_open_copy(str(base_id))
+    assert copy is not None
+    assert copy.pending_add_notional >= 10.0
+    assert copy.pending_add_reason == "below_hl_min"
+    db.close()
+
+
+def test_small_add_is_sized_over_hl_floor(tmp_path) -> None:
+    """A sub-floor add is fattened past the floor, not sent sitting on it."""
+    settings = Settings(
+        db_path=tmp_path / "agent.db",
+        session_path=tmp_path / "session.json",
+        live=False,
+        dry_run=True,
+        hl_min_order_usd=10.0,
+    )
+    db = AgentDB(settings.db_path)
+    base_id = uuid4()
+    _open_copy_for_add(db, base_id)
+    exe = DexExecutor(settings, db=db)
+    trader = _FakeTrader(mid=0.20, available=50.0)
+
+    sz, sub = exe._apply_size_increase(
+        trader,  # type: ignore[arg-type]
+        inv=_small_add_inv(base_id),
+        coin="ADA",
+        is_long=True,
+        current_sz=80.0,
+        equity=100.0,
+    )
+
+    assert trader.orders, "the add must be sent, not queued"
+    add_sz = float(trader.orders[-1]["sz"])
+    assert add_sz * 0.20 >= min_notional_target(10.0)
+    assert sz > 80.0
     db.close()

@@ -40,6 +40,7 @@ from invo_agent.dex.pricing import (
     extract_avg_px,
     fill_gaps,
     ioc_unfilled_message,
+    min_notional_message,
     min_notional_target,
     price_is_at_or_better,
     size_clearing_min_notional,
@@ -1724,14 +1725,17 @@ class DexExecutor:
         available = trader.available_margin()
         lev = max(1, leverage)
         buyable = available * 0.98 * lev
+        # Aim over HL's floor, not at it — sizing the add to exactly $10 is what
+        # came back "Order must have minimum value of $10" and lost the leg.
+        floor_target = min_notional_target(hl_min)
         if need + 1e-9 < hl_min:
             accumulated = need
             if accumulated <= 1e-9:
                 if self.db is not None and inv.base_id is not None:
                     self.db.set_pending_add_notional(str(inv.base_id), 0.0)
                 return current_sz, None
-            if buyable + 1e-9 >= hl_min:
-                need = hl_min
+            if buyable + 1e-9 >= floor_target:
+                need = floor_target
             else:
                 self._stash_pending_add(
                     inv, accumulated, reason="margin", entry=trader_entry
@@ -1798,7 +1802,7 @@ class DexExecutor:
             return current_sz, None
 
         add_sz = self._sz_for_notional(
-            trader, coin, delta_notional, mid, hl_min
+            trader, coin, delta_notional, mid, floor_target
         )
         if add_sz <= 0:
             return current_sz, None
@@ -1886,6 +1890,25 @@ class DexExecutor:
                     reason="rate_limited",
                     error=str(exc),
                     pending_add_notional=need,
+                )
+                return current_sz, None
+            if min_notional_message(msg):
+                # The clip was under HL's floor, so the trader's scale-in is still
+                # owed. Queue it rather than raising: ERROR_UPDATE dropped the leg
+                # and left us averaging down a scale-in behind the trader.
+                self._stash_pending_add(
+                    inv,
+                    max(need, floor_target),
+                    reason="below_hl_min",
+                    entry=trader_entry,
+                )
+                log_event_throttled(
+                    "size_increase_skip",
+                    key=f"{coin}:min_notional",
+                    coin=coin,
+                    reason="min_notional",
+                    error=str(exc),
+                    pending_add_notional=max(need, floor_target),
                 )
                 return current_sz, None
             raise

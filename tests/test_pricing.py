@@ -2,6 +2,7 @@ from invo_agent.dex.pricing import (
     extract_avg_px,
     fill_gaps,
     ioc_unfilled_message,
+    min_notional_message,
     min_notional_target,
     plan_resting_adopt,
     price_is_at_or_better,
@@ -120,3 +121,17 @@ def test_btc_40x_clip_survives_lot_rounding() -> None:
         sz_decimals=5,
     )
     assert sz * mid > 11.0
+
+
+def test_min_notional_reject_is_recognised() -> None:
+    """HL's floor reject is recoverable — the caller queues instead of raising."""
+    assert min_notional_message(
+        "HL size_increase order error: Order must have minimum value of $10. asset=163"
+    )
+    assert min_notional_message("Order must have minimum value of $10")
+
+
+def test_unrelated_rejects_are_not_min_notional() -> None:
+    assert not min_notional_message("Insufficient margin to place order")
+    assert not min_notional_message("Too many cumulative requests sent")
+    assert not min_notional_message("")
