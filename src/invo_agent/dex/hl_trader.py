@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -277,6 +278,17 @@ class HlFill:
     closed_pnl: float | None = None
 
 
+def asset_name_index(names: Iterable[str]) -> dict[str, str]:
+    """Upper-cased ticker → HL's own spelling of it.
+
+    Involio tickers reach the executor upper-cased, but HL's universe keeps the
+    lower-case k on its 1000x markets (kPEPE, kBONK, kSHIB). Asking the exchange
+    for "KPEPE" raised KeyError on every retry and the copy never left the queue.
+    Perps are declared after spot, so a collision resolves to the perp.
+    """
+    return {str(name).upper(): str(name) for name in names}
+
+
 @dataclass(frozen=True)
 class HlPosition:
     """One open HL position, as reported by ``user_state``."""
@@ -353,6 +365,8 @@ class HlTrader:
         self.info = Info(self.base_url, skip_ws=True)
         self._http = httpx.Client(timeout=30.0)
         self._book: HlBookSnapshot | None = None
+        # Built once from HL's universe; see asset_name_index.
+        self._asset_names: dict[str, str] | None = None
         # coin → (leverage, monotonic_ts). Fed from snapshot + our writes.
         self._leverage: dict[str, tuple[int, float]] = {}
 
@@ -546,8 +560,15 @@ class HlTrader:
         """
         return float(self._ensure_book().available)
 
+    def hl_asset_name(self, coin: str) -> str:
+        """The name HL published for ``coin``, matched without case."""
+        if self._asset_names is None:
+            names = getattr(self.info, "name_to_coin", None) or self.info.coin_to_asset
+            self._asset_names = asset_name_index(names)
+        return self._asset_names.get(coin.upper(), coin)
+
     def asset_index(self, coin: str) -> int:
-        return int(self.info.name_to_asset(coin))
+        return int(self.info.name_to_asset(self.hl_asset_name(coin)))
 
     def mid_price(self, coin: str) -> float:
         book = self._ensure_book()
