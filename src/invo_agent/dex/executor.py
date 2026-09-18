@@ -7,7 +7,7 @@ from typing import Any
 
 from rich.console import Console
 
-from invo_agent.api.client import InvolioClient
+from invo_agent.api.client import InvolioClient, api_error_detail
 from invo_agent.api.models import ActionType, InvestmentUpdate, TradeAction
 from invo_agent.config import Settings
 from invo_agent.db import AgentDB, OpenCopy
@@ -960,12 +960,13 @@ class DexExecutor:
                 f"[yellow]mimic/copy attribution failed after HL open "
                 f"(ignored, same as app):[/yellow] {exc}"
             )
-            logger.warning("OPEN mimic/copy failed after HL success coin=%s: %s", coin, exc)
+            detail = api_error_detail(exc)
+            logger.warning("OPEN mimic/copy failed after HL success coin=%s: %s", coin, detail)
             log_event(
                 "open_recorded",
                 via="hl_only",
                 coin=coin,
-                error=str(exc),
+                error=detail,
                 cloid=entry_cloid.to_raw() if entry_cloid else None,
             )
 
@@ -1231,14 +1232,15 @@ class DexExecutor:
             console.print(
                 f"[yellow]UPDATE mimic/copy failed (ignored — HL position kept):[/yellow] {exc}"
             )
-            logger.warning("UPDATE mimic/copy failed coin=%s: %s", coin, exc)
+            detail = api_error_detail(exc)
+            logger.warning("UPDATE mimic/copy failed coin=%s: %s", coin, detail)
             log_event(
                 "update_recorded",
                 via="hl_only",
                 coin=coin,
                 sz=sz,
                 update_type=update_type,
-                error=str(exc),
+                error=detail,
             )
 
         tags = update_labels(inv)
@@ -1408,7 +1410,7 @@ class DexExecutor:
                 console.print(
                     f"[yellow]mimic/copy close failed, trying position/close:[/yellow] {exc}"
                 )
-                logger.warning("mimic/copy close failed: %s", exc)
+                logger.warning("mimic/copy close failed: %s", api_error_detail(exc))
 
         body: dict[str, Any] = {
             "clientTxId": client_tx,
@@ -1433,15 +1435,16 @@ class DexExecutor:
                 f"[yellow]Involio close record failed (HL already flat — OK for "
                 f"older self-opened positions):[/yellow] {exc}"
             )
+            detail = api_error_detail(exc)
             logger.warning(
-                "CLOSE Involio record failed after HL success coin=%s: %s", coin, exc
+                "CLOSE Involio record failed after HL success coin=%s: %s", coin, detail
             )
             log_event(
                 "close_recorded",
                 via="hl_only",
                 coin=coin,
                 sz=sz,
-                error=str(exc),
+                error=detail,
             )
 
     def _get_tracked_copy(self, inv: InvestmentUpdate | None) -> OpenCopy | None:
@@ -2776,7 +2779,9 @@ class DexExecutor:
                 )
                 return
             except Exception as exc:  # noqa: BLE001
-                logger.warning("recovery mimic/copy close failed: %s", exc)
+                logger.warning(
+                    "recovery mimic/copy close failed: %s", api_error_detail(exc)
+                )
         body: dict[str, Any] = {
             "clientTxId": client_tx,
             "coin": coin,
@@ -2797,16 +2802,17 @@ class DexExecutor:
                 response=recorded,
             )
         except Exception as exc:  # noqa: BLE001
+            detail = api_error_detail(exc)
             logger.warning(
                 "recovery Involio close record failed after HL success coin=%s: %s",
                 coin,
-                exc,
+                detail,
             )
             log_event(
                 "recovery_close_recorded",
                 via="hl_only",
                 coin=coin,
-                error=str(exc),
+                error=detail,
             )
 
     def _mimic_copy(

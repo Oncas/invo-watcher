@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json as jsonlib
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -35,6 +36,33 @@ class InvolioAPIError(RuntimeError):
         self.status_code = status_code
         self.body = body
         self.retry_after = retry_after
+
+
+_ERROR_DETAIL_MAX = 1000
+
+
+def api_error_detail(exc: BaseException) -> str:
+    """Render an exception together with whatever the server sent back.
+
+    ``str(exc)`` on an :class:`InvolioAPIError` is only the status line, which
+    says a call was rejected but never why. The body holds the reason, so log
+    sites that record a failure use this instead.
+    """
+    message = str(exc)
+    body = getattr(exc, "body", None)
+    if body is None or body == "":
+        return message
+    if isinstance(body, str):
+        rendered = body
+    else:
+        try:
+            rendered = jsonlib.dumps(body, separators=(",", ":"))
+        except (TypeError, ValueError):
+            rendered = repr(body)
+    detail = f"{message}: {rendered}"
+    if len(detail) > _ERROR_DETAIL_MAX:
+        detail = detail[: _ERROR_DETAIL_MAX - 1] + "…"
+    return detail
 
 
 class InvolioClient:
