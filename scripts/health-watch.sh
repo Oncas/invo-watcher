@@ -91,31 +91,79 @@ tail_log() {
     [[ -f "$AGENT_LOG" ]] && { echo; echo "--- last 20 lines of $AGENT_LOG ---"; tail -n 20 "$AGENT_LOG"; }
 }
 
-# Byte offsets, so rotation (size shrinks) is detected instead of replaying the
-# whole file as "new".
+# Byte offsets, so an append costs one tail instead of a re-scan. Two different
+# things make the size drop, and they need opposite handling:
+#
+#   logrotate  -- a genuinely new file; everything in it is new
+#   log prune  -- logging_setup.py::_trim keeps the last cap_bytes of the SAME
+#                 file, so what survives is content already read
+#
+# Treating a trim as a rotation replays the whole retained tail: one routine
+# "log prune trimmed=1" then reports every historical live_error as fresh.
+# The last line consumed tells them apart -- still there means a trim, so
+# resume just after it; gone means a new file, so read from the start.
 size_of() { [[ -f "$1" ]] && wc -c <"$1" || echo 0; }
 
-# Reads bytes appended since offset $2 into $FRESH, and leaves the new offset in
-# $OFFSET for the caller to store.
+# Reads bytes appended since offset $2 into $FRESH, using $3 as the resume
+# marker, and leaves the new offset in $OFFSET and the new marker in $LAST_LINE.
 FRESH=""
 OFFSET=0
+LAST_LINE=""
 read_new() {
-    local path="$1" prev="$2"
+    local path="$1" prev="$2" marker="$3" hit
     OFFSET="$(size_of "$path")"
-    if [[ "$OFFSET" -lt "$prev" ]]; then prev=0; fi   # rotated
+    if [[ "$OFFSET" -lt "$prev" ]]; then
+        prev=0
+        if [[ -n "$marker" ]]; then
+            hit="$(grep -Fxb -- "$marker" "$path" 2>/dev/null | tail -n1 | cut -d: -f1)"
+            if [[ -n "$hit" ]]; then
+                prev=$(( hit + $(printf '%s\n' "$marker" | wc -c) ))
+                [[ "$prev" -gt "$OFFSET" ]] && prev="$OFFSET"
+            fi
+        fi
+    fi
     if [[ "$OFFSET" -gt "$prev" ]]; then
         FRESH="$(tail -c "+$((prev + 1))" "$path")"
+        LAST_LINE="$(tail -n1 <<<"$FRESH")"
     else
         FRESH=""
     fi
 }
 
+# Second line of defence: nothing stamped before we armed is news, whatever the
+# offsets say. Both files timestamp in UTC with fixed-width fields, so a string
+# compare is an ordering compare. Lines carrying no timestamp (traceback
+# continuations) are kept rather than silently dropped.
+since_armed_events() {
+    awk -v cut="$STARTED_TS" '
+        match($0, /"ts": "[^"]+"/) {
+            ts = substr($0, RSTART + 7, RLENGTH - 8)
+            if (ts > cut) print
+            next
+        }
+        { print }
+    '
+}
+since_armed_log() {
+    awk -v cut="$STARTED_LOG" '
+        /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] / {
+            if (substr($0, 1, 19) > cut) print
+            next
+        }
+        { print }
+    '
+}
+
 trap 'echo "health-watch: stopped"; exit 0' INT TERM
 
 log_size="$(size_of "$AGENT_LOG")"
+log_marker=""
 events_size="$(size_of "$EVENTS_LOG")"
+events_marker=""
 misses=0
 started="$(date -Is)"
+STARTED_TS="$(date -u +%Y-%m-%dT%H:%M:%S)"
+STARTED_LOG="$(date -u '+%Y-%m-%d %H:%M:%S')"
 
 echo "health-watch: armed at $started -> $HEALTH_URL (every ${INTERVAL}s, trip after ${FAILS} misses)" >&2
 echo "health-watch: logs $LOG_DIR" >&2
@@ -156,9 +204,9 @@ while true; do
     esac
 
     if [[ -f "$AGENT_LOG" ]]; then
-        read_new "$AGENT_LOG" "$log_size"
-        log_size="$OFFSET"
-        if hits="$(grep -E "$LOG_ERROR_RE" <<<"$FRESH")" && [[ -n "$hits" ]]; then
+        read_new "$AGENT_LOG" "$log_size" "$log_marker"
+        log_size="$OFFSET"; log_marker="$LAST_LINE"
+        if hits="$(grep -E "$LOG_ERROR_RE" <<<"$FRESH" | since_armed_log)" && [[ -n "$hits" ]]; then
             echo "LOG ERROR: new error lines in $AGENT_LOG"
             echo "watch armed at $started, tripped at $(date -Is)"
             echo "$hits" | head -n 40
@@ -168,9 +216,9 @@ while true; do
     fi
 
     if [[ -f "$EVENTS_LOG" ]]; then
-        read_new "$EVENTS_LOG" "$events_size"
-        events_size="$OFFSET"
-        if hits="$(grep -E "\"($EVENT_ERROR_KINDS)\"" <<<"$FRESH")" && [[ -n "$hits" ]]; then
+        read_new "$EVENTS_LOG" "$events_size" "$events_marker"
+        events_size="$OFFSET"; events_marker="$LAST_LINE"
+        if hits="$(grep -E "\"($EVENT_ERROR_KINDS)\"" <<<"$FRESH" | since_armed_events)" && [[ -n "$hits" ]]; then
             echo "EVENT ERROR: the agent recorded a failure event"
             echo "watch armed at $started, tripped at $(date -Is)"
             echo "$hits" | head -n 20
