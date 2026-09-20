@@ -47,3 +47,4 @@ htmlcov/
 
 # Local make overrides (VPS_HOST etc.)
 Makefile.local
+.venv-linux/

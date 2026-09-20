@@ -7,8 +7,12 @@
 
 SHELL := /bin/bash
 
-# Windows venvs put entry points in Scripts/, POSIX ones in bin/.
-VENV_BIN := $(if $(wildcard .venv/Scripts/invo-agent.exe),.venv/Scripts,.venv/bin)
+# Windows venvs put entry points in Scripts/, POSIX ones in bin/. A checkout
+# shared between the two can carry both, so a native .venv-linux wins when the
+# Windows .venv/Scripts is present but unrunnable here.
+VENV_BIN := $(strip \
+  $(if $(wildcard .venv-linux/bin/python),.venv-linux/bin,\
+  $(if $(wildcard .venv/Scripts/invo-agent.exe),.venv/Scripts,.venv/bin)))
 INVO     := $(VENV_BIN)/invo-agent
 
 # On the VPS the config is /etc/invo-agent.env and must be exported by hand.
