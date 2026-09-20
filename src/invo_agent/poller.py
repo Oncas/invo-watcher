@@ -2540,7 +2540,9 @@ class NotificationPoller:
             return
         self._last_log_prune = now
         try:
-            stats = prune_logs(self.settings.log_dir)
+            stats = prune_logs(
+                self.settings.log_dir, retain_days=self.settings.log_retain_days
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("log prune failed: %s", exc)
             return

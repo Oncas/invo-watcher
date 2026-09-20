@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 import shutil
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import TextIO
 
-from invo_agent.events import configure_events
+from invo_agent.events import configure_events, today_stamp
 
 # Live files stay small; dated history is deleted after this many days.
 LOG_RETAIN_DAYS = 7
@@ -22,12 +24,68 @@ class _FlushFileHandler(logging.FileHandler):
         self.flush()
 
 
+class DatedFileHandler(logging.Handler):
+    """Append to ``history/<today>.log``, following the date across midnight.
+
+    ``TimedRotatingFileHandler`` cannot do this: it keeps one fixed filename and
+    *renames* it on rollover, so the live file would be ``agent-daily.log`` and
+    the archive ``agent-daily.log.2026-09-19``. The sync depends on the opposite
+    — a file named for its own day, closed for good once that day ends, which is
+    what makes "already present locally" a safe reason to skip it.
+    """
+
+    def __init__(
+        self,
+        history_dir: Path,
+        *,
+        suffix: str = ".log",
+        now: Callable[[], datetime] | None = None,
+    ):
+        super().__init__()
+        self.history_dir = Path(history_dir).expanduser()
+        self.history_dir.mkdir(parents=True, exist_ok=True)
+        self.suffix = suffix
+        self._now = now or datetime.now
+        self._day: str | None = None
+        self._stream: TextIO | None = None
+
+    def _target(self, day: str) -> Path:
+        return self.history_dir / f"{day}{self.suffix}"
+
+    def _stream_for(self, day: str) -> TextIO:
+        if self._day == day and self._stream is not None:
+            return self._stream
+        if self._stream is not None:
+            self._stream.close()
+        # Always append: a restart within the same day must not truncate it.
+        self._stream = self._target(day).open("a", encoding="utf-8")
+        self._day = day
+        return self._stream
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            stream = self._stream_for(self._now().strftime("%Y-%m-%d"))
+            stream.write(self.format(record) + "\n")
+            stream.flush()
+        except Exception:
+            self.handleError(record)
+
+    def close(self) -> None:
+        try:
+            if self._stream is not None:
+                self._stream.close()
+                self._stream = None
+                self._day = None
+        finally:
+            super().close()
+
+
 def setup_logging(log_dir: Path, *, level: str = "INFO") -> Path:
     """Configure console + append-only file logging. Returns agent.log path.
 
     Writes to:
       - log_dir/agent.log              (rotating, long-lived)
-      - log_dir/history/YYYY-MM-DD.log (daily archive; pruned after 7 days)
+      - log_dir/history/YYYY-MM-DD.log (daily archive; pruned by retain_days)
     Events go to events.jsonl + history/YYYY-MM-DD.events.jsonl
     """
     log_dir = log_dir.expanduser()
@@ -35,11 +93,11 @@ def setup_logging(log_dir: Path, *, level: str = "INFO") -> Path:
     history_dir = log_dir / "history"
     history_dir.mkdir(parents=True, exist_ok=True)
 
-    day = datetime.now().strftime("%Y-%m-%d")
     log_path = log_dir / "agent.log"
-    daily_path = history_dir / f"{day}.log"
 
-    configure_events(log_dir, daily_path=history_dir / f"{day}.events.jsonl")
+    # No dated path is pinned here: both sinks resolve today's file per write,
+    # so a process that outlives midnight rolls over on its own.
+    configure_events(log_dir)
 
     root = logging.getLogger()
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
@@ -62,8 +120,8 @@ def setup_logging(log_dir: Path, *, level: str = "INFO") -> Path:
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
 
-    # Immutable-ish daily archive — always append, never rotated.
-    daily = _FlushFileHandler(daily_path, mode="a", encoding="utf-8")
+    # Dated archive: one file per day, closed for good when the day ends.
+    daily = DatedFileHandler(history_dir)
     daily.setFormatter(fmt)
     root.addHandler(daily)
 
@@ -77,7 +135,7 @@ def setup_logging(log_dir: Path, *, level: str = "INFO") -> Path:
     logging.getLogger(__name__).info(
         "logging ready agent=%s daily=%s events=%s level=%s",
         log_path,
-        daily_path,
+        history_dir / f"{today_stamp()}.log",
         log_dir / "events.jsonl",
         level.upper(),
     )

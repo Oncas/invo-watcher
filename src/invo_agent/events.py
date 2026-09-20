@@ -10,13 +10,29 @@ from typing import Any
 _lock = threading.Lock()
 _path: Path | None = None
 _daily_path: Path | None = None
+_history_dir: Path | None = None
 _throttle: dict[str, float] = {}
 _THROTTLE_S = 900.0
 
 
+def _now() -> datetime:
+    """Wall clock, indirected so the midnight rollover is testable."""
+    return datetime.now()
+
+
+def today_stamp() -> str:
+    """Local date, matching the dated log filenames the agent already writes."""
+    return _now().strftime("%Y-%m-%d")
+
+
 def configure_events(log_dir: Path, *, daily_path: Path | None = None) -> Path:
-    """Set JSONL event log paths. Always append — never truncate."""
-    global _path, _daily_path
+    """Set JSONL event log paths. Always append — never truncate.
+
+    Without an explicit ``daily_path`` the dated file is resolved per append,
+    so a process that runs past midnight starts a new day's file instead of
+    growing yesterday's for ever.
+    """
+    global _path, _daily_path, _history_dir
     log_dir = log_dir.expanduser()
     log_dir.mkdir(parents=True, exist_ok=True)
     _path = log_dir / "events.jsonl"
@@ -24,12 +40,21 @@ def configure_events(log_dir: Path, *, daily_path: Path | None = None) -> Path:
         daily_path = daily_path.expanduser()
         daily_path.parent.mkdir(parents=True, exist_ok=True)
         _daily_path = daily_path
+        _history_dir = None
     else:
-        day = datetime.now(UTC).strftime("%Y-%m-%d")
-        hist = log_dir / "history"
-        hist.mkdir(parents=True, exist_ok=True)
-        _daily_path = hist / f"{day}.events.jsonl"
+        _daily_path = None
+        _history_dir = log_dir / "history"
+        _history_dir.mkdir(parents=True, exist_ok=True)
     return _path
+
+
+def daily_events_path() -> Path | None:
+    """Where an event written right now belongs."""
+    if _daily_path is not None:
+        return _daily_path
+    if _history_dir is None:
+        return None
+    return _history_dir / f"{today_stamp()}.events.jsonl"
 
 
 def events_path() -> Path | None:
@@ -51,7 +76,7 @@ def log_event(kind: str, **fields: Any) -> None:
     }
     line = json.dumps(record, default=str, ensure_ascii=False) + "\n"
     with _lock:
-        for path in (_path, _daily_path):
+        for path in (_path, daily_events_path()):
             if path is None:
                 continue
             with path.open("a", encoding="utf-8") as fh:

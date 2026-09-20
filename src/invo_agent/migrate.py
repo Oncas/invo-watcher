@@ -130,7 +130,7 @@ def migrate_state(settings: Settings) -> dict[str, int]:
     db.close()
     from invo_agent.logging_setup import prune_logs
 
-    pruned = prune_logs(settings.log_dir)
+    pruned = prune_logs(settings.log_dir, retain_days=settings.log_retain_days)
     return {
         "tagged": tagged,
         "traders": traders,

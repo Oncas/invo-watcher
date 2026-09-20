@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     dex_session_path: Path = Field(default_factory=lambda: _default_home() / "dex-session.json")
     db_path: Path = Field(default_factory=lambda: _default_home() / "agent.db")
     log_dir: Path = Field(default_factory=lambda: _default_home() / "logs")
+    # Dated history is the VPS's buffer until `logs pull` has collected it;
+    # raise it to cover the longest stretch the laptop may be offline.
+    log_retain_days: int = 7
     research_enabled: bool = True
     research_db_path: Path = Field(default_factory=lambda: _default_home() / "research.db")
     market_db_path: Path = Field(default_factory=lambda: _default_home() / "market.db")
