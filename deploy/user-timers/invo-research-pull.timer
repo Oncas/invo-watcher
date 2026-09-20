@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly research pull
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+# A run missed while the laptop was asleep fires once on resume.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

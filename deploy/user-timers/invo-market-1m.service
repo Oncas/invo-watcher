@@ -1,0 +1,12 @@
+[Unit]
+Description=Capture 1m Hyperliquid bars before the source expires them
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/invo-agent/sync.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/sh -c 'exec "$INVO_BIN" market backfill --database "$INVO_DB_DIR/market.db" --intervals 1m --update'
+Nice=10
+IOSchedulingClass=idle

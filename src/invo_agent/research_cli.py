@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from contextlib import closing
 from pathlib import Path
 from uuid import UUID
@@ -9,10 +10,15 @@ from uuid import UUID
 import httpx
 import typer
 
+from invo_agent import research_sync
 from invo_agent.api.client import InvolioAPIError, InvolioClient
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import get_settings
-from invo_agent.research import ResearchArchive, validate_archive_path
+from invo_agent.research import (
+    ResearchArchive,
+    SchemaTooNewError,
+    validate_archive_path,
+)
 from invo_agent.research_backfill import HistoryBackfill, HistoryError
 
 research_app = typer.Typer(no_args_is_help=True, help="Collect and inspect research data.")
@@ -91,3 +97,141 @@ def status(database: Path | None = typer.Option(None, "--database")) -> None:
                  strict=True)) for row in counts
     ], "latest_backfill": {"kind": latest[0], "detail": json.loads(latest[1])}
         if latest else None}, indent=2))
+
+
+@research_app.command("export")
+def export(
+    after_id: int = typer.Option(0, "--after-id", min=0, help="Highest id already received"),
+    since: str = typer.Option(
+        research_sync.EPOCH, "--since", help="Re-send rows re-seen after this ISO timestamp"
+    ),
+    database: Path | None = typer.Option(None, "--database", help="Archive to read"),
+) -> None:
+    """Stream the archive as NDJSON. Read-only; writes nothing."""
+    path = database or get_settings().research_db_path
+    try:
+        with ResearchArchive(path) as archive:
+            for line in research_sync.export_stream(archive, after_id=after_id, since=since):
+                # Flushing per line keeps a truncated pipe truncated at a line
+                # boundary, which is what lets the puller detect it cleanly.
+                typer.echo(json.dumps(line, default=str, ensure_ascii=False))
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        typer.secho(f"export failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+
+
+def _ssh_stream(remote: str, remote_bin: str, compress: bool):
+    def opener(after_id: int, since: str):
+        args = ["ssh"]
+        if compress:
+            # SSH's own zlib on the wire; no separate gzip process.
+            args.append("-C")
+        args += [remote, remote_bin, "research", "export",
+                 "--after-id", str(after_id), "--since", since]
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, text=True, bufsize=1)
+        assert proc.stdout is not None
+        try:
+            for raw in proc.stdout:
+                raw = raw.strip()
+                if raw:
+                    yield json.loads(raw)
+        finally:
+            proc.stdout.close()
+            proc.wait()
+    return opener
+
+
+@research_app.command("pull")
+def pull(
+    remote: str | None = typer.Option(None, "--remote", help="user@host of the VPS"),
+    from_file: Path | None = typer.Option(
+        None, "--from-file", help="Merge a local backfill database instead of SSHing"
+    ),
+    dest: Path | None = typer.Option(None, "--dest", help="Local archive directory"),
+    database: Path | None = typer.Option(None, "--database", help="Local archive file"),
+    rescan_days: int = typer.Option(
+        research_sync.DEFAULT_RESCAN_DAYS, "--rescan-days", min=1,
+        help="Re-scan at least this far back for updates to old rows",
+    ),
+    remote_bin: str = typer.Option(
+        "/opt/invo-agent/.venv/bin/invo-agent", "--remote-bin", help="CLI path on the VPS"
+    ),
+    source: str = typer.Option("vps", "--source", help="Name of this source in sync-state.json"),
+) -> None:
+    """Merge the VPS archive, or a backfill file, into the local archive."""
+    if bool(remote) == bool(from_file):
+        raise typer.BadParameter("Use either --remote or --from-file")
+    target = (dest or Path("~/Work/invo-db")).expanduser()
+    local = database or (target / "research.db")
+    try:
+        with research_sync.pull_lock(target), ResearchArchive(local) as archive:
+            if from_file is not None:
+                # A backfill is its own archive: merged in full, and deliberately
+                # never allowed to move the VPS watermark.
+                result = research_sync.merge_archive_file(archive, from_file)
+            else:
+                result = research_sync.pull_source(
+                    archive, target, source=source, rescan_days=rescan_days,
+                    open_stream=_ssh_stream(str(remote), remote_bin, compress=True),
+                )
+    except research_sync.PullBusyError as exc:
+        typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=1) from None
+    except (
+        research_sync.ArchiveMismatch, research_sync.SyncProtocolError,
+        SchemaTooNewError, sqlite3.Error, OSError, ValueError, json.JSONDecodeError,
+    ) as exc:
+        typer.secho(f"pull failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+    state = "complete" if result.complete else "PARTIAL"
+    typer.echo(
+        f"{state}: {result.counts['new']} new, {result.counts['update']} updated, "
+        f"{result.inserted} inserted, watermark {result.last_id}"
+    )
+    if not result.complete:
+        raise typer.Exit(code=1)
+
+
+@research_app.command("prune")
+def prune(
+    ack: Path | None = typer.Option(
+        None, "--ack", help="The laptop's sync-state.json, copied over"
+    ),
+    database: Path | None = typer.Option(None, "--database", help="Archive to prune"),
+    keep_days: int = typer.Option(
+        research_sync.DEFAULT_RESCAN_DAYS, "--keep-days", min=1,
+        help="Never delete anything touched this recently",
+    ),
+    source: str = typer.Option("vps", "--source", help="Which source entry to read"),
+    vacuum: bool = typer.Option(False, "--vacuum", help="Reclaim disk; stop the service first"),
+    yes: bool = typer.Option(False, "--yes", help="Actually delete. Without it, dry-run."),
+) -> None:
+    """Delete rows the laptop has confirmed receiving. Dry-run unless --yes."""
+    if ack is None:
+        raise typer.BadParameter("--ack is required; prune never guesses a watermark")
+    path = database or get_settings().research_db_path
+    try:
+        state = research_sync.SyncState.load(ack.parent if ack.is_file() else ack)
+        with ResearchArchive(path) as archive:
+            report = research_sync.prune_archive(
+                archive, state.source(source), keep_days=keep_days, apply=yes
+            )
+            if yes and vacuum:
+                archive.conn.execute("VACUUM")
+    except research_sync.PruneRefused as exc:
+        typer.secho(f"prune refused: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+    except (SchemaTooNewError, sqlite3.Error, OSError, ValueError) as exc:
+        typer.secho(f"prune failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+    if report["stale_days"] > keep_days:
+        typer.secho(
+            f"note: acknowledgement is {report['stale_days']} days old, so this "
+            "prunes less than a fresh one would",
+            fg=typer.colors.YELLOW, err=True,
+        )
+    verb = "deleted" if report["applied"] else "would delete"
+    typer.echo(
+        f"{verb} {report['deleted']} of {report['before']} rows "
+        f"(id <= {report['watermark']}, untouched since {report['cutoff']})"
+    )

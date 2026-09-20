@@ -16,6 +16,10 @@ from uuid import uuid4
 logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 2
 
+
+class SchemaTooNewError(RuntimeError):
+    """The archive was written by a newer build than this one understands."""
+
 # Credential keys are matched on the whole normalized name, never as a bare
 # substring: "tokenAddress" and "sessionHigh" are instrument/market fields and
 # must survive, while "accessToken" and "x-api-key" must not.
@@ -59,6 +63,10 @@ _BASE_SCHEMA = """
         ON observations(kind, entity_id, observed_at);
     CREATE INDEX IF NOT EXISTS observations_portfolio
         ON observations(portfolio_id, kind, observed_at);
+    CREATE TABLE IF NOT EXISTS archive_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
 """
 
 # Views carry no data, so they are rebuilt rather than migrated.
@@ -157,6 +165,14 @@ class ResearchArchive:
             raise
 
     def _initialize(self) -> None:
+        # Read the version before touching anything: an archive written by a
+        # newer build may have columns or semantics this code would corrupt.
+        found = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        if found > SCHEMA_VERSION:
+            raise SchemaTooNewError(
+                f"Research archive is at schema {found}, this build understands "
+                f"{SCHEMA_VERSION}. Upgrade invo-agent before opening it."
+            )
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(_BASE_SCHEMA)
         existing = {
@@ -166,9 +182,49 @@ class ResearchArchive:
         for name, col_type in _EXTRA_COLUMNS:
             if name not in existing:
                 self.conn.execute(f"ALTER TABLE observations ADD COLUMN {name} {col_type}")
+        # Identity must exist before any key is derived from it, or a re-run
+        # would mint a second UUID and renumber rows it had already migrated.
+        self._archive_uuid = self._ensure_archive_uuid()
+        self._backfill_null_dedupe_keys()
         self.conn.executescript(_VIEW_SCHEMA)
         self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.conn.commit()
+
+    def _ensure_archive_uuid(self) -> str:
+        row = self.conn.execute(
+            "SELECT value FROM archive_meta WHERE key = 'archive_uuid'"
+        ).fetchone()
+        if row is not None:
+            return str(row[0])
+        minted = str(uuid4())
+        self.conn.execute(
+            "INSERT INTO archive_meta (key, value) VALUES ('archive_uuid', ?)", (minted,)
+        )
+        return minted
+
+    def _backfill_null_dedupe_keys(self) -> None:
+        """Give pre-migration rows a stable identity so replay can dedupe them.
+
+        ``archive_uuid || ':' || id`` is deterministic, so a retry or a copy of
+        this archive derives the same keys rather than duplicating on merge.
+        """
+        self.conn.execute(
+            """UPDATE observations
+                  SET dedupe_key = ? || ':' || id
+                WHERE dedupe_key IS NULL""",
+            (self._archive_uuid,),
+        )
+        remaining = self.conn.execute(
+            "SELECT COUNT(*) FROM observations WHERE dedupe_key IS NULL"
+        ).fetchone()[0]
+        if remaining:
+            raise RuntimeError(
+                f"{remaining} observations still have no dedupe_key; merge would duplicate them"
+            )
+
+    @property
+    def archive_uuid(self) -> str:
+        return self._archive_uuid
 
     def append(
         self, kind: str, payload: dict, *, origin: str = "live",
@@ -189,10 +245,16 @@ class ResearchArchive:
         )
         dropped = sorted(set(removed) | set(redacted or []))
         seen_at = observed_at or utc_now()
-        key = None
         if deduplicate:
+            # Content-addressed, deliberately archive-independent: two archives
+            # must agree on this key or merging them would duplicate the row.
             identity = json.dumps([kind, origin, entity_id, portfolio_id, encoded])
             key = hashlib.sha256(identity.encode()).hexdigest()
+        else:
+            # Distinct by intent. Uniqueness is the only requirement, but it
+            # must still exist: a NULL key is not UNIQUE in SQLite, so replaying
+            # an export would insert these rows again and again.
+            key = f"{self._archive_uuid}:{uuid4()}"
         with self.conn:
             cursor = self.conn.execute(
                 """INSERT OR IGNORE INTO observations

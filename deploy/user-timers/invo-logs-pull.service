@@ -1,0 +1,12 @@
+[Unit]
+Description=Copy the VPS's dated log history to the laptop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/invo-agent/sync.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/sh -c 'exec "$INVO_BIN" logs-sync pull --remote "$INVO_REMOTE" --dest "$INVO_DB_DIR/logs"'
+Nice=10
+IOSchedulingClass=idle

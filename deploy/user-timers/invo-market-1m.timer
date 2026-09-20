@@ -1,0 +1,12 @@
+[Unit]
+Description=Five-minute 1m bar capture
+
+[Timer]
+OnCalendar=*:0/5
+RandomizedDelaySec=60
+# 1m bars expire from the source within about six days, so a missed window
+# is unrecoverable; catch up on resume.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

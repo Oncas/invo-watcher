@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily 1h/4h bar capture
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

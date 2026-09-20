@@ -1,0 +1,13 @@
+[Unit]
+Description=Pull the VPS research buffer into the local archive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/invo-agent/sync.env
+Environment=PYTHONUNBUFFERED=1
+# INVO_REMOTE and INVO_DB_DIR come from sync.env; see README.md.
+ExecStart=/bin/sh -c 'exec "$INVO_BIN" research pull --remote "$INVO_REMOTE" --dest "$INVO_DB_DIR"'
+Nice=10
+IOSchedulingClass=idle
