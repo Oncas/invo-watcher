@@ -6,8 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from invo_agent.research import ResearchArchive, SchemaTooNewError
+from invo_agent.research import (
+    ArchiveNotMigratedError,
+    ResearchArchive,
+    SchemaTooNewError,
+)
 from invo_agent.research_sync import (
+    EPOCH,
     PROTOCOL,
     ArchiveMismatch,
     PruneRefused,
@@ -249,7 +254,10 @@ def test_row_committed_during_export_is_included_or_beyond_the_boundary(tmp_path
         _seed(archive, 2)
         stream = export_stream(archive, after_id=0, since="1970-01-01T00:00:00+00:00")
         header = next(stream)
-        archive.append("investment", {"id": "late"}, deduplicate=True)
+        # A second connection: appending on the exporting connection would
+        # commit its read transaction and the test would prove nothing.
+        with ResearchArchive(tmp_path / "r.db") as writer:
+            writer.append("investment", {"id": "late"}, deduplicate=True)
         rest = list(stream)
     payloads = [r.get("payload", "") for r in rest if r["type"] == "row"]
     carried = any("late" in p for p in payloads)
@@ -799,3 +807,70 @@ def test_from_file_rejects_a_stream_mixing_two_archives(tmp_path: Path) -> None:
     with ResearchArchive(tmp_path / "dst.db") as dst:
         with pytest.raises(SyncProtocolError):
             merge_stream(dst, stream)
+
+
+# --- export must not write --------------------------------------------------
+
+
+def test_readonly_open_does_not_touch_the_file(tmp_path: Path) -> None:
+    path = tmp_path / "r.db"
+    with ResearchArchive(path) as archive:
+        _seed(archive, 2)
+    before = path.stat().st_mtime_ns
+    with ResearchArchive(path, readonly=True) as archive:
+        list(export_stream(archive, after_id=0, since="1970-01-01T00:00:00+00:00"))
+    assert path.stat().st_mtime_ns == before
+
+
+def test_readonly_open_works_on_an_unwritable_file(tmp_path: Path) -> None:
+    """Export runs beside a live trader; it must never need the write lock."""
+    path = tmp_path / "r.db"
+    with ResearchArchive(path) as archive:
+        _seed(archive, 2)
+    path.chmod(0o444)
+    try:
+        with ResearchArchive(path, readonly=True) as archive:
+            rows = [x for x in export_stream(archive, after_id=0, since=EPOCH)
+                    if x["type"] == "row"]
+        assert len(rows) == 2
+    finally:
+        path.chmod(0o644)
+
+
+def test_readonly_open_still_exposes_the_archive_uuid(tmp_path: Path) -> None:
+    path = tmp_path / "r.db"
+    with ResearchArchive(path) as archive:
+        uuid = archive.archive_uuid
+    with ResearchArchive(path, readonly=True) as archive:
+        assert archive.archive_uuid == uuid
+
+
+def test_readonly_open_refuses_an_unmigrated_archive(tmp_path: Path) -> None:
+    """Exporting NULL keys would silently defeat the merge's deduplication."""
+    path = tmp_path / "r.db"
+    _legacy_archive(path)
+    sqlite3.connect(path).close()
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE observations SET dedupe_key = NULL")
+    conn.execute("DROP TABLE IF EXISTS archive_meta")
+    conn.commit()
+    conn.close()
+    with pytest.raises(ArchiveNotMigratedError):
+        ResearchArchive(path, readonly=True)
+
+
+def test_readonly_open_refuses_a_newer_schema(tmp_path: Path) -> None:
+    path = tmp_path / "r.db"
+    with ResearchArchive(path):
+        pass
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA user_version = 999")
+    conn.commit()
+    conn.close()
+    with pytest.raises(SchemaTooNewError):
+        ResearchArchive(path, readonly=True)
+
+
+def test_readonly_open_refuses_a_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        ResearchArchive(tmp_path / "nope.db", readonly=True)

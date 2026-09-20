@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -199,3 +200,77 @@ def test_prune_applies_with_yes(tmp_path: Path) -> None:
     with ResearchArchive(src) as archive:
         assert archive.conn.execute(
             "SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+
+
+# --- ssh failures must not look like an empty archive -----------------------
+
+
+def _fake_ssh(tmp_path: Path, body: str) -> dict[str, str]:
+    """A real executable named ssh, earlier on PATH than the real one."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    fake = bin_dir / "ssh"
+    fake.write_text(body)
+    fake.chmod(0o755)
+    return {"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"}
+
+
+def test_pull_reports_a_failing_ssh_instead_of_a_tidy_partial(
+    tmp_path: Path, monkeypatch
+) -> None:
+    env = _fake_ssh(
+        tmp_path,
+        "#!/bin/sh\necho 'invo-agent: command not found' >&2\nexit 127\n",
+    )
+    monkeypatch.setenv("PATH", env["PATH"])
+    dest = tmp_path / "dest"
+    result = runner.invoke(
+        research_app,
+        ["pull", "--remote", "invo@example", "--dest", str(dest),
+         "--database", str(dest / "research.db")],
+    )
+    assert result.exit_code != 0
+    assert "127" in result.output or "command not found" in result.output
+
+
+def test_pull_succeeds_when_ssh_streams_a_complete_export(
+    tmp_path: Path, monkeypatch
+) -> None:
+    src = tmp_path / "src.db"
+    _seed(src, 3)
+    dump = tmp_path / "dump.ndjson"
+    out = runner.invoke(research_app, ["export", "--database", str(src)]).stdout
+    dump.write_text(out)
+    monkeypatch.setenv(
+        "PATH", _fake_ssh(tmp_path, f"#!/bin/sh\ncat {dump}\n")["PATH"]
+    )
+    dest = tmp_path / "dest"
+    result = runner.invoke(
+        research_app,
+        ["pull", "--remote", "invo@example", "--dest", str(dest),
+         "--database", str(dest / "research.db")],
+    )
+    assert result.exit_code == 0, result.output
+    assert "complete" in result.output
+    with ResearchArchive(dest / "research.db") as archive:
+        assert archive.conn.execute(
+            "SELECT COUNT(*) FROM observations").fetchone()[0] == 3
+
+
+# --- vacuum -----------------------------------------------------------------
+
+
+def test_prune_with_vacuum_reclaims_the_file(tmp_path: Path) -> None:
+    src = tmp_path / "src.db"
+    with ResearchArchive(src) as archive:
+        for i in range(400):
+            archive.append("old", {"i": i, "pad": "x" * 500}, deduplicate=True,
+                           observed_at="2020-01-01T00:00:00+00:00")
+        ack = _write_ack(tmp_path / "dest", archive)
+    before = src.stat().st_size
+    result = runner.invoke(
+        research_app,
+        ["prune", "--database", str(src), "--ack", str(ack), "--yes", "--vacuum"],
+    )
+    assert result.exit_code == 0, result.output
+    assert src.stat().st_size < before

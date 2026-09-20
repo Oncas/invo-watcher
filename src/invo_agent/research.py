@@ -20,6 +20,10 @@ SCHEMA_VERSION = 2
 class SchemaTooNewError(RuntimeError):
     """The archive was written by a newer build than this one understands."""
 
+
+class ArchiveNotMigratedError(RuntimeError):
+    """Opened read-only, but the archive still needs a write to be usable."""
+
 # Credential keys are matched on the whole normalized name, never as a bare
 # substring: "tokenAddress" and "sessionHigh" are instrument/market fields and
 # must survive, while "accessToken" and "x-api-key" must not.
@@ -154,8 +158,23 @@ def validate_archive_path(path: Path, operational_db: Path, log_dir: Path) -> No
 
 
 class ResearchArchive:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, readonly: bool = False):
         path = path.expanduser()
+        self.readonly = readonly
+        if readonly:
+            # Export runs beside a live collector on the trading box. Opening
+            # read-write would take the write lock — and `_initialize` writes
+            # on *every* open — so a "read-only" command would contend with
+            # the trader and fail outright on an unwritable file.
+            if not path.is_file():
+                raise FileNotFoundError(f"No research archive at {path}")
+            self.conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+            try:
+                self._check_readable()
+            except BaseException:
+                self.conn.close()
+                raise
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, timeout=5)
         try:
@@ -164,15 +183,46 @@ class ResearchArchive:
             self.conn.close()
             raise
 
-    def _initialize(self) -> None:
-        # Read the version before touching anything: an archive written by a
-        # newer build may have columns or semantics this code would corrupt.
+    def _assert_schema_understood(self) -> None:
+        """An archive from a newer build may have semantics this code would corrupt."""
         found = self.conn.execute("PRAGMA user_version").fetchone()[0]
         if found > SCHEMA_VERSION:
             raise SchemaTooNewError(
                 f"Research archive is at schema {found}, this build understands "
                 f"{SCHEMA_VERSION}. Upgrade invo-agent before opening it."
             )
+
+    def _check_readable(self) -> None:
+        """Verify a read-only archive is already in a state worth exporting."""
+        self._assert_schema_understood()
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM archive_meta WHERE key = 'archive_uuid'"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            raise ArchiveNotMigratedError(
+                "Archive has no identity yet. Open it once for writing "
+                "(any agent or backfill run) before exporting."
+            ) from exc
+        if row is None:
+            raise ArchiveNotMigratedError(
+                "Archive has no archive_uuid yet. Open it once for writing "
+                "before exporting."
+            )
+        self._archive_uuid = str(row[0])
+        # Exporting NULL keys would silently defeat the merge: a NULL is not
+        # UNIQUE in SQLite, so every replay would insert those rows again.
+        unkeyed = self.conn.execute(
+            "SELECT COUNT(*) FROM observations WHERE dedupe_key IS NULL"
+        ).fetchone()[0]
+        if unkeyed:
+            raise ArchiveNotMigratedError(
+                f"{unkeyed} observations still have no dedupe_key. Open the "
+                "archive for writing once to migrate them, then export."
+            )
+
+    def _initialize(self) -> None:
+        self._assert_schema_understood()
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(_BASE_SCHEMA)
         existing = {

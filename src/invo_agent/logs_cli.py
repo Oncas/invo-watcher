@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
@@ -61,7 +62,8 @@ def pull(
     target = (dest or (get_settings().log_dir / "pulled")).expanduser()
     target.mkdir(parents=True, exist_ok=True)
     try:
-        listing = _run(["ssh", remote, f"ls -1 {remote_dir} 2>/dev/null || true"])
+        quoted = shlex.quote(remote_dir)
+        listing = _run(["ssh", remote, f"ls -1 {quoted} 2>/dev/null || true"])
         wanted = plan_transfers(listing.split(), target, today=today_stamp())
         for name in wanted:
             _run(["scp", "-q", f"{remote}:{remote_dir}/{name}", str(target / name)])

@@ -15,6 +15,7 @@ from invo_agent.api.client import InvolioAPIError, InvolioClient
 from invo_agent.auth.session import SessionStore
 from invo_agent.config import get_settings
 from invo_agent.research import (
+    ArchiveNotMigratedError,
     ResearchArchive,
     SchemaTooNewError,
     validate_archive_path,
@@ -110,12 +111,15 @@ def export(
     """Stream the archive as NDJSON. Read-only; writes nothing."""
     path = database or get_settings().research_db_path
     try:
-        with ResearchArchive(path) as archive:
+        # Read-only: this runs on the trading box, beside the live collector.
+        with ResearchArchive(path, readonly=True) as archive:
             for line in research_sync.export_stream(archive, after_id=after_id, since=since):
                 # Flushing per line keeps a truncated pipe truncated at a line
                 # boundary, which is what lets the puller detect it cleanly.
                 typer.echo(json.dumps(line, default=str, ensure_ascii=False))
-    except (sqlite3.Error, OSError, ValueError) as exc:
+    except (
+        SchemaTooNewError, ArchiveNotMigratedError, sqlite3.Error, OSError, ValueError,
+    ) as exc:
         typer.secho(f"export failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from None
 
@@ -128,16 +132,32 @@ def _ssh_stream(remote: str, remote_bin: str, compress: bool):
             args.append("-C")
         args += [remote, remote_bin, "research", "export",
                  "--after-id", str(after_id), "--since", since]
-        proc = subprocess.Popen(args, stdout=subprocess.PIPE, text=True, bufsize=1)
+        proc = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+        )
         assert proc.stdout is not None
+        failed = False
         try:
             for raw in proc.stdout:
                 raw = raw.strip()
                 if raw:
                     yield json.loads(raw)
+        except BaseException:
+            failed = True
+            proc.kill()
+            raise
         finally:
             proc.stdout.close()
-            proc.wait()
+            stderr = proc.stderr.read() if proc.stderr else ""
+            if proc.stderr:
+                proc.stderr.close()
+            code = proc.wait()
+            # Without this a dead ssh looks exactly like an empty archive: the
+            # stream just ends, and the pull reports a tidy "PARTIAL: 0 new".
+            if code and not failed:
+                raise RuntimeError(
+                    f"ssh exited {code}: {stderr.strip() or 'no output'}"
+                )
     return opener
 
 
@@ -179,7 +199,10 @@ def pull(
         raise typer.Exit(code=1) from None
     except (
         research_sync.ArchiveMismatch, research_sync.SyncProtocolError,
-        SchemaTooNewError, sqlite3.Error, OSError, ValueError, json.JSONDecodeError,
+        SchemaTooNewError, ArchiveNotMigratedError, sqlite3.Error, OSError,
+        ValueError, json.JSONDecodeError,
+        # A transport failure (ssh died, remote binary missing) arrives here.
+        RuntimeError,
     ) as exc:
         typer.secho(f"pull failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from None
