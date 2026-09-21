@@ -11,7 +11,7 @@ the archive of record. See `docs/specs/2026-09-19-research-sync-design.md`.
 mkdir -p ~/.config/invo-agent
 cat > ~/.config/invo-agent/sync.env <<'EOF'
 INVO_BIN=/path/to/invo-agent/.venv/bin/invo-agent
-INVO_REMOTE=invo@192.0.2.10
+INVO_REMOTE=USER@VPS_HOST
 INVO_DB_DIR=$HOME/Work/invo-db
 EOF
 mkdir -p ~/Work/invo-db/logs
@@ -62,10 +62,10 @@ Never on a timer — the buffer only shrinks when you say so, and only for rows
 this machine has confirmed receiving.
 
 ```sh
-scp ~/Work/invo-db/sync-state.json invo@HOST:/tmp/ack.json
-ssh invo@HOST '/opt/invo-agent/.venv/bin/invo-agent research prune --ack /tmp/ack.json'
+scp ~/Work/invo-db/sync-state.json $INVO_REMOTE:/tmp/ack.json
+ssh "$INVO_REMOTE" '/opt/invo-agent/.venv/bin/invo-agent research prune --ack /tmp/ack.json'
 # ...read the dry-run count, then:
-ssh invo@HOST '/opt/invo-agent/.venv/bin/invo-agent research prune --ack /tmp/ack.json --yes'
+ssh "$INVO_REMOTE" '/opt/invo-agent/.venv/bin/invo-agent research prune --ack /tmp/ack.json --yes'
 ```
 
 `--vacuum` reclaims the disk but takes an exclusive lock: stop `invo-agent`
