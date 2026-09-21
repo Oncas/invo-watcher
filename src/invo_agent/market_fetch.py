@@ -66,6 +66,22 @@ class HyperliquidCandles:
                 raise MarketFetchError("candleSnapshot returned a malformed bar")
         return body
 
+    def universe(self) -> set[str]:
+        """Perp names the venue actually lists.
+
+        ``candleSnapshot`` answers HTTP 500 with a ``null`` body for a coin it
+        has no perp for, which is indistinguishable from the venue being down.
+        Asking what exists first keeps a 500 meaning what it should.
+        """
+        response = self._client.post(self.url, json={"type": "meta"})
+        if response.status_code != 200:
+            raise MarketFetchError(f"meta failed (HTTP {response.status_code})")
+        body = response.json()
+        try:
+            return {str(asset["name"]) for asset in body["universe"]}
+        except (KeyError, TypeError) as exc:
+            raise MarketFetchError("meta did not describe a universe") from exc
+
     def close(self) -> None:
         self._client.close()
 
@@ -169,6 +185,23 @@ class MarketBackfill:
         ).fetchone()
         since = None if row is None or row[0] is None else int(row[0]) + interval_ms(interval)
         return self.backfill(coin, interval, since_ms=since)
+
+
+def tradable_coins(coins: list[str], source: object) -> tuple[list[str], list[str]]:
+    """Split coins into those the source lists and those it does not.
+
+    The archive records every ticker the followed traders touched, including
+    Binance-style names (``1000BONK``) and exchange tokens (``KCS``) that this
+    venue never listed. A source with no ``universe`` cannot say, so it is
+    taken at its word and nothing is dropped.
+    """
+    ask = getattr(source, "universe", None)
+    if ask is None:
+        return list(coins), []
+    listed = ask()
+    wanted = [c for c in coins if c in listed]
+    skipped = [c for c in coins if c not in listed]
+    return wanted, skipped
 
 
 def coins_from_archive(research_db_path: str) -> list[str]:

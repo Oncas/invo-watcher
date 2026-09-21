@@ -14,6 +14,7 @@ from invo_agent.market_fetch import (
     MarketBackfill,
     MarketFetchError,
     coins_from_archive,
+    tradable_coins,
 )
 from invo_agent.market_join import DEFAULT_DELAYS_MS, coverage_gaps, signal_rows
 
@@ -61,6 +62,12 @@ def backfill(
         wanted = _intervals(intervals)
         results = []
         with MarketStore(path) as store, HyperliquidCandles() as source:
+            # The archive names coins this venue never listed; asking for one
+            # answers HTTP 500, which would otherwise end the whole run.
+            coins, unlisted = tradable_coins(coins, source)
+            if not coins:
+                raise typer.BadParameter(
+                    "None of the requested coins are listed on the venue")
             importer = MarketBackfill(source, store, delay=delay)
             for symbol in coins:
                 for interval in wanted:
@@ -75,6 +82,7 @@ def backfill(
     incomplete = [r for r in results if r["status"] != "complete"]
     typer.echo(json.dumps({
         "stored_bars": importer.stored, "scopes": len(results),
+        "skipped_unlisted": unlisted,
         "incomplete": incomplete, "results": results,
     }, indent=2))
     if incomplete:

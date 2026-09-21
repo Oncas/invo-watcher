@@ -4,7 +4,14 @@ import sqlite3
 import pytest
 
 from invo_agent.market import MarketStore, interval_ms, validate_market_path
-from invo_agent.market_fetch import MarketBackfill, MarketFetchError, coins_from_archive
+from invo_agent.market_fetch import (
+    MAINNET_INFO_URL,
+    HyperliquidCandles,
+    MarketBackfill,
+    MarketFetchError,
+    coins_from_archive,
+    tradable_coins,
+)
 from invo_agent.market_join import coverage_gaps, market_context, signal_rows, to_ms
 from invo_agent.research import ResearchArchive
 
@@ -294,3 +301,75 @@ def test_status_and_join_survive_an_empty_store(tmp_path):
     assert sqlite3.connect(tmp_path / "m.db").execute(
         "PRAGMA user_version").fetchone()[0] == 1
     assert json.dumps(coverage_gaps([])) is not None
+
+
+# --- the archive names coins the venue never listed --------------------------
+
+
+class ListedCandles(FakeCandles):
+    """A source that knows its own venue's universe, as the real endpoint does."""
+
+    def __init__(self, bars, listed, *, cap=50):
+        super().__init__(bars, cap=cap)
+        self.listed = set(listed)
+
+    def universe(self) -> set[str]:
+        return set(self.listed)
+
+
+def test_coins_the_venue_does_not_list_are_skipped_not_requested(tmp_path):
+    # Involio observes Binance-style and exchange tickers that Hyperliquid has
+    # no perp for; asking for one answers HTTP 500 and used to kill the run.
+    source = ListedCandles(series(T0, 10), listed={"BTC", "SOL"})
+    wanted, skipped = tradable_coins(["1000BONK", "BTC", "KCS", "SOL"], source)
+    assert wanted == ["BTC", "SOL"]
+    assert skipped == ["1000BONK", "KCS"]
+
+    with MarketStore(tmp_path / "m.db") as store:
+        importer = MarketBackfill(source, store, delay=0.1, sleep=lambda _: None,
+                                  clock=lambda: T0 + 200 * MINUTE)
+        for symbol in wanted:
+            importer.backfill(symbol, "1m", since_ms=T0)
+    assert {c[0] for c in source.calls} == {"BTC", "SOL"}
+
+
+def test_a_source_that_declares_no_universe_keeps_every_coin(tmp_path):
+    source = FakeCandles(series(T0, 10))
+    assert tradable_coins(["BTC", "WHATEVER"], source) == (["BTC", "WHATEVER"], [])
+
+
+def test_universe_is_read_from_the_meta_endpoint():
+    class Reply:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"universe": [{"name": "BTC"}, {"name": "SOL"}, {"name": "0G"}]}
+
+    class Client:
+        def __init__(self):
+            self.sent = []
+
+        def post(self, url, json):
+            self.sent.append(json)
+            return Reply()
+
+    source = HyperliquidCandles.__new__(HyperliquidCandles)
+    source.url, source._client = MAINNET_INFO_URL, Client()
+    assert source.universe() == {"BTC", "SOL", "0G"}
+    assert source._client.sent == [{"type": "meta"}]
+
+
+def test_an_unlisted_coin_that_slips_through_is_still_fatal(tmp_path):
+    # Filtering is not a licence to swallow a real outage: a 500 still stops.
+    class Broken:
+        name = "broken"
+
+        def candles(self, coin, interval, start_ms, end_ms):
+            raise MarketFetchError("candleSnapshot failed (HTTP 500)")
+
+    with MarketStore(tmp_path / "m.db") as store:
+        importer = MarketBackfill(Broken(), store, delay=0.1, sleep=lambda _: None,
+                                  clock=lambda: T0 + 200 * MINUTE)
+        with pytest.raises(MarketFetchError, match="HTTP 500"):
+            importer.backfill("BTC", "1m", since_ms=T0)
