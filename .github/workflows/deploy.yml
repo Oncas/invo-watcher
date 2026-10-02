@@ -12,21 +12,55 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A fork without VPS secrets still builds the bundle, then skips the
+      # push instead of failing every run on main.
+      - name: Check deploy target
+        id: target
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          if [[ -n "${VPS_HOST:-}" && -n "${VPS_SSH_KEY:-}" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Deploy skipped::Set the VPS_HOST and VPS_SSH_KEY secrets on the PROD environment to deploy."
+          fi
+
+      # The VPS holds no repo credentials and never fetches: CI ships the
+      # tree. Excludes keep runtime state and secrets out of the payload.
+      - name: Build deploy bundle
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/invo-agent.tar.gz"
+          tar -cz \
+            --exclude=.git \
+            --exclude=.venv \
+            --exclude=.env \
+            --exclude=captures \
+            --exclude=.pytest_cache \
+            -f "$bundle" .
+          echo "bundle=$bundle" >> "$GITHUB_ENV"
+          {
+            echo "### Deploy bundle"
+            echo ""
+            echo "- Commit: \`${GITHUB_SHA::7}\`"
+            echo "- Size: $(du -h "$bundle" | cut -f1)"
+            echo "- Files: $(tar -tzf "$bundle" | grep -vc '/$')"
+            if [[ "${{ steps.target.outputs.configured }}" != "true" ]]; then
+              echo ""
+              echo "No VPS secrets configured, so nothing was deployed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Push code and deploy
+        if: steps.target.outputs.configured == 'true'
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
           set -euo pipefail
-          if [[ -z "${VPS_HOST:-}" ]]; then
-            echo "Set repo secret VPS_HOST (VPS public IP or hostname)" >&2
-            exit 1
-          fi
-          if [[ -z "${VPS_SSH_KEY:-}" ]]; then
-            echo "Set repo secret VPS_SSH_KEY (private key for the invo user)" >&2
-            exit 1
-          fi
           user="${VPS_USER:-invo}"
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
@@ -34,18 +68,9 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh_opts="-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
 
-          # The VPS holds no repo credentials and never fetches: CI ships the
-          # tree. Excludes keep runtime state and secrets out of the payload.
           echo "==> push tree to ${user}@${VPS_HOST}:/opt/invo-agent"
-          tar -cz \
-            --exclude=.git \
-            --exclude=.venv \
-            --exclude=.env \
-            --exclude=captures \
-            --exclude=.pytest_cache \
-            -f - . \
-            | ssh $ssh_opts "${user}@${VPS_HOST}" \
-              'mkdir -p /opt/invo-agent && tar -xz -C /opt/invo-agent'
+          ssh $ssh_opts "${user}@${VPS_HOST}" \
+            'mkdir -p /opt/invo-agent && tar -xz -C /opt/invo-agent' < "$bundle"
 
           echo "==> run deploy"
           ssh $ssh_opts "${user}@${VPS_HOST}" \
