@@ -1,13 +1,44 @@
 # invo-watcher
 
-A personal portfolio watcher for Involio, with local monitoring, research archives,
-and optional Hyperliquid trade execution through an Involio / Turnkey wallet.
+An educational research project demonstrating portfolio monitoring, local data
+archives, and optional Hyperliquid execution through an Involio / Turnkey wallet.
 
 The application reads trade notifications from the portfolios you follow, records
 what happened, and exposes a terminal dashboard. With live execution enabled, it
 can copy OPEN, UPDATE, and CLOSE signals to your own wallet.
 
 The repository is named `invo-watcher`; the installed command remains `invo-agent`.
+
+## Educational purpose and disclaimer
+
+This project is published for **educational and research purposes only**: to study
+event processing, portfolio state, and wallet integrations. It is experimental
+software, not a recommendation to deploy a trading service or trade with real
+funds. Documentation describes existing capabilities, including live execution;
+the educational purpose does not disable those capabilities.
+
+Nothing in this project constitutes financial, investment, tax, or legal advice.
+Examples, signals, and outputs are not recommendations or promises of returns.
+Live execution can lose funds, including your entire trading balance. Dry-run
+does not establish that a strategy is safe or profitable.
+
+You are responsible for deciding whether and how to use the software, securing
+your accounts and keys, verifying its behavior, and complying with applicable
+laws and third-party terms. Obtain all required permissions before connecting to
+a service. The authors, maintainers, and contributors do not operate your account
+or make trading decisions on your behalf.
+
+The software and documentation are provided **as is, without warranties**, to the
+extent permitted by applicable law. No warranty is made about accuracy, security,
+availability, fitness for a particular purpose, or trading outcomes. To the fullest
+extent permitted by applicable law, the authors, maintainers, and contributors
+disclaim liability for claims, damages, or losses arising from use of or inability
+to use this project, including lost funds, lost data, account restrictions, and
+service interruptions. Use is at your own risk. This disclaimer does not exclude
+liability or rights that applicable law does not allow to be excluded.
+
+For offline study, inspect the source and test fixtures without authenticating or
+running polling commands. The connected examples below contact external services.
 
 ## Authorized use
 
@@ -19,6 +50,8 @@ restrict automated monitoring and data collection, subject to the exceptions
 stated there, including written permission. Use connected features only with the
 required authorization. Account access alone does not establish permission to
 automate access. Dry-run prevents trade execution but still contacts Involio.
+Educational use does not waive these requirements or grant permission to access,
+collect data from, or automate any third-party service.
 
 ## Modes
 
@@ -131,7 +164,11 @@ The terminal dashboard shows health, tracked copies, and recent events.
 `events.jsonl` records decisions and execution outcomes; `live_error` and
 `hl_order_rejected` identify failed execution attempts.
 
-## Optional live execution
+## Live execution implementation (reference only)
+
+This section documents the implementation for study. It is not a recommendation
+to enable real-money execution. The software can submit real orders if configured
+as described below; the educational disclaimer does not make it a simulator.
 
 Live mode copies followed portfolio signals to your wallet. Review portfolio
 selection, position limits, and observed dry-run decisions before enabling it.
