@@ -1,306 +1,222 @@
-# invo-agent
+# invo-watcher
 
-Watches Involio portfolio trade notifications and copies **OPEN / UPDATE / CLOSE** on Hyperliquid (via Involio’s DEX / Turnkey wallet).
+A personal portfolio watcher for Involio, with local monitoring, research archives,
+and optional Hyperliquid trade execution through an Involio / Turnkey wallet.
 
-**Risk:** Involio’s Terms ban bots/scrapers. This uses their private web API with your own account. Ban risk is real. Default mode is **dry-run only** (no real orders). Do not run two LIVE pollers against the same wallet.
+The application reads trade notifications from the portfolios you follow, records
+what happened, and exposes a terminal dashboard. With live execution enabled, it
+can copy OPEN, UPDATE, and CLOSE signals to your own wallet.
 
----
+The repository is named `invo-watcher`; the installed command remains `invo-agent`.
 
-## How it works
+## Authorized use
 
-One process polls Involio for new trade notifications from the portfolios you follow, decides what each one means for your book, and executes on Hyperliquid with Turnkey-signed orders.
+This is an independent integration using authenticated Involio web endpoints.
+It is not an official Involio integration or an endorsed application.
 
-```
-Involio notifications  →  poller  →  engine (OPEN/UPDATE/CLOSE)  →  Hyperliquid
-                                          ↓
-                            agent.db + agent.log + events.jsonl
-```
+[Involio's Terms of Service, §5.2](https://www.invoapp.com/terms-condition)
+restrict automated monitoring and data collection, subject to the exceptions
+stated there, including written permission. Use connected features only with the
+required authorization. Account access alone does not establish permission to
+automate access. Dry-run prevents trade execution but still contacts Involio.
 
-| Piece | Responsibility |
-|-------|----------------|
-| `poller` | Polls Involio (~4s), startup catch-up, missed-close reconcile |
-| `engine` | Turns a notification into an OPEN / UPDATE / CLOSE decision |
-| `dex` | Turnkey signing, Hyperliquid execution, recovery |
-| `db` | Processed notification ids, open copies, entry + recovery state |
-| `server` | Optional read-only snapshot API (`GET /v1/hud|events|logs|health`) |
+## Modes
 
-`healthy` means the poller loop is current — it has polled within `4 ×` the poll interval (min 30s) — and, on a LIVE run, that the signing key has not expired.
+| Mode | Behavior |
+| --- | --- |
+| Dry-run, the default | Read notifications and record intended actions without placing Hyperliquid orders |
+| Live execution, optional | Submit wallet-signed orders, apply position limits, and reconcile tracked copies |
 
-Portfolio history and ongoing signal/decision capture are stored in a separate SQLite research database. See [Research data collection](docs/research-data.md) for backfill commands, SQL queries, coverage, and training-data limitations. Market bars for joining those signals to conditions at the time live in a third SQLite file. See [Market data](docs/market-data.md) — note that minute-level history expires within days, so forward capture has to start before analysis.
-
----
+Keep `DRY_RUN=true` and `LIVE=false` while configuring the application. Live
+execution places real orders. Run only one live poller against a wallet.
 
 ## Requirements
 
-- Python **3.12+** (`python3 --version`)
-- An Involio account with email OTP login
-- Gmail (or any IMAP mailbox) for OTP auto-login
-- Hyperliquid equity in the Involio wallet (for live trading later)
+- Python 3.12 or newer.
+- An Involio account and authorization for the connected features you use.
+- Access to the account's email verification codes, manually or through IMAP.
+- An Involio / Turnkey wallet with Hyperliquid funds if enabling live execution.
 
----
-
-## 1. Install
+## Install
 
 ```bash
-cd invo-agent
+git clone https://github.com/Once4thewin/invo-watcher.git
+cd invo-watcher
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-
 cp .env.example .env
 ```
 
-Keep the venv activated in any terminal you use for `invo-agent`.
+Keep the virtual environment active when running `invo-agent` commands.
 
----
+## Configure
 
-## 2. Configure `.env`
-
-Minimum for dry-run:
+Edit `.env` with your own account details. A minimal monitoring configuration is:
 
 ```env
 INVO_EMAIL=you@example.com
-
-# Gmail App Password (see next section)
-IMAP_HOST=imap.gmail.com
-IMAP_PORT=993
-IMAP_USER=you@example.com
-IMAP_PASSWORD=xxxx xxxx xxxx xxxx
-IMAP_MAILBOX=INBOX
-
 DRY_RUN=true
 LIVE=false
 POLL_INTERVAL_SECONDS=4
-POSITION_PCT=5
 
-# Fallback allowlist (comma-separated UUIDs). With PORTFOLIO_SYNC=true this list
-# is REPLACED by every portfolio the account follows on the first successful
-# sync -- a hand-picked subset here widens to all your follows. Set
-# PORTFOLIO_SYNC=false to pin exactly this list.
-PORTFOLIO_ALLOWLIST=<portfolio-id-1>,<portfolio-id-2>
 PORTFOLIO_SYNC=true
 PORTFOLIO_SYNC_INTERVAL_SECONDS=900
+PORTFOLIO_ALLOWLIST=
 ```
 
-| Setting | Meaning |
-|---------|---------|
-| `DRY_RUN` / `LIVE` | Keep `DRY_RUN=true` and `LIVE=false` until you’re ready |
-| `POSITION_PCT` | Fallback margin % if the source trade has no `entrySize` |
-| `HL_MIN_ORDER_USD` | Floor order notional (margin×leverage); default $10 for Hyperliquid |
-| `MAX_POSITION_PCT` | Cap each copy to this % of equity as margin (default 10) |
-| `MAX_BOOK_MARGIN_PCT` | Cap the sum of open-copy margins + this order (default 40) |
-| `RECOVERY_ENABLED` | On startup, reconcile open copies vs Involio closes (default true) |
-| `RECOVERY_SL_PCT` | Parked SL as % of our margin (price move = this / leverage; default 3) |
-| `MIN_EQUITY_USD` | Skip trades if HL equity is below this |
-| `PORTFOLIO_ALLOWLIST` | Fallback list, used until the first successful follows sync |
-| `PORTFOLIO_SYNC` | Replace the allowlist with the account's followed portfolios (default true; **widens** a hand-picked `PORTFOLIO_ALLOWLIST` to all follows) |
-| `PORTFOLIO_SYNC_INTERVAL_SECONDS` | How often to re-read follows while running (default 900) |
-| | If `PORTFOLIO_SYNC=true` and the sync fails with no `PORTFOLIO_ALLOWLIST` fallback, copying **pauses** rather than copying every trader |
-| `LOG_DIR` | Where `agent.log` and `events.jsonl` are written (default `~/.invo-agent/logs`) |
-| `HUD_TOKEN` | Bearer token for the snapshot API. Empty disables the HTTP server entirely |
-| `HUD_BIND` / `HUD_PORT` | Snapshot API bind address and port (default `127.0.0.1:8787`) |
+With `PORTFOLIO_SYNC=true`, the selected portfolios are refreshed from your
+account's follows. A successful sync replaces `PORTFOLIO_ALLOWLIST`, including a
+hand-picked subset. If sync fails and no fallback list exists, copying pauses.
+To restrict selection to a fixed list, set `PORTFOLIO_SYNC=false` and supply the
+portfolio UUIDs in `PORTFOLIO_ALLOWLIST`, separated by commas.
 
-Sessions and state are stored under `~/.invo-agent/` (not in the repo):
+For automatic email-code retrieval, add IMAP settings:
 
-| Path | Contents |
-|------|----------|
-| `~/.invo-agent/session.json` | Involio social login JWT |
-| `~/.invo-agent/dex-session.json` | Turnkey trading keys (after `dex-login`) |
-| `~/.invo-agent/agent.db` | Processed notifications + open copies |
-| `~/.invo-agent/logs/agent.log` | Rotating file log |
-| `~/.invo-agent/logs/events.jsonl` | Structured OPEN/UPDATE/CLOSE sizing, HL responses, errors |
-
-Do not commit `.env`, `captures/`, or anything under `~/.invo-agent/`.
-
----
-
-## 3. Gmail App Password (IMAP)
-
-Used so the agent can read OTP emails without you pasting codes every time.
-
-1. Turn on [2-Step Verification](https://myaccount.google.com/signinoptions/two-step-verification).
-2. Create an [App Password](https://myaccount.google.com/apppasswords) → app **Mail**.
-3. Paste the 16-character password into `IMAP_PASSWORD` (spaces are fine).
-4. Test:
-
-```bash
-invo-agent imap-check
+```env
+IMAP_HOST=imap.gmail.com
+IMAP_PORT=993
+IMAP_USER=you@example.com
+IMAP_PASSWORD=your-app-password
+IMAP_MAILBOX=INBOX
 ```
 
-You should see `OK — logged in as …`.
+For Gmail, enable [2-Step Verification](https://myaccount.google.com/signinoptions/two-step-verification)
+and create an [App Password](https://myaccount.google.com/apppasswords). Use that
+password for IMAP. If automatic retrieval is unavailable, login prompts for a
+verification code. Account and wallet verification emails are handled separately.
 
-### Which OTP email is which
-
-| Command | Email from | Looks like |
-|---------|------------|------------|
-| `invo-agent login` | `no-reply@mail.involio.com` | Subject **Verification Code**, **4-digit** PIN |
-| `invo-agent dex-login` | `no-reply@mail.turnkey.com` | Subject **`NNNNNN` is your sign in code for Invo Wallet**, **6-digit** PIN |
-
-The agent filters by sender so a wallet email is never used for account login (and vice versa). If IMAP misses, the CLI asks you to paste the code.
-
----
-
-## 4. First-time login
-
-```bash
-invo-agent login
-invo-agent status
-```
-
-IMAP should pick up the Involio 4-digit code.
-
----
-
-## 5. Dry-run (recommended first)
-
-Watches notifications and logs what it *would* trade — **no Hyperliquid orders**.
-
-```bash
-# One poll (first run catch-up marks old notifs as seen — no history spam)
-invo-agent once
-
-# Continuous watcher (Ctrl+C to stop)
-invo-agent dry-run
-```
-
-On every start (or after `reset-state`), **catch-up** marks existing notifications as already handled, then only new trader signals fire OPEN / UPDATE / CLOSE.
-
-After catch-up, **missed-close recovery** checks local open copies against Involio. If the trader already closed while the agent was offline but Hyperliquid still holds the coin, it either market-closes or parks reduce-only TP/SL (`RECOVERY_ENABLED`, `RECOVERY_SL_PCT`). It also runs every 5 minutes, and immediately after a CLOSE we could not execute.
-
-How a CLOSE is handled depends on how late we are:
-
-| Age of the CLOSE signal | Behaviour |
+| Setting | Purpose |
 | --- | --- |
-| Fresh | Market-close our slice |
-| Failed on a blip (cap / network), < 2 min old | Retried at market on the next poll |
-| Older than 10 min, or still failing | Recovery prices it: flatten while green or less red than the trader, otherwise park TP/SL. A parked copy is never market-dumped later. |
+| `POSITION_PCT` | Fallback margin allocation when a source trade has no `entrySize`; default 5% |
+| `MAX_POSITION_PCT` | Margin cap for each copy; default 10% of equity |
+| `MAX_BOOK_MARGIN_PCT` | Combined margin cap for tracked copies; default 40% |
+| `HL_MIN_ORDER_USD` | Minimum order notional used by the executor; default $10 |
+| `MIN_EQUITY_USD` | Minimum account equity for execution; default $5 |
+| `RECOVERY_ENABLED` | Reconcile tracked copies after missed closes; default true |
+| `RECOVERY_SL_PCT` | Recovery stop distance as a percentage of position margin; default 3% |
+| `HL_BUDGET_RESERVE` | Request slots reserved for closes and protective orders; default 50 |
+| `LOG_DIR` | Log directory; default `~/.invo-agent/logs` |
+| `HUD_TOKEN` | Snapshot API bearer token; an empty value disables the server |
+| `HUD_BIND` / `HUD_PORT` | Snapshot API address; default `127.0.0.1:8787` |
 
-Hyperliquid’s address request cap is `10,000 + 1 request per USDC traded` (lifetime, no daily reset). The agent tracks it locally from `userFees` volume plus every action it posts, and re-anchors from HL’s rejection string. Closes and protective TP/SL always go through; new opens and size-adds wait (HUD tag `ratelimit`) while remaining slots are at or below `HL_BUDGET_RESERVE` (default 50). While over the cap, actions are spaced 11s apart so we use HL’s one-per-10s allowance on the trade instead of a leverage write.
+See `.env.example` for the remaining settings. Keep `.env`, email credentials,
+session files, wallet keys, captures, and account databases out of Git.
 
-A fresh OPEN is still an IoC at entry-or-better. Queued opens place **one** resting GTC at the trader’s entry and wait; they are not re-probed every poll. An unchanged UPDATE writes nothing. TP/SL replaces only the leg that moved.
+## Start monitoring
 
-When Hyperliquid answers “too many requests”, opportunistic queue work also pauses for 2 minutes as a backstop.
-
-Useful:
+After confirming authorization and configuring your account:
 
 ```bash
-invo-agent status           # last poll, open copies, recent actions
-invo-agent portfolios       # re-read follows: manager, portfolio name, id
-invo-agent reset-state -y   # clear DB + re-catch-up (keeps login)
+invo-agent imap-check        # optional IMAP connectivity check
+invo-agent login            # account login
+invo-agent status           # session and local state
+invo-agent once             # one dry-run polling cycle
+invo-agent dry-run          # continuous monitoring; Ctrl+C to stop
 ```
 
----
+Startup catch-up marks existing notifications as handled before processing new
+signals. This prevents old notifications from being replayed as new actions.
 
-## 6. Live trading (optional)
+Inspect a running instance from another terminal:
 
-Only after dry-run looks correct on real signals.
+```bash
+invo-agent watch
+invo-agent status
+invo-agent logs -n 80
+invo-agent portfolios
+```
 
-### 6a. DEX / wallet session
+The terminal dashboard shows health, tracked copies, and recent events.
+`events.jsonl` records decisions and execution outcomes; `live_error` and
+`hl_order_rejected` identify failed execution attempts.
 
-Separate OTP from account login (Turnkey / Invo Wallet):
+## Optional live execution
+
+Live mode copies followed portfolio signals to your wallet. Review portfolio
+selection, position limits, and observed dry-run decisions before enabling it.
+
+Create the separate wallet session:
 
 ```bash
 invo-agent dex-login
-invo-agent dex-status      # should show Hyperliquid equity
+invo-agent dex-status
 ```
 
-If you hit rate limits on `/dex/auth/otp`, wait a few minutes and retry (or paste the 6-digit code with `--code`).
-
-If the Turnkey key expires while running, the agent **auto re-logins via IMAP** (Turnkey OTP email) and retries the trade; on failure it cools down 10 minutes then tries again.
-
-### 6b. Enable live in `.env`
+Then update `.env`:
 
 ```env
 DRY_RUN=false
 LIVE=true
-POSITION_PCT=5
-MIN_EQUITY_USD=5
 ```
 
-### 6c. Run
+Run `invo-agent run`. Restore `DRY_RUN=true` and `LIVE=false` before restarting
+in monitoring mode. The `invo-agent dry-run` command always forces dry-run mode.
 
-```bash
-invo-agent run
+| Signal | Execution behavior |
+| --- | --- |
+| OPEN | Size from the source allocation, apply margin caps, and submit an entry-or-better order |
+| UPDATE | Adjust size or protection when the source trade changes, subject to execution limits |
+| CLOSE | Reduce a tracked copy; shared-coin copies are limited to their stored slice |
+
+Source `entrySize` values are percentages: `0.8` means 0.8% of your Hyperliquid
+equity. `POSITION_PCT` is the fallback when allocation is missing. Size increases
+scale your existing copy by the source trade's relative increase; per-copy and
+combined margin caps still apply. When a tracked copy is the only copy on a coin,
+CLOSE can flatten the full live position on that coin.
+
+Queued opens use a resting order at the source entry price. The executor maintains
+a local Hyperliquid request budget, reserves capacity for closes and protective
+orders, and paces retries after request-limit responses. The dashboard labels
+blocked work with its current reason, such as `ratelimit`.
+
+Missed-close recovery compares tracked copies with Involio state at startup and
+periodically while running. Depending on timing and recovery state, it closes the
+position or maintains reduce-only protection. Expired Turnkey sessions can be
+renewed through email verification when IMAP is configured.
+
+## Architecture and local data
+
+```text
+Involio notifications → poller → decision engine → optional Hyperliquid execution
+                                   ↓
+                         SQLite state + logs + events
 ```
 
-**Sizing:** each OPEN copies the source trader’s `entrySize` as percent of *your* HL equity (Involio `0.8` = 0.8%, `1` = 1%, `12` = 12% — not a 0–1 fraction). If that would make order notional (`margin × leverage`) below `HL_MIN_ORDER_USD` ($10), it bids the % up to clear that floor. `POSITION_PCT` is only used when `entrySize` is missing. Size-ups grow **your existing clip** by `simDifference / previous entrySim` (the same percent they added to dollars already in the trade) — they do not retarget the trader’s new `entrySize` onto your whole account. Per-copy and book caps still apply.
+| Component | Responsibility |
+| --- | --- |
+| `api/`, `auth/` | Authenticated requests, account sessions, and email verification |
+| `poller.py` | Notification polling, catch-up, and reconciliation |
+| `engine.py` | OPEN / UPDATE / CLOSE decisions |
+| `dex/` | Turnkey signing, order execution, request budgets, and recovery |
+| `db.py` | Processed notifications and tracked-copy state |
+| `server.py` | Optional read-only health, snapshot, event, and log endpoints |
 
-`size ≈ (margin × leverage) / mid_price`
+Default state lives under `~/.invo-agent/`: account and wallet session files,
+`agent.db`, `research.db`, `market.db`, and `logs/`. `healthy` indicates a current
+polling loop and, during live execution, a usable signing session.
 
-(UPDATE does not add size in v1; CLOSE flattens your full HL position for that coin.)
+Additional documentation:
 
-Flow: size → set leverage → IoC market order on HL (Turnkey-signed) → record on Involio.
+- [Research data collection](docs/research-data.md): portfolio history, signal capture, and archive queries.
+- [Market data](docs/market-data.md): candle capture and joining market conditions to signals.
+- [Scheduled collection](deploy/user-timers/README.md): user timers for archive and market capture.
+- [Research sync rollout](docs/rollout-research-sync.md): deployment order and verification.
 
-To go back to safe mode:
-
-```env
-DRY_RUN=true
-LIVE=false
-```
-
----
-
-## CLI cheat sheet
-
-```bash
-invo-agent login                 # Involio account (Involio email OTP)
-invo-agent imap-check            # test Gmail App Password
-invo-agent status                # session, poll meta, open copies
-invo-agent once                  # single dry-run poll
-invo-agent dry-run               # loop, no trades
-invo-agent run                   # loop, honors .env LIVE/DRY_RUN
-invo-agent dex-login             # Turnkey / wallet OTP
-invo-agent dex-status            # HL equity
-invo-agent watch                 # live terminal HUD, refreshes every 2s
-invo-agent logs -n 80            # recent log lines
-invo-agent portfolios            # re-read follows
-invo-agent reset-state -y        # clear local DB (not login)
-```
-
-Run `invo-agent --help` for the full list, including background-service and
-remote-monitoring commands not covered here.
-
----
-
-## Watching a run
-
-```bash
-invo-agent watch          # health, last poll, recent trades, log tail
-invo-agent status         # one-shot
-invo-agent logs -n 80
-```
-
-Leave `watch` in a small terminal window. For anything scripted, read
-`events.jsonl` — one JSON object per trade/step, with `live_error` and
-`hl_order_rejected` marking actions that failed to execute.
-
----
-
-## Layout
-
-```
-src/invo_agent/
-  api/           # Involio HTTP client + models
-  auth/          # OTP login, IMAP (account vs wallet), session
-  dex/           # Turnkey signing + Hyperliquid execution (+ missed-close recovery)
-  poller.py      # notification loop + startup catch-up / missed-close reconcile
-  engine.py      # notification → OPEN/UPDATE/CLOSE
-  db.py          # processed ids + open copies (entry + recovery state)
-  server.py      # read-only snapshot API (GET /v1/hud|events|logs|health)
-  logging_setup.py
-  cli.py
-```
-
----
+The VPS bootstrap script defaults to this repository and accepts an
+`INVO_AGENT_REPO` override. Runtime directories and service names remain
+`invo-agent`. The deployment workflow uses the `PROD` environment's VPS secrets;
+when configured, a push to `main` deploys the code and restarts the service.
 
 ## Troubleshooting
 
-| Problem | What to try |
-|---------|-------------|
-| `imap-check` fails | Use a Gmail **App Password**, not your normal password; 2FA must be on |
-| `login` waits forever | Check spam for `mail.involio.com`; paste code manually when prompted |
-| `dex-login` 429 / rate limit | Wait several minutes; don’t spam OTP requests |
-| Wrong OTP used | Fixed by sender filter — ensure you’re on latest code (`pip install -e .`) |
-| `health` returns 503 | `poll_stale` = poller stuck; `dex_key_expired` = run `invo-agent dex-login` |
-| Opens queue but never fill | Check the HL request cap (HUD tag `ratelimit`) and `MIN_EQUITY_USD` |
-| Want to ignore old history | `invo-agent reset-state -y` then `once` / `dry-run` |
+| Symptom | Check |
+| --- | --- |
+| IMAP login fails | Mailbox settings, Gmail App Password, and account 2-Step Verification |
+| Login is waiting | Verification email delivery; enter the code manually if needed |
+| Wallet login is rate-limited | Wait before retrying the verification request |
+| Health endpoint returns 503 | Poller freshness and wallet-session expiry |
+| An open remains queued | Request budget, available equity, entry price, and order minimum |
+
+Run `invo-agent --help` for the complete command list, including service management
+and remote monitoring.

@@ -3,7 +3,7 @@
 # Run as root. Does not start LIVE trading and does not overwrite existing secrets.
 set -euo pipefail
 
-REPO_URL="${INVO_AGENT_REPO:-git@github.com:Once4thewin/invo-agent-public.git}"
+REPO_URL="${INVO_AGENT_REPO:-https://github.com/Once4thewin/invo-watcher.git}"
 ROOT=/opt/invo-agent
 DATA=/var/lib/invo-agent
 ENV_FILE=/etc/invo-agent.env
