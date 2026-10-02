@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
+from invo_agent import __version__
 from invo_agent.api.models import (
     NotificationsResponse,
     OTPLoginResponse,
@@ -22,11 +23,9 @@ _WEB_APP_RELEASE = "1.0.59"
 _WEB_APP_BUILD = "83"
 _WEB_PLATFORM = "web"
 _DEX_CLIENT_VERSION = "involio-dex/fe"
-_BROWSER_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/139.0.0.0 Safari/537.36"
-)
+# Say what this is: the x-app-* headers above keep API compatibility, but the
+# client never claims to be a browser.
+_USER_AGENT = f"invo-watcher/{__version__} (+https://github.com/Once4thewin/invo-watcher)"
 
 
 class InvolioAPIError(RuntimeError):
@@ -80,7 +79,7 @@ class InvolioClient:
                 "Content-Type": "application/json",
                 "Origin": settings.origin,
                 "Referer": f"{settings.origin}/",
-                "User-Agent": _BROWSER_UA,
+                "User-Agent": _USER_AGENT,
                 "x-app-version": _WEB_APP_VERSION,
                 "x-app-release": _WEB_APP_RELEASE,
                 "x-app-build-number": _WEB_APP_BUILD,

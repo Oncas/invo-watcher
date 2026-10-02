@@ -81,8 +81,9 @@ def start_dex_otp(client: InvolioClient) -> tuple[str, int]:
 DEFAULT_DEX_EXPIRATION_SECONDS = 30 * 24 * 60 * 60
 # Turnkey default when Involio does not forward expirationSeconds.
 TURNKEY_DEFAULT_EXPIRATION_SECONDS = 15 * 60
-# Browser-ish label. Turnkey apiKeyName allows only printable ASCII (no "·").
-DEFAULT_DEX_DEVICE_LABEL = "Chrome on Mac"
+# Names the tool in the wallet's key list, so the owner can tell its keys from
+# their own browser sessions. Turnkey apiKeyName allows only printable ASCII.
+DEFAULT_DEX_DEVICE_LABEL = "invo-watcher"
 
 
 def turnkey_api_key_name(label: str, public_key_hex: str) -> str:

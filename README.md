@@ -53,6 +53,10 @@ automate access. Dry-run prevents trade execution but still contacts Involio.
 Educational use does not waive these requirements or grant permission to access,
 collect data from, or automate any third-party service.
 
+Requests identify themselves with an `invo-watcher/<version>` User-Agent, and
+wallet keys it creates are named `invo-watcher`, so the traffic and keys are
+distinguishable from a browser session.
+
 ## Modes
 
 | Mode | Behavior |

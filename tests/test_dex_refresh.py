@@ -66,7 +66,7 @@ def test_create_read_write_session_stamps_expected_body(monkeypatch) -> None:
     try:
         out = signer.create_read_write_session(
             target_public_key="0x" + target,
-            api_key_name="Chrome on Mac · testhash",
+            api_key_name="invo-watcher · testhash",
             expiration_seconds=2592000,
             invalidate_existing=False,
         )
@@ -81,7 +81,7 @@ def test_create_read_write_session_stamps_expected_body(monkeypatch) -> None:
     assert body["parameters"]["targetPublicKey"] == target
     assert body["parameters"]["expirationSeconds"] == "2592000"
     assert body["parameters"]["invalidateExisting"] is False
-    assert body["parameters"]["apiKeyName"].startswith("Chrome on Mac")
+    assert body["parameters"]["apiKeyName"].startswith("invo-watcher")
 
 
 def test_refresh_dex_session_saves_new_key(tmp_path: Path, monkeypatch) -> None:

@@ -80,7 +80,7 @@ def test_refresh_failed_because_key_dead() -> None:
 
 
 def test_turnkey_api_key_name_is_printable_ascii() -> None:
-    name = turnkey_api_key_name("Chrome on Mac · agent", "0x" + "ab" * 33)
+    name = turnkey_api_key_name("invo-watcher · agent", "0x" + "ab" * 33)
     assert "·" not in name
     assert all(32 <= ord(ch) <= 126 for ch in name)
     assert name.endswith("abababab")
