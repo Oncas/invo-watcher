@@ -46,12 +46,15 @@ class HyperliquidCandles:
     def __init__(self, url: str = MAINNET_INFO_URL, *, timeout: float = 30.0):
         self.url = url
         self._client = httpx.Client(timeout=timeout, headers={"Content-Type": "application/json"})
+        # Upper-cased name -> the venue's own spelling, once ``universe`` is known.
+        self._venue_names: dict[str, str] | None = None
 
     def candles(self, coin: str, interval: str, start_ms: int, end_ms: int
                 ) -> list[dict[str, Any]]:
+        venue_coin = (self._venue_names or {}).get(coin.upper(), coin)
         response = self._client.post(self.url, json={
             "type": "candleSnapshot",
-            "req": {"coin": coin, "interval": interval,
+            "req": {"coin": venue_coin, "interval": interval,
                     "startTime": int(start_ms), "endTime": int(end_ms)},
         })
         if response.status_code != 200:
@@ -72,15 +75,22 @@ class HyperliquidCandles:
         ``candleSnapshot`` answers HTTP 500 with a ``null`` body for a coin it
         has no perp for, which is indistinguishable from the venue being down.
         Asking what exists first keeps a 500 meaning what it should.
+
+        Names come back upper-cased, the way the archive spells its tickers.
+        The venue keeps a lower-case k on its 1000x perps (kPEPE, kBONK), so a
+        case-sensitive check called them unlisted; ``candles`` sends the
+        venue's spelling back.
         """
         response = self._client.post(self.url, json={"type": "meta"})
         if response.status_code != 200:
             raise MarketFetchError(f"meta failed (HTTP {response.status_code})")
         body = response.json()
         try:
-            return {str(asset["name"]) for asset in body["universe"]}
+            names = [str(asset["name"]) for asset in body["universe"]]
         except (KeyError, TypeError) as exc:
             raise MarketFetchError("meta did not describe a universe") from exc
+        self._venue_names = {name.upper(): name for name in names}
+        return set(self._venue_names)
 
     def close(self) -> None:
         self._client.close()

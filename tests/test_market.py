@@ -360,6 +360,30 @@ def test_universe_is_read_from_the_meta_endpoint():
     assert source._client.sent == [{"type": "meta"}]
 
 
+def test_k_markets_are_listed_upper_cased_and_fetched_by_venue_spelling():
+    # Hyperliquid spells its 1000x perps kPEPE; the archive's tickers arrive
+    # upper-cased, so a case-sensitive check called them unlisted.
+    class Client:
+        def __init__(self):
+            self.sent = []
+
+        def post(self, url, json):
+            self.sent.append(json)
+            reply = type("Reply", (), {"status_code": 200})()
+            body = ({"universe": [{"name": "BTC"}, {"name": "kPEPE"}]}
+                    if json["type"] == "meta" else [])
+            reply.json = lambda: body
+            return reply
+
+    source = HyperliquidCandles.__new__(HyperliquidCandles)
+    source.url, source._client, source._venue_names = MAINNET_INFO_URL, Client(), None
+    assert tradable_coins(["BTC", "KPEPE"], source) == (["BTC", "KPEPE"], [])
+
+    source.candles("KPEPE", "4h", T0, T0 + 1)
+    source.candles("BTC", "4h", T0, T0 + 1)
+    assert [s["req"]["coin"] for s in source._client.sent[1:]] == ["kPEPE", "BTC"]
+
+
 def test_an_unlisted_coin_that_slips_through_is_still_fatal(tmp_path):
     # Filtering is not a licence to swallow a real outage: a 500 still stops.
     class Broken:
