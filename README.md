@@ -77,7 +77,7 @@ execution places real orders. Run only one live poller against a wallet.
 ## Install
 
 ```bash
-git clone https://github.com/Once4thewin/invo-watcher.git
+git clone https://github.com/Oncas/invo-watcher.git
 cd invo-watcher
 python3.12 -m venv .venv
 source .venv/bin/activate

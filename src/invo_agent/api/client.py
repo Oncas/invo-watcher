@@ -25,7 +25,7 @@ _WEB_PLATFORM = "web"
 _DEX_CLIENT_VERSION = "involio-dex/fe"
 # Say what this is: the x-app-* headers above keep API compatibility, but the
 # client never claims to be a browser.
-_USER_AGENT = f"invo-watcher/{__version__} (+https://github.com/Once4thewin/invo-watcher)"
+_USER_AGENT = f"invo-watcher/{__version__} (+https://github.com/Oncas/invo-watcher)"
 
 
 class InvolioAPIError(RuntimeError):
